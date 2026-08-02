@@ -2,20 +2,28 @@ name: Release
 
 on:
   push:
-    tags:
-      - "v*.*.*"
+    branches: ["master", "main"]
 
 permissions:
   contents: write
 
 jobs:
   build:
-    name: Build portable exe
+    name: Build & publish release
     runs-on: windows-latest
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Generate timestamp version
+        id: version
+        run: |
+          $ts = (Get-Date -Format "yyyy.MMdd.HHmm")
+          echo "tag=build-$ts" >> $env:GITHUB_OUTPUT
+          echo "name=MiNERVA Browser $ts" >> $env:GITHUB_OUTPUT
+          echo "Generated version: $ts"
+        shell: pwsh
 
       - name: Set up Python 3.13
         uses: actions/setup-python@v5
@@ -30,8 +38,7 @@ jobs:
         shell: pwsh
 
       - name: Build exe
-        run: |
-          pyinstaller minerva_browser.spec
+        run: pyinstaller minerva_browser.spec
         shell: pwsh
 
       - name: Verify output
@@ -45,11 +52,14 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          name: "MiNERVA Browser ${{ github.ref_name }}"
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: ${{ steps.version.outputs.name }}
           body: |
-            ## MiNERVA Archive Browser ${{ github.ref_name }}
+            ## ${{ steps.version.outputs.name }}
 
             Portable single-file Windows executable — no installation required.
+
+            **Commit:** `${{ github.sha }}`
 
             ### Usage
             1. Download `MiNERVA-Browser.exe`

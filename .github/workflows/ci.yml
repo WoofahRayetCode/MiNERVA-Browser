@@ -1,11 +1,6 @@
 name: CI
 
 on:
-  push:
-    branches: ["master", "main"]
-    paths-ignore:
-      - "**.md"
-      - ".gitignore"
   pull_request:
     branches: ["master", "main"]
     paths-ignore:
@@ -20,6 +15,13 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Generate timestamp version
+        id: version
+        run: |
+          $ts = (Get-Date -Format "yyyy.MMdd.HHmm")
+          echo "ts=$ts" >> $env:GITHUB_OUTPUT
+        shell: pwsh
 
       - name: Set up Python 3.13
         uses: actions/setup-python@v5
@@ -51,9 +53,9 @@ jobs:
           Write-Host "✓ dist\MiNERVA-Browser.exe ($size MB)"
         shell: pwsh
 
-      - name: Upload build artifact
+      - name: Upload PR build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: MiNERVA-Browser-${{ github.sha }}
+          name: MiNERVA-Browser-PR-${{ steps.version.outputs.ts }}
           path: dist/MiNERVA-Browser.exe
           retention-days: 7
