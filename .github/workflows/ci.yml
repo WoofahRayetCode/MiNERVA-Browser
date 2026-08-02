@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches: ["master", "main"]
+    paths-ignore:
+      - "**.md"
+      - ".gitignore"
+  pull_request:
+    branches: ["master", "main"]
+    paths-ignore:
+      - "**.md"
+      - ".gitignore"
+
+jobs:
+  build:
+    name: Build & smoke test
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller
+          pip install libtorrent || echo "libtorrent unavailable — skipping"
+        shell: pwsh
+
+      - name: Syntax check
+        run: python -m py_compile minerva_browser.py && echo "Syntax OK"
+        shell: pwsh
+
+      - name: Build exe
+        run: pyinstaller minerva_browser.spec
+        shell: pwsh
+
+      - name: Verify exe exists and has reasonable size
+        run: |
+          $exe = "dist\MiNERVA-Browser.exe"
+          if (!(Test-Path $exe)) { throw "Exe not found after build" }
+          $bytes = (Get-Item $exe).Length
+          if ($bytes -lt 5MB) { throw "Exe too small ($bytes bytes) — build may be incomplete" }
+          $size = [math]::Round($bytes / 1MB, 1)
+          Write-Host "✓ dist\MiNERVA-Browser.exe ($size MB)"
+        shell: pwsh
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MiNERVA-Browser-${{ github.sha }}
+          path: dist/MiNERVA-Browser.exe
+          retention-days: 7

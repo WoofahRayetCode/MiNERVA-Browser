@@ -1,0 +1,65 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build portable exe
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller
+          pip install libtorrent || echo "libtorrent not available — downloads will be disabled"
+        shell: pwsh
+
+      - name: Build exe
+        run: |
+          pyinstaller minerva_browser.spec
+        shell: pwsh
+
+      - name: Verify output
+        run: |
+          $exe = "dist\MiNERVA-Browser.exe"
+          if (!(Test-Path $exe)) { throw "Build failed — exe not found" }
+          $size = [math]::Round((Get-Item $exe).Length / 1MB, 1)
+          Write-Host "Built: $exe ($size MB)"
+        shell: pwsh
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "MiNERVA Browser ${{ github.ref_name }}"
+          body: |
+            ## MiNERVA Archive Browser ${{ github.ref_name }}
+
+            Portable single-file Windows executable — no installation required.
+
+            ### Usage
+            1. Download `MiNERVA-Browser.exe`
+            2. Run it — that's it
+
+            ### What's included
+            - Browse minerva-archive.org categories
+            - Download games via BitTorrent (libtorrent bundled)
+            - Auto-extract archives with 7-Zip
+            - Download queue with concurrency control
+          files: dist/MiNERVA-Browser.exe
+          draft: false
+          prerelease: false
