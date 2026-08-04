@@ -15,8 +15,16 @@ __pycache__/
 # Torrent cache (user-generated at runtime)
 torrentfiles/
 
-# Downloaded files
+# Downloaded / extracted files
 downloads/
+extracted/
+
+# Logs
+*.log
+activity_log*.txt
+
+# Runtime tools (auto-installed at runtime)
+tools/
 
 # PyInstaller
 *.manifest
