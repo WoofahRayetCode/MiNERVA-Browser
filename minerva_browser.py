@@ -17,8 +17,13 @@ import zipfile
 import hashlib
 import traceback
 import json
+import os
+import winreg
 from datetime import datetime
 from html.parser import HTMLParser
+
+APP_VERSION = "0.0.0"  # replaced at build time by build.ps1
+GITHUB_REPO = "WoofahRayetCode/MiNERVA-Browser"
 
 BASE_URL = "https://minerva-archive.org"
 BROWSE_ROOT = "/browse/"
@@ -945,7 +950,7 @@ class DownloadQueue:
 class MinervaApp(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("MiNERVA Archive Browser")
+        self.title(f"MiNERVA Archive Browser v{APP_VERSION}")
         self.geometry("1100x650")
         self.configure(bg=BG)
         self._current_path = BROWSE_ROOT
@@ -965,6 +970,12 @@ class MinervaApp(tk.Tk):
         )
         self._compress_ps1_chd_var = tk.BooleanVar(
             value=bool(self._settings.get("compress_ps1_chd", False))
+        )
+        self._autostart_var = tk.BooleanVar(
+            value=bool(self._settings.get("autostart_with_windows", False))
+        )
+        self._start_minimized_var = tk.BooleanVar(
+            value=bool(self._settings.get("start_minimized", False))
         )
         self._show_tag_specs = [
             ("demo", "Demo"),
@@ -1045,6 +1056,9 @@ class MinervaApp(tk.Tk):
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._load_left_tree()
         self._navigate(BROWSE_ROOT)
+        if self._start_minimized_var.get() or "--minimized" in sys.argv:
+            self.after(100, self.iconify)
+        self.after(2500, self._check_for_updates_async)
 
     def _setup_styles(self):
         style = ttk.Style(self)
@@ -1137,6 +1151,9 @@ class MinervaApp(tk.Tk):
         self._open_btn = ttk.Button(toolbar, text="\U0001f310 Open in Browser",
                                     style="Toolbar.TButton", command=self._open_in_browser)
         self._open_btn.pack(side="left", padx=4)
+        self._update_btn = ttk.Button(toolbar, text="🔄 Check for Updates",
+                                      style="Toolbar.TButton", command=self._check_for_update_button_click)
+        self._update_btn.pack(side="left", padx=4)
         self._loading_label = ttk.Label(toolbar, text="", style="Loading.TLabel", background=PANEL)
         self._loading_label.pack(side="right", padx=8)
 
@@ -1334,6 +1351,30 @@ class MinervaApp(tk.Tk):
             relief="flat",
             command=self._on_extract_defaults_change,
         ).pack(side="left", padx=(6, 0))
+        tk.Checkbutton(
+            hdr,
+            text="Autostart",
+            variable=self._autostart_var,
+            bg=PANEL,
+            fg=FG,
+            selectcolor=PANEL,
+            activebackground=PANEL,
+            activeforeground=FG,
+            relief="flat",
+            command=self._on_startup_settings_change,
+        ).pack(side="left", padx=(10, 0))
+        tk.Checkbutton(
+            hdr,
+            text="Start minimized",
+            variable=self._start_minimized_var,
+            bg=PANEL,
+            fg=FG,
+            selectcolor=PANEL,
+            activebackground=PANEL,
+            activeforeground=FG,
+            relief="flat",
+            command=self._on_startup_settings_change,
+        ).pack(side="left", padx=(4, 0))
 
         hdr_actions = tk.Frame(self._downloads_frame, bg=PANEL)
         hdr_actions.pack(fill="x", padx=10, pady=(0, 4))
@@ -2189,6 +2230,8 @@ class MinervaApp(tk.Tk):
             "auto_extract_default": bool(self._auto_extract_default_var.get()),
             "delete_archive_default": bool(self._delete_archive_default_var.get()),
             "compress_ps1_chd": bool(self._compress_ps1_chd_var.get()),
+            "autostart_with_windows": bool(self._autostart_var.get()),
+            "start_minimized": bool(self._start_minimized_var.get()),
             "download_queue": self._get_persisted_queue_for_settings(),
         }
 
@@ -2292,6 +2335,25 @@ class MinervaApp(tk.Tk):
         else:
             self._extract_status_var.set("")
         self._save_settings()
+
+    def _on_startup_settings_change(self):
+        self._apply_autostart(self._autostart_var.get())
+        self._save_settings()
+
+    def _apply_autostart(self, enabled: bool):
+        _AUTOSTART_KEY = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run"
+        _APP_NAME = "MiNERVA Browser"
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _AUTOSTART_KEY, 0, winreg.KEY_SET_VALUE) as key:
+                if enabled and getattr(sys, "frozen", False):
+                    winreg.SetValueEx(key, _APP_NAME, 0, winreg.REG_SZ, f'"{sys.executable}" --minimized')
+                else:
+                    try:
+                        winreg.DeleteValue(key, _APP_NAME)
+                    except FileNotFoundError:
+                        pass
+        except Exception as e:
+            log_error("MinervaApp._apply_autostart failed", e)
 
     def _ensure_chdman_available_async(self):
         if self._chd_download_in_progress or self._chdman_path:
@@ -3383,6 +3445,163 @@ class MinervaApp(tk.Tk):
             log_activity(f"extract.error id={download_id} file='{file_name}' err={repr(e)}")
             _set_progress(0, f"Error: {str(e)[:40]}")
             self.after(0, lambda: self._chd_progress_var.set(0.0))
+
+    # ── updater ──────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _parse_version(tag: str) -> tuple[int, ...]:
+        try:
+            return tuple(int(x) for x in tag.lstrip("vV").strip().split("."))
+        except ValueError:
+            return (0,)
+
+    @staticmethod
+    def _fetch_latest_release() -> tuple[str, str]:
+        """Returns (tag_name, asset_download_url) for the latest GitHub release."""
+        url = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+        req = urllib.request.Request(url, headers={"User-Agent": f"MiNERVA-Browser/{APP_VERSION}"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode())
+        tag = data.get("tag_name", "")
+        assets = data.get("assets", [])
+        exe_asset = next(
+            (a for a in assets if a.get("name", "").lower().endswith(".exe")),
+            None,
+        )
+        if not exe_asset:
+            raise RuntimeError("No .exe asset found in latest release")
+        return tag, exe_asset["browser_download_url"]
+
+    def _check_for_updates_async(self, *, silent: bool = True):
+        def worker():
+            try:
+                tag, url = self._fetch_latest_release()
+                if self._parse_version(tag) > self._parse_version(APP_VERSION):
+                    self.after(0, lambda t=tag, u=url: self._on_update_available(t, u))
+                elif not silent:
+                    self.after(0, lambda t=tag: self._on_already_up_to_date(t))
+            except Exception as e:
+                if not silent:
+                    self.after(0, lambda err=e: messagebox.showerror(
+                        "Update Check Failed", f"Could not check for updates:\n{err}"))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _check_for_update_button_click(self):
+        self._update_btn.config(state="disabled", text="Checking…")
+        def worker():
+            try:
+                tag, url = self._fetch_latest_release()
+                if self._parse_version(tag) > self._parse_version(APP_VERSION):
+                    self.after(0, lambda t=tag, u=url: self._on_update_available(t, u))
+                else:
+                    self.after(0, lambda t=tag: self._on_already_up_to_date(t))
+            except Exception as e:
+                self.after(0, lambda err=e: (
+                    self._update_btn.config(state="normal", text="🔄 Check for Updates"),
+                    messagebox.showerror("Update Check Failed", f"Could not check for updates:\n{err}"),
+                ))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_already_up_to_date(self, latest_tag: str):
+        self._update_btn.config(state="normal", text="🔄 Check for Updates")
+        messagebox.showinfo("Up to Date", f"You are running the latest version (v{APP_VERSION}).")
+
+    def _on_update_available(self, tag: str, download_url: str):
+        self._update_btn.config(text=f"⬆ Update {tag}", state="normal",
+                                command=lambda t=tag, u=download_url: self._show_update_dialog(t, u))
+
+    def _show_update_dialog(self, tag: str, download_url: str):
+        dlg = tk.Toplevel(self)
+        dlg.title("Update Available")
+        dlg.configure(bg=BG)
+        dlg.resizable(False, False)
+        dlg.grab_set()
+
+        tk.Label(dlg, text=f"A new version is available: {tag}",
+                 bg=BG, fg=FG, font=("TkDefaultFont", 11, "bold")).pack(padx=20, pady=(16, 4))
+        tk.Label(dlg, text=f"Current version: v{APP_VERSION}",
+                 bg=BG, fg=FG_DIM, font=("TkDefaultFont", 9)).pack(padx=20)
+        tk.Label(dlg, text=f"New version:     {tag}",
+                 bg=BG, fg=FG_DIM, font=("TkDefaultFont", 9)).pack(padx=20, pady=(0, 12))
+
+        status_var = tk.StringVar(value="Ready to download.")
+        tk.Label(dlg, textvariable=status_var, bg=BG, fg=ACCENT,
+                 font=("TkDefaultFont", 9)).pack(padx=20)
+
+        progress_var = tk.DoubleVar(value=0.0)
+        progress_bar = ttk.Progressbar(dlg, variable=progress_var, maximum=100, length=320)
+        progress_bar.pack(padx=20, pady=(4, 12))
+
+        btn_frame = tk.Frame(dlg, bg=BG)
+        btn_frame.pack(pady=(0, 16))
+        download_btn = ttk.Button(btn_frame, text="Download & Install",
+                                  command=lambda: self._download_and_install_update(
+                                      tag, download_url, dlg, status_var, progress_var, download_btn))
+        download_btn.pack(side="left", padx=8)
+        ttk.Button(btn_frame, text="Later", command=dlg.destroy).pack(side="left", padx=8)
+
+    def _download_and_install_update(self, tag: str, download_url: str,
+                                     dlg: tk.Toplevel, status_var: tk.StringVar,
+                                     progress_var: tk.DoubleVar, download_btn: ttk.Button):
+        if not getattr(sys, "frozen", False):
+            messagebox.showinfo("Not Supported",
+                                "Auto-update only works for the portable .exe build.\n"
+                                f"Please download {tag} manually from GitHub.")
+            dlg.destroy()
+            return
+
+        download_btn.config(state="disabled")
+        dest = pathlib.Path(sys.executable).parent / "MiNERVA-Browser-update.exe"
+
+        def worker():
+            try:
+                req = urllib.request.Request(
+                    download_url, headers={"User-Agent": f"MiNERVA-Browser/{APP_VERSION}"})
+                with urllib.request.urlopen(req, timeout=60) as resp:
+                    total = int(resp.headers.get("Content-Length", 0))
+                    downloaded = 0
+                    chunk = 65536
+                    with open(dest, "wb") as f:
+                        while True:
+                            buf = resp.read(chunk)
+                            if not buf:
+                                break
+                            f.write(buf)
+                            downloaded += len(buf)
+                            if total > 0:
+                                pct = downloaded * 100.0 / total
+                                self.after(0, lambda p=pct: progress_var.set(p))
+                            mb = downloaded / 1_048_576
+                            self.after(0, lambda m=mb: status_var.set(f"Downloaded {m:.1f} MB…"))
+                self.after(0, lambda: progress_var.set(100.0))
+                self.after(0, lambda: status_var.set("Download complete. Restarting…"))
+                self.after(500, lambda: self._launch_updater_and_exit(dest))
+            except Exception as e:
+                self.after(0, lambda err=e: status_var.set(f"Error: {err}"))
+                self.after(0, lambda: download_btn.config(state="normal"))
+                log_error("MinervaApp._download_and_install_update failed", e)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _launch_updater_and_exit(self, new_exe: pathlib.Path):
+        current_exe = pathlib.Path(sys.executable)
+        pid = os.getpid()
+        script = (
+            f"$p = Get-Process -Id {pid} -ErrorAction SilentlyContinue\n"
+            f"if ($p) {{ $p | Wait-Process -Timeout 15 }}\n"
+            f"Start-Sleep -Milliseconds 500\n"
+            f"Move-Item -Path '{new_exe}' -Destination '{current_exe}' -Force\n"
+            f"Start-Process '{current_exe}'\n"
+            f"Remove-Item -Path $PSCommandPath -Force -ErrorAction SilentlyContinue\n"
+        )
+        script_path = new_exe.parent / "_minerva_update.ps1"
+        script_path.write_text(script, encoding="utf-8")
+        subprocess.Popen(
+            ["powershell", "-WindowStyle", "Hidden", "-ExecutionPolicy", "Bypass",
+             "-File", str(script_path)],
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        self._on_close()
 
     def _on_close(self):
         self._save_settings()
