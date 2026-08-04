@@ -22,6 +22,7 @@ extracted/
 # Logs
 *.log
 activity_log*.txt
+startup_cleanup_debug.txt
 
 # Runtime tools (auto-installed at runtime)
 tools/

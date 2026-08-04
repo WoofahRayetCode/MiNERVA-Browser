@@ -29,9 +29,11 @@ A portable desktop GUI for browsing and downloading from [minerva-archive.org](h
 - 🔍 Extractor detection shown in the UI (tool paths displayed when found)
 - 📊 Per-download extraction progress bar
 - 🗑️ Optional **delete archive** after successful extraction
-- ⚙️ **Auto extract**, **delete archive**, and **PS1 BIN/CUE → CHD** defaults are configurable in the Downloads panel and persist across launches
+- ⚙️ **Auto extract**, **delete archive**, and **PS1/PS2 BIN/CUE/ISO → CHD** defaults are configurable in the Downloads panel and persist across launches
+- 🧹 CHD conversion now auto-cleans names after conversion and removes the old BIN/CUE/ISO inputs
 - ⬇️ If CHD compression is enabled and `chdman` is missing, the app parses the latest MAME release page, downloads the Windows package, extracts only `chdman.exe`, and cleans up the rest
 - ✅ Extraction now verifies that ROM content was actually produced in the game output folder
+- 🚀 **Startup cleanup** — on every app launch, scans the extracted folder for processed CHD files and automatically cleans file names (removes region tags) and deletes source files (BIN/CUE/ISO)
 
 ## Requirements
 
