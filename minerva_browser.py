@@ -950,6 +950,20 @@ class DownloadQueue:
 class MinervaApp(tk.Tk):
     def __init__(self):
         super().__init__()
+        # TEST: Create a marker file to verify __init__ is being called
+        try:
+            test_file = pathlib.Path(pathlib.Path.home()) / "minerva_init_test.txt"
+            with open(test_file, "w") as f:
+                f.write(f"__init__ called at {datetime.now()}\n")
+        except Exception as e:
+            try:
+                import traceback
+                test_file = pathlib.Path(pathlib.Path.home()) / "minerva_init_error.txt"
+                with open(test_file, "w") as f:
+                    f.write(f"ERROR in __init__: {str(e)}\n{traceback.format_exc()}\n")
+            except:
+                pass
+        
         self.title(f"MiNERVA Archive Browser v{APP_VERSION}")
         self.geometry("1100x650")
         self.configure(bg=BG)
@@ -1058,6 +1072,14 @@ class MinervaApp(tk.Tk):
         self._navigate(BROWSE_ROOT)
         if self._start_minimized_var.get() or "--minimized" in sys.argv:
             self.after(100, self.iconify)
+        self.after(100, self._run_startup_cleanup)
+        # TEST: Verify after() call is reached
+        try:
+            test_file = pathlib.Path(pathlib.Path.home()) / "minerva_after_scheduled.txt"
+            with open(test_file, "w") as f:
+                f.write(f"after() called at {datetime.now()}\n")
+        except:
+            pass
         self.after(2500, self._check_for_updates_async)
 
     def _setup_styles(self):
@@ -1341,7 +1363,7 @@ class MinervaApp(tk.Tk):
         ).pack(side="left", padx=(4, 0))
         tk.Checkbutton(
             hdr,
-            text="Compress PS1 to CHD",
+            text="Compress PS1/PS2 to CHD",
             variable=self._compress_ps1_chd_var,
             bg=PANEL,
             fg=FG,
@@ -1398,7 +1420,7 @@ class MinervaApp(tk.Tk):
         ).pack(side="left", padx=(0, 6))
         ttk.Button(
             hdr_actions,
-            text="Compress PS1→CHD",
+            text="Compress PS1/PS2→CHD",
             style="Header.TButton",
             command=self._compress_ps1_button_click
         ).pack(side="left", padx=(0, 6))
@@ -1496,9 +1518,14 @@ class MinervaApp(tk.Tk):
         self._poll_downloads()
 
         self._status_var = tk.StringVar(value="")
-        status_bar = ttk.Label(self, textvariable=self._status_var, style="Status.TLabel",
-                               relief="flat", padding=(8, 3))
-        status_bar.pack(fill="x", side="bottom")
+        status_bar = ttk.Label(
+            self,
+            textvariable=self._status_var,
+            style="Status.TLabel",
+            relief="flat",
+            padding=(10, 5),
+        )
+        status_bar.pack(fill="x", side="bottom", pady=(0, 4))
 
     def _update_breadcrumb(self):
         for w in self._breadcrumb_frame.winfo_children():
@@ -2328,7 +2355,7 @@ class MinervaApp(tk.Tk):
 
     def _on_extract_defaults_change(self):
         if self._compress_ps1_chd_var.get() and not self._chdman_path:
-            self._extract_status_var.set("PS1→CHD enabled but chdman.exe not found")
+            self._extract_status_var.set("PS1/PS2→CHD enabled but chdman.exe not found")
             self._ensure_chdman_available_async()
         elif self._chdman_path:
             self._extract_status_var.set(f"CHD tool: {self._chdman_path}")
@@ -2600,23 +2627,23 @@ class MinervaApp(tk.Tk):
 
     def _compress_ps1_button_click(self):
         if self._chd_compress_in_progress:
-            messagebox.showinfo("Compress PS1 to CHD", "CHD compression is already running.")
+            messagebox.showinfo("Compress PS1/PS2 to CHD", "CHD compression is already running.")
             return
         base = pathlib.Path(self.get_download_dir()) / "extracted"
         if not base.exists() or not base.is_dir():
-            messagebox.showinfo("Compress PS1 to CHD", "No extracted folder found yet.")
+            messagebox.showinfo("Compress PS1/PS2 to CHD", "No extracted folder found yet.")
             return
         if not self._chdman_path:
             self._ensure_chdman_available_async()
             messagebox.showinfo(
-                "Compress PS1 to CHD",
+                "Compress PS1/PS2 to CHD",
                 "chdman is not installed yet. Installation has started in the background."
             )
             return
 
         targets = [d for d in base.iterdir() if d.is_dir()]
         if not targets:
-            messagebox.showinfo("Compress PS1 to CHD", "No extracted game folders found.")
+            messagebox.showinfo("Compress PS1/PS2 to CHD", "No extracted game folders found.")
             return
         self._chd_compress_in_progress = True
         self._chd_progress_var.set(0.0)
@@ -2628,8 +2655,7 @@ class MinervaApp(tk.Tk):
             total_done = 0
             total_planned = 0
             for d in targets:
-                cues = sorted(p for p in d.rglob("*.cue") if p.is_file())
-                total_planned += len(cues)
+                total_planned += len(self._collect_chd_sources(d))
 
             for d in targets:
                 try:
@@ -2647,6 +2673,14 @@ class MinervaApp(tk.Tk):
                     total_done += made
                 except Exception as e:
                     failed.append(f"{d.name}: {e}")
+            renamed, unchanged, cleanup_failed = self._clean_chd_names_in_base(base)
+            if cleanup_failed:
+                failed.append(
+                    f"name cleanup: {len(cleanup_failed)} issue(s) after renaming {renamed} item(s)"
+                )
+            log_activity(
+                f"chd.clean_names.manual renamed={renamed} unchanged={unchanged} failed={len(cleanup_failed)}"
+            )
             self.after(0, lambda c=converted, f=failed, t=len(targets): self._finish_manual_chd_batch(c, f, t))
 
         threading.Thread(target=worker, daemon=True).start()
@@ -2773,6 +2807,30 @@ class MinervaApp(tk.Tk):
             messagebox.showerror(TITLE, "Extracted path exists but is not a folder.")
             return
 
+        renamed, unchanged, failed = self._clean_chd_names_in_base(base, file_exts=FILE_EXTS)
+        if not failed:
+            msg = f"Name cleanup complete. Renamed {renamed}, unchanged {unchanged}."
+            self._extract_status_var.set(msg)
+            messagebox.showinfo(TITLE, msg)
+            return
+
+        preview = "\n".join(failed[:8])
+        more = f"\n...and {len(failed) - 8} more" if len(failed) > 8 else ""
+        msg = (
+            f"Name cleanup completed with issues.\n"
+            f"Renamed: {renamed}, Unchanged: {unchanged}, Failed: {len(failed)}\n\n"
+            f"{preview}{more}"
+        )
+        self._extract_status_var.set(f"Name cleanup issues: {len(failed)} file(s)")
+        messagebox.showwarning(TITLE, msg)
+
+    def _clean_chd_names_in_base(
+        self,
+        base: pathlib.Path,
+        *,
+        file_exts: set[str] | None = None,
+    ) -> tuple[int, int, list[str]]:
+        file_exts = file_exts or {".chd", ".bin", ".cue", ".iso", ".img", ".mdf", ".mds"}
         renamed = 0
         unchanged = 0
         failed: list[str] = []
@@ -2797,7 +2855,7 @@ class MinervaApp(tk.Tk):
 
         # Rename files first (deepest first so folder renames don't break paths)
         all_files = sorted(
-            (p for p in base.rglob("*") if p.is_file() and p.suffix.lower() in FILE_EXTS),
+            (p for p in base.rglob("*") if p.is_file() and p.suffix.lower() in file_exts),
             key=lambda p: (-len(p.parts), p.name),
         )
         for f in all_files:
@@ -2818,22 +2876,133 @@ class MinervaApp(tk.Tk):
                 unchanged += 1
                 continue
             _try_rename(d, new_name)
+        return renamed, unchanged, failed
 
-        if not failed:
-            msg = f"Name cleanup complete. Renamed {renamed}, unchanged {unchanged}."
-            self._extract_status_var.set(msg)
-            messagebox.showinfo(TITLE, msg)
-            return
+    def _run_startup_cleanup(self):
+        """Run cleanup on startup if processed ROM files (CHD) are detected."""
+        try:
+            # Create debug file at the start - with a test write
+            download_dir = self.get_download_dir()
+            debug_file_path = pathlib.Path(download_dir) / "startup_cleanup_debug.txt"
+            
+            # Test write
+            try:
+                with open(debug_file_path, "a") as f:
+                    f.write(f"TEST: _run_startup_cleanup() called\n")
+            except Exception as write_err:
+                # If we can't write, at least try to create empty file
+                try:
+                    debug_file_path.touch()
+                except:
+                    pass
+            
+            with open(debug_file_path, "a") as f:
+                f.write(f"[STARTUP CLEANUP] Method called at {datetime.now()}\n")
+            
+            base = pathlib.Path(download_dir) / "extracted"
+            with open(debug_file_path, "a") as f:
+                f.write(f"[STARTUP CLEANUP] Checking directory: {base}\n")
+            
+            if not base.exists() or not base.is_dir():
+                with open(debug_file_path, "a") as f:
+                    f.write(f"[STARTUP CLEANUP] Directory does not exist or is not a directory\n")
+                return
 
-        preview = "\n".join(failed[:8])
-        more = f"\n...and {len(failed) - 8} more" if len(failed) > 8 else ""
-        msg = (
-            f"Name cleanup completed with issues.\n"
-            f"Renamed: {renamed}, Unchanged: {unchanged}, Failed: {len(failed)}\n\n"
-            f"{preview}{more}"
-        )
-        self._extract_status_var.set(f"Name cleanup issues: {len(failed)} file(s)")
-        messagebox.showwarning(TITLE, msg)
+            # Check if any CHD files exist (indicates processing has happened)
+            chd_files = list(base.rglob("*.chd"))
+            with open(debug_file_path, "a") as f:
+                f.write(f"[STARTUP CLEANUP] Found {len(chd_files)} CHD files\n")
+            
+            if not chd_files:
+                with open(debug_file_path, "a") as f:
+                    f.write(f"[STARTUP CLEANUP] No CHD files found, skipping cleanup\n")
+                return
+
+            log_activity(f"startup.cleanup detected {len(chd_files)} CHD files")
+            with open(debug_file_path, "a") as f:
+                f.write(f"[STARTUP CLEANUP] Processing {len(chd_files)} CHD files\n")
+
+            # Check for source files that should be cleaned up
+            bin_files = list(base.rglob("*.bin"))
+            cue_files = list(base.rglob("*.cue"))
+            iso_files = list(base.rglob("*.iso"))
+            source_count = len(bin_files) + len(cue_files) + len(iso_files)
+
+            if source_count > 0 or True:
+                # Run name cleanup on all extracted content
+                renamed, unchanged, cleanup_failed = self._clean_chd_names_in_base(base)
+                log_activity(
+                    f"startup.cleanup names renamed={renamed} unchanged={unchanged} failed={len(cleanup_failed)}"
+                )
+
+            # Delete source files for each CHD
+            removed_bins = 0
+            removed_cues = 0
+            removed_isos = 0
+            delete_failed: list[str] = []
+
+            for chd in chd_files:
+                with open(debug_file_path, "a") as f:
+                    f.write(f"[STARTUP CLEANUP] Processing CHD: {chd}\n")
+                
+                cue = chd.with_suffix(".cue")
+                bin_file = chd.with_suffix(".bin")
+                iso_file = chd.with_suffix(".iso")
+
+                if cue.exists():
+                    try:
+                        with open(debug_file_path, "a") as f:
+                            f.write(f"[STARTUP CLEANUP] Deleting CUE: {cue}\n")
+                        cue.unlink()
+                        removed_cues += 1
+                        log_activity(f"startup.cleanup.delete cue='{cue}'")
+                    except Exception as e:
+                        delete_failed.append(f"{cue.name}: {e}")
+                        log_activity(f"startup.cleanup.delete_failed cue='{cue}' err={e}")
+                        with open(debug_file_path, "a") as f:
+                            f.write(f"[STARTUP CLEANUP] Failed to delete CUE: {e}\n")
+
+                if bin_file.exists():
+                    try:
+                        with open(debug_file_path, "a") as f:
+                            f.write(f"[STARTUP CLEANUP] Deleting BIN: {bin_file}\n")
+                        bin_file.unlink()
+                        removed_bins += 1
+                        log_activity(f"startup.cleanup.delete bin='{bin_file}'")
+                    except Exception as e:
+                        delete_failed.append(f"{bin_file.name}: {e}")
+                        log_activity(f"startup.cleanup.delete_failed bin='{bin_file}' err={e}")
+                        with open(debug_file_path, "a") as f:
+                            f.write(f"[STARTUP CLEANUP] Failed to delete BIN: {e}\n")
+
+                if iso_file.exists():
+                    try:
+                        with open(debug_file_path, "a") as f:
+                            f.write(f"[STARTUP CLEANUP] Deleting ISO: {iso_file}\n")
+                        iso_file.unlink()
+                        removed_isos += 1
+                        log_activity(f"startup.cleanup.delete iso='{iso_file}'")
+                    except Exception as e:
+                        delete_failed.append(f"{iso_file.name}: {e}")
+                        log_activity(f"startup.cleanup.delete_failed iso='{iso_file}' err={e}")
+                        with open(debug_file_path, "a") as f:
+                            f.write(f"[STARTUP CLEANUP] Failed to delete ISO: {e}\n")
+
+            if removed_bins > 0 or removed_cues > 0 or removed_isos > 0:
+                msg = f"Cleanup: Removed {removed_bins} BIN, {removed_cues} CUE, {removed_isos} ISO files"
+                log_activity(f"startup.cleanup.done {msg}")
+                with open(debug_file_path, "a") as f:
+                    f.write(f"[STARTUP CLEANUP] {msg}\n")
+            else:
+                with open(debug_file_path, "a") as f:
+                    f.write(f"[STARTUP CLEANUP] No files needed deletion\n")
+
+        except Exception as e:
+            debug_file_path = pathlib.Path(self.get_download_dir()) / "startup_cleanup_debug.txt"
+            with open(debug_file_path, "a") as f:
+                f.write(f"[STARTUP CLEANUP] ERROR: {e}\n")
+            log_error("MinervaApp._run_startup_cleanup failed", e)
+
 
     def _force_delete_bins_button_click(self):
         TITLE = "Delete BINs"
@@ -2888,7 +3057,7 @@ class MinervaApp(tk.Tk):
         if not failed:
             msg = f"CHD compression finished: {converted} file(s) converted across {total_folders} folder(s)."
             self._extract_status_var.set(msg)
-            messagebox.showinfo("Compress PS1 to CHD", msg)
+            messagebox.showinfo("Compress PS1/PS2 to CHD", msg)
             return
 
         preview = "\n".join(failed[:8])
@@ -2899,7 +3068,7 @@ class MinervaApp(tk.Tk):
             f"{preview}{more}"
         )
         self._extract_status_var.set(f"CHD conversion issues: {len(failed)} folder(s)")
-        messagebox.showwarning("Compress PS1 to CHD", msg)
+        messagebox.showwarning("Compress PS1/PS2 to CHD", msg)
 
     def _open_folder(self, path: pathlib.Path):
         try:
@@ -3161,6 +3330,21 @@ class MinervaApp(tk.Tk):
                 f"Extracted files from {source_name} do not look like ROM content ({sample})"
             )
 
+    @staticmethod
+    def _chd_source_mode(path: pathlib.Path) -> str | None:
+        suffix = path.suffix.lower()
+        if suffix == ".cue":
+            return "createcd"
+        if suffix == ".iso":
+            return "createdvd"
+        return None
+
+    def _collect_chd_sources(self, extracted_dir: pathlib.Path) -> list[pathlib.Path]:
+        sources: list[pathlib.Path] = []
+        sources.extend(sorted(p for p in extracted_dir.rglob("*.cue") if p.is_file()))
+        sources.extend(sorted(p for p in extracted_dir.rglob("*.iso") if p.is_file()))
+        return sources
+
     def _compress_ps1_to_chd(
         self,
         extracted_dir: pathlib.Path,
@@ -3172,29 +3356,32 @@ class MinervaApp(tk.Tk):
         if not chdman:
             log_activity("chd.skip reason=no_chdman")
             return 0
-        cue_files = sorted(p for p in extracted_dir.rglob("*.cue") if p.is_file())
-        if not cue_files:
+        chd_sources = self._collect_chd_sources(extracted_dir)
+        if not chd_sources:
             return 0
 
         converted = 0
 
-        total = len(cue_files)
+        total = len(chd_sources)
         cpu_threads = max(1, (os.cpu_count() or 1))
-        for idx, cue in enumerate(cue_files, start=1):
-            out_chd = cue.with_suffix(".chd")
+        for idx, source in enumerate(chd_sources, start=1):
+            mode = self._chd_source_mode(source)
+            if mode is None:
+                continue
+            out_chd = source.with_suffix(".chd")
             if progress_cb is not None:
                 try:
-                    progress_cb(idx - 1, total, cue.name)
+                    progress_cb(idx - 1, total, source.name)
                 except Exception:
                     pass
             if out_chd.exists():
                 if progress_cb is not None:
                     try:
-                        progress_cb(idx, total, cue.name)
+                        progress_cb(idx, total, source.name)
                     except Exception:
                         pass
                 continue
-            cmd = [chdman, "createcd", "-np", str(cpu_threads), "-i", str(cue), "-o", str(out_chd)]
+            cmd = [chdman, mode, "-np", str(cpu_threads), "-i", str(source), "-o", str(out_chd)]
             log_activity(f"chd.run cmd={' '.join(cmd)}")
             startupinfo = subprocess.STARTUPINFO()
             startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
@@ -3211,44 +3398,48 @@ class MinervaApp(tk.Tk):
             if proc.returncode != 0:
                 tail = " | ".join((proc.stdout or "").splitlines()[-3:])
                 raise RuntimeError(
-                    f"CHD conversion failed for {cue.name} (rc={proc.returncode})"
+                    f"CHD conversion failed for {source.name} (rc={proc.returncode})"
                     + (f" ({tail})" if tail else "")
                 )
             if not out_chd.exists() or out_chd.stat().st_size <= 0:
-                raise RuntimeError(f"CHD output missing for {cue.name}")
-            log_activity(f"chd.ok cue='{cue}' chd='{out_chd}'")
-            # Remove all BIN files referenced by this CUE sheet
-            try:
-                cue_text = cue.read_text(encoding="utf-8", errors="replace")
-                referenced_bins = [
-                    cue.parent / m.group(1)
-                    for m in re.finditer(r'^\s*FILE\s+"?([^"]+\.bin)"?\s+BINARY', cue_text, re.IGNORECASE | re.MULTILINE)
-                ]
-            except Exception:
-                referenced_bins = []
-            # Fall back: find BINs in the same folder whose stem matches the parent folder name
-            if not referenced_bins:
-                folder_name = cue.parent.name
-                referenced_bins = [
-                    p for p in cue.parent.iterdir()
-                    if p.suffix.lower() == ".bin" and p.stem.lower().startswith(folder_name.lower())
-                ]
-            # Last resort: the single-stem BIN matching the CUE
-            if not referenced_bins:
-                referenced_bins = [cue.with_suffix(".bin")]
-            for bin_path in referenced_bins:
-                if bin_path.exists():
-                    try:
-                        bin_path.unlink()
-                        log_activity(f"chd.cleanup.bin removed='{bin_path}'")
-                    except Exception as e:
-                        log_activity(f"chd.cleanup.bin failed='{bin_path}' err='{e}'")
-            cue.unlink()
-            log_activity(f"chd.cleanup.cue removed='{cue}'")
+                raise RuntimeError(f"CHD output missing for {source.name}")
+            log_activity(f"chd.ok source='{source}' chd='{out_chd}'")
+            if source.suffix.lower() == ".cue":
+                # Remove all BIN files referenced by this CUE sheet
+                try:
+                    cue_text = source.read_text(encoding="utf-8", errors="replace")
+                    referenced_bins = [
+                        source.parent / m.group(1)
+                        for m in re.finditer(r'^\s*FILE\s+"?([^"]+\.bin)"?\s+BINARY', cue_text, re.IGNORECASE | re.MULTILINE)
+                    ]
+                except Exception:
+                    referenced_bins = []
+                # Fall back: find BINs in the same folder whose stem matches the parent folder name
+                if not referenced_bins:
+                    folder_name = source.parent.name
+                    referenced_bins = [
+                        p for p in source.parent.iterdir()
+                        if p.suffix.lower() == ".bin" and p.stem.lower().startswith(folder_name.lower())
+                    ]
+                # Last resort: the single-stem BIN matching the CUE
+                if not referenced_bins:
+                    referenced_bins = [source.with_suffix(".bin")]
+                for bin_path in referenced_bins:
+                    if bin_path.exists():
+                        try:
+                            bin_path.unlink()
+                            log_activity(f"chd.cleanup.bin removed='{bin_path}'")
+                        except Exception as e:
+                            log_activity(f"chd.cleanup.bin failed='{bin_path}' err='{e}'")
+                source.unlink()
+                log_activity(f"chd.cleanup.cue removed='{source}'")
+            else:
+                source.unlink()
+                log_activity(f"chd.cleanup.iso removed='{source}'")
             converted += 1
             if progress_cb is not None:
                 try:
-                    progress_cb(idx, total, cue.name)
+                    progress_cb(idx, total, source.name)
                 except Exception:
                     pass
         return converted
@@ -3430,6 +3621,16 @@ class MinervaApp(tk.Tk):
                     extracted_dir,
                     progress_cb=_chd_progress
                 )
+                renamed, unchanged, failed = self._clean_chd_names_in_base(extracted_dir)
+                if failed:
+                    log_activity(
+                        f"extract.clean_names.partial id={download_id} renamed={renamed} "
+                        f"unchanged={unchanged} failed={len(failed)}"
+                    )
+                else:
+                    log_activity(
+                        f"extract.clean_names.ok id={download_id} renamed={renamed} unchanged={unchanged}"
+                    )
                 log_activity(f"extract.verify.ok id={download_id} dir='{extracted_dir}'")
 
             if extracted_ok and delete_archive and src.exists():
