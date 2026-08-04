@@ -12,7 +12,12 @@ import pathlib
 import shutil
 import subprocess
 import re
+import time
 import zipfile
+import hashlib
+import traceback
+import json
+from datetime import datetime
 from html.parser import HTMLParser
 
 BASE_URL = "https://minerva-archive.org"
@@ -27,6 +32,7 @@ FG = "#cdd6f4"
 FG_DIM = "#a6adc8"
 SEL_BG = "#45475a"
 ENTRY_BG = "#313244"
+_LOG_LOCK = threading.Lock()
 
 
 def get_default_download_dir() -> str:
@@ -34,6 +40,12 @@ def get_default_download_dir() -> str:
     if getattr(sys, "frozen", False):
         return str(pathlib.Path(sys.executable).parent)
     return str(pathlib.Path(__file__).parent)
+
+
+def get_runtime_base_dir() -> pathlib.Path:
+    if getattr(sys, "frozen", False):
+        return pathlib.Path(sys.executable).parent
+    return pathlib.Path(__file__).parent
 
 
 def get_torrent_dir() -> pathlib.Path:
@@ -45,19 +57,140 @@ def get_torrent_dir() -> pathlib.Path:
     return d
 
 
-def find_7zip_executable() -> str | None:
-    """Find a usable 7-Zip executable on PATH or in common Windows install locations."""
-    candidates = [
+def get_error_log_path() -> pathlib.Path:
+    base = pathlib.Path(sys.executable).parent if getattr(sys, "frozen", False) \
+        else pathlib.Path(__file__).parent
+    return base / "minerva_error.log"
+
+
+def get_settings_path() -> pathlib.Path:
+    base = pathlib.Path(sys.executable).parent if getattr(sys, "frozen", False) \
+        else pathlib.Path(__file__).parent
+    return base / "minerva_settings.json"
+
+
+def log_error(context: str, exc: Exception | None = None):
+    try:
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        lines = [f"[{ts}] {context}"]
+        if exc is not None:
+            lines.append(f"Exception: {repr(exc)}")
+            lines.append(traceback.format_exc().rstrip())
+        line = "\n".join(lines) + "\n\n"
+        log_path = get_error_log_path()
+        with _LOG_LOCK:
+            with log_path.open("a", encoding="utf-8") as f:
+                f.write(line)
+    except Exception:
+        pass
+
+
+def log_activity(message: str):
+    try:
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        line = f"[{ts}] {message}\n"
+        log_path = get_error_log_path()
+        with _LOG_LOCK:
+            with log_path.open("a", encoding="utf-8") as f:
+                f.write(line)
+    except Exception:
+        pass
+
+
+def load_app_settings() -> dict:
+    path = get_settings_path()
+    if not path.exists():
+        return {}
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return data
+        raise ValueError("Settings file must contain a JSON object")
+    except Exception as e:
+        log_error(f"load_app_settings failed for {path}", e)
+        return {}
+
+
+def save_app_settings(settings: dict):
+    path = get_settings_path()
+    tmp_path = path.with_suffix(".tmp")
+    try:
+        with tmp_path.open("w", encoding="utf-8") as f:
+            json.dump(settings, f, indent=2, ensure_ascii=False)
+        tmp_path.replace(path)
+    except Exception as e:
+        log_error(f"save_app_settings failed for {path}", e)
+
+
+def find_archive_extractors() -> list[dict]:
+    """Find supported external archive tools in preferred order."""
+    tools: list[dict] = []
+
+    def _add_tool(kind: str, label: str, exe: str | None):
+        if not exe:
+            return
+        p = pathlib.Path(exe)
+        if not p.exists():
+            return
+        if any(t["kind"] == kind and pathlib.Path(t["exe"]).resolve() == p.resolve() for t in tools):
+            return
+        tools.append({"kind": kind, "label": label, "exe": str(p)})
+
+    # 1) Native 7-Zip CLI
+    for candidate in [
         shutil.which("7z"),
         shutil.which("7z.exe"),
         shutil.which("7za"),
         shutil.which("7za.exe"),
         r"C:\Program Files\7-Zip\7z.exe",
         r"C:\Program Files (x86)\7-Zip\7z.exe",
+    ]:
+        _add_tool("7zip", "7-Zip", candidate)
+
+    # 2) PeaZip's bundled 7z backend (CLI compatible with 7-Zip switches)
+    for candidate in [
+        r"C:\Program Files\PeaZip\res\bin\7z\7z.exe",
+        r"C:\Program Files (x86)\PeaZip\res\bin\7z\7z.exe",
+        r"C:\Program Files\PeaZip\res\7z\7z.exe",
+        r"C:\Program Files (x86)\PeaZip\res\7z\7z.exe",
+    ]:
+        _add_tool("peazip", "PeaZip", candidate)
+
+    # 3) WinRAR CLI
+    for candidate in [
+        shutil.which("winrar"),
+        shutil.which("winrar.exe"),
+        shutil.which("rar"),
+        shutil.which("rar.exe"),
+        r"C:\Program Files\WinRAR\WinRAR.exe",
+        r"C:\Program Files (x86)\WinRAR\WinRAR.exe",
+    ]:
+        _add_tool("winrar", "WinRAR", candidate)
+
+    return tools
+
+
+def format_extractor_status(extractors: list[dict]) -> str:
+    if not extractors:
+        return "No external extractor found; using Python extraction for ZIPs"
+    labels = [f"{tool['label']}: {tool['exe']}" for tool in extractors]
+    return "Extractors detected: " + " | ".join(labels)
+
+
+def find_chdman_executable() -> str | None:
+    managed = get_runtime_base_dir() / "tools" / "chdman" / "chdman.exe"
+    candidates = [
+        str(managed),
+        shutil.which("chdman"),
+        shutil.which("chdman.exe"),
+        str(pathlib.Path.home() / "scoop" / "apps" / "mame" / "current" / "chdman.exe"),
+        r"C:\Program Files\MAME\chdman.exe",
+        r"C:\Program Files (x86)\MAME\chdman.exe",
     ]
     for candidate in candidates:
         if candidate and pathlib.Path(candidate).exists():
-            return candidate
+            return str(pathlib.Path(candidate))
     return None
 
 
@@ -430,7 +563,7 @@ class TorrentEngine:
         self._thread.start()
 
     def add_download(self, torrent_source: str, so_id: int, file_name: str, save_path: str,
-                     download_id: str = None, auto_extract: bool = False, delete_archive: bool = False) -> str:
+                     download_id: str = None) -> str:
         """Add a download. torrent_source is a local .torrent file path, a .torrent URL, or a magnet URI."""
         download_id = download_id or str(uuid.uuid4())
 
@@ -445,8 +578,7 @@ class TorrentEngine:
                         "name": file_name,
                         "so_id": so_id,
                         "save_path": save_path,
-                        "auto_extract": auto_extract,
-                        "delete_archive": delete_archive,
+                        "delete_archive": False,
                         "waiting_metadata": True,
                     }
                 else:
@@ -470,33 +602,83 @@ class TorrentEngine:
                     params.save_path = save_path
                     params.file_priorities = priorities
                     handle = self._session.add_torrent(params)
+                    self._add_file_priority(handle, so_id)
                     self._handles[download_id] = handle
                     self._meta[download_id] = {
                         "name": file_name,
                         "so_id": so_id,
                         "save_path": save_path,
-                        "auto_extract": auto_extract,
-                        "delete_archive": delete_archive,
+                        "delete_archive": False,
                         "waiting_metadata": False,
                     }
             except Exception as e:
+                log_error(f"TorrentEngine.add_download failed for {file_name}", e)
                 self.events.put({"type": "error", "id": download_id, "msg": str(e)})
 
         threading.Thread(target=_do, daemon=True).start()
         return download_id
 
-    def _set_single_file_priority(self, handle, so_id: int):
+    def _add_file_priority(self, handle, so_id: int):
         try:
             ti = handle.torrent_file()
             if ti is None:
                 return
             num_files = ti.num_files()
-            priorities = [0] * num_files
+            existing = []
+            try:
+                existing = list(handle.file_priorities())
+            except Exception:
+                existing = []
+            priorities = (existing + [0] * max(0, num_files - len(existing)))[:num_files]
             if 0 <= so_id < num_files:
-                priorities[so_id] = 4
+                priorities[so_id] = max(priorities[so_id], 4)
             handle.prioritize_files(priorities)
-        except Exception:
-            pass
+        except Exception as e:
+            log_error("TorrentEngine._add_file_priority failed", e)
+
+    def _has_downloaded_file(self, download_id: str) -> bool:
+        meta = self._meta.get(download_id)
+        if not meta:
+            return False
+        save_path = pathlib.Path(meta.get("save_path", ""))
+        file_name = meta.get("name", "")
+        if not file_name:
+            return False
+
+        direct = save_path / file_name
+        if direct.exists():
+            return True
+
+        for depth in range(1, 4):
+            pattern = "/".join(["*"] * depth) + f"/{file_name}"
+            if any(save_path.glob(pattern)):
+                return True
+        return False
+
+    def _is_target_file_complete(self, download_id: str, handle, status) -> bool:
+        """Return True only when the selected file index has all bytes downloaded."""
+        meta = self._meta.get(download_id)
+        if not meta:
+            return False
+        so_id = meta.get("so_id")
+        if not isinstance(so_id, int) or so_id < 0:
+            return False
+        ti = handle.torrent_file()
+        if ti is None:
+            return False
+        num_files = ti.num_files()
+        if so_id >= num_files:
+            return False
+        target_size = ti.files().file_size(so_id)
+        if target_size <= 0:
+            return False
+        progress = list(handle.file_progress())
+        if so_id >= len(progress):
+            return False
+        target_done = progress[so_id]
+        if target_done >= target_size:
+            return True
+        return status.total_wanted == target_size and status.total_done >= status.total_wanted
 
     def _alert_loop(self):
         while self._running:
@@ -509,7 +691,7 @@ class TorrentEngine:
                         meta = self._meta.get(did, {})
                         if meta.get("waiting_metadata") and handle.is_valid():
                             if handle.info_hash() == alert.handle.info_hash():
-                                self._set_single_file_priority(handle, meta["so_id"])
+                                self._add_file_priority(handle, meta["so_id"])
                                 meta["waiting_metadata"] = False
             for did, handle in list(self._handles.items()):
                 if not handle.is_valid():
@@ -540,12 +722,16 @@ class TorrentEngine:
                         "paused": s.paused,
                         "error": s.errc.message() if s.errc else "",
                     })
-                    if state_str in ("Seeding", "Finished") and not s.paused:
+                    is_complete = self._is_target_file_complete(did, handle, s) or (
+                        (state_str in ("Seeding", "Finished")) and s.progress >= 0.999
+                    )
+                    has_file = self._has_downloaded_file(did)
+                    if is_complete and has_file and state_str in ("Seeding", "Finished") and not s.paused:
                         if did not in self._finished_ids:
                             self._finished_ids.add(did)
                             self.events.put({"type": "finished", "id": did})
-                except Exception:
-                    pass
+                except Exception as e:
+                    log_error(f"TorrentEngine._alert_loop status processing failed for {did}", e)
 
     def get_all_statuses(self) -> dict:
         statuses = {}
@@ -576,8 +762,8 @@ class TorrentEngine:
                     "paused": s.paused,
                     "error": s.errc.message() if s.errc else "",
                 }
-            except Exception:
-                pass
+            except Exception as e:
+                log_error(f"TorrentEngine.get_all_statuses failed for {did}", e)
         return statuses
 
     def pause(self, download_id: str):
@@ -605,6 +791,14 @@ class TorrentEngine:
         self._meta.pop(download_id, None)
         self._finished_ids.discard(download_id)
 
+    def stop_seeding(self, download_id: str):
+        """Remove torrent handle once download is complete, but keep metadata for post-processing."""
+        h = self._handles.get(download_id)
+        if h and h.is_valid():
+            self._session.remove_torrent(h)
+        self._handles.pop(download_id, None)
+        self._finished_ids.discard(download_id)
+
     def set_auto_extract(self, download_id: str, enabled: bool):
         meta = self._meta.get(download_id)
         if meta is not None:
@@ -626,7 +820,7 @@ class TorrentEngine:
 class DownloadQueue:
     """
     Manages a list of pending + active downloads.
-    Automatically starts the next queued item when a slot frees up.
+    Pending downloads do not start automatically until explicitly selected.
     """
     def __init__(self, engine: "TorrentEngine", max_active: int = 3):
         self.engine = engine
@@ -637,25 +831,41 @@ class DownloadQueue:
         self._done: dict[str, dict] = {}      # id -> {name, save_path, status:'done'|'error', error:''}
         self._lock = threading.Lock()
 
-    def enqueue(self, download_id: str, name: str, source: str, so_id: int, save_path: str,
-                auto_extract: bool = False, delete_archive: bool = False):
+    def enqueue(self, download_id: str, name: str, source: str, so_id: int, save_path: str):
         item = {"id": download_id, "name": name, "source": source, "so_id": so_id,
-                "save_path": save_path, "auto_extract": auto_extract, "delete_archive": delete_archive}
+                "save_path": save_path, "start_requested": False}
         with self._lock:
             self._pending[download_id] = item
+
+    def start_selected(self, download_ids: list[str]):
+        with self._lock:
+            for did in download_ids:
+                item = self._pending.get(did)
+                if item:
+                    item["start_requested"] = True
+        self._try_advance()
+
+    def start_all_pending(self):
+        with self._lock:
+            for item in self._pending.values():
+                item["start_requested"] = True
         self._try_advance()
 
     def _try_advance(self):
         with self._lock:
             while len(self._active) < self.max_active and self._pending:
-                did, item = next(iter(self._pending.items()))
+                next_item = next(
+                    ((did, item) for did, item in self._pending.items() if item.get("start_requested")),
+                    None
+                )
+                if next_item is None:
+                    break
+                did, item = next_item
                 del self._pending[did]
                 self._active[did] = item
                 self.engine.add_download(
                     item["source"], item["so_id"], item["name"], item["save_path"],
                     download_id=did,
-                    auto_extract=item.get("auto_extract", False),
-                    delete_archive=item.get("delete_archive", False),
                 )
 
     def on_finished(self, download_id: str, error: str = ""):
@@ -705,6 +915,30 @@ class DownloadQueue:
                 "done": list(self._done.values()),
             }
 
+    def export_for_persistence(self) -> list[dict]:
+        """Export queue items that can be restored on next app launch."""
+        with self._lock:
+            items: list[dict] = []
+            for item in self._active.values():
+                items.append({
+                    "id": item["id"],
+                    "name": item["name"],
+                    "source": item["source"],
+                    "so_id": item["so_id"],
+                    "save_path": item["save_path"],
+                    "start_requested": True,
+                })
+            for item in self._pending.values():
+                items.append({
+                    "id": item["id"],
+                    "name": item["name"],
+                    "source": item["source"],
+                    "so_id": item["so_id"],
+                    "save_path": item["save_path"],
+                    "start_requested": bool(item.get("start_requested", False)),
+                })
+            return items
+
 
 
 
@@ -718,26 +952,96 @@ class MinervaApp(tk.Tk):
         self._all_entries = []
         self._torrent_engine: TorrentEngine | None = None
         self._download_queue: DownloadQueue | None = None
-        self._download_dir = tk.StringVar(value=get_default_download_dir())
-        self._auto_extract_var = tk.BooleanVar(value=False)
-        self._delete_archive_var = tk.BooleanVar(value=False)
-        self._seven_zip_path = find_7zip_executable()
-        self._extract_tool_var = tk.StringVar(
-            value=(
-                f"7-Zip detected: {self._seven_zip_path}"
-                if self._seven_zip_path else
-                "7-Zip not found; using Python extraction for ZIPs"
-            )
+        self._settings = load_app_settings()
+        saved_download_dir = self._settings.get("download_dir")
+        if not isinstance(saved_download_dir, str) or not saved_download_dir.strip():
+            saved_download_dir = get_default_download_dir()
+        self._download_dir = tk.StringVar(value=saved_download_dir)
+        self._auto_extract_default_var = tk.BooleanVar(
+            value=bool(self._settings.get("auto_extract_default", True))
         )
+        self._delete_archive_default_var = tk.BooleanVar(
+            value=bool(self._settings.get("delete_archive_default", True))
+        )
+        self._compress_ps1_chd_var = tk.BooleanVar(
+            value=bool(self._settings.get("compress_ps1_chd", False))
+        )
+        self._show_tag_specs = [
+            ("demo", "Demo"),
+            ("beta", "Beta"),
+            ("revision", "Revision"),
+            ("proto", "Proto"),
+            ("unlicensed", "Unlicensed"),
+            ("hack", "Hack"),
+            ("translation", "Translation"),
+        ]
+        self._show_region_specs = [
+            ("usa", "USA"),
+            ("europe", "Europe"),
+            ("japan", "Japan"),
+            ("world", "World"),
+            ("asia", "Asia"),
+            ("korea", "Korea"),
+            ("china", "China"),
+            ("australia", "Australia"),
+            ("canada", "Canada"),
+            ("brazil", "Brazil"),
+            ("france", "France"),
+            ("germany", "Germany"),
+            ("italy", "Italy"),
+            ("spain", "Spain"),
+            ("netherlands", "Netherlands"),
+            ("sweden", "Sweden"),
+            ("russia", "Russia"),
+            ("taiwan", "Taiwan"),
+            ("hong_kong", "Hong Kong"),
+            ("other", "Other"),
+        ]
+        saved_hidden_tags = self._settings.get("hidden_tags", [])
+        if not isinstance(saved_hidden_tags, list):
+            saved_hidden_tags = []
+        saved_hidden_tags = set(t for t in saved_hidden_tags if isinstance(t, str))
+        saved_regions = self._settings.get("show_regions", [])
+        if not isinstance(saved_regions, list):
+            saved_regions = []
+        saved_regions = set(r for r in saved_regions if isinstance(r, str))
+        self._show_tag_vars = {
+            key: tk.BooleanVar(value=key in saved_hidden_tags)
+            for key, _ in self._show_tag_specs
+        }
+        self._show_region_vars = {
+            key: tk.BooleanVar(value=key in saved_regions)
+            for key, _ in self._show_region_specs
+        }
+        self._extractors = find_archive_extractors()
+        self._chdman_path = find_chdman_executable()
+        self._extract_tool_var = tk.StringVar(value=format_extractor_status(self._extractors))
         self._extract_status_var = tk.StringVar(value="")
+        self._chd_progress_var = tk.DoubleVar(value=0.0)
         # per-download extraction progress: id -> {pct, status}
         self._extract_progress: dict[str, dict] = {}
+        self._extract_request_queue: queue.Queue[str | None] = queue.Queue()
+        self._extract_pending_ids: set[str] = set()
+        self._extract_pending_lock = threading.Lock()
+        self._queued_selected_ids: set[str] = set()
+        self._left_loaded_nodes: set[str] = set()
+        self._left_loading_nodes: set[str] = set()
+        self._dl_speed_samples: dict[str, tuple[int, float]] = {}
+        self._chd_download_in_progress = False
+        self._chd_compress_in_progress = False
         # track per-id widget dicts for active and done rows
         self._dl_active_widgets: dict[str, dict] = {}
+        self._dl_queued_widgets: dict[str, dict] = {}
         self._dl_done_widgets: dict[str, dict] = {}
         self._checked_hrefs: set[str] = set()
         self._setup_styles()
         self._build_ui()
+        self._download_dir.trace_add("write", self._on_download_dir_change)
+        if self._compress_ps1_chd_var.get() and not self._chdman_path:
+            self._ensure_chdman_available_async()
+        self._restore_persisted_queue()
+        self._extract_worker_thread = threading.Thread(target=self._extract_worker_loop, daemon=True)
+        self._extract_worker_thread.start()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._load_left_tree()
         self._navigate(BROWSE_ROOT)
@@ -762,6 +1066,10 @@ class MinervaApp(tk.Tk):
         style.configure("Toolbar.TButton", background=PANEL, foreground=FG,
                         bordercolor=ACCENT, focuscolor=ACCENT, padding=(8, 4))
         style.map("Toolbar.TButton", background=[("active", SEL_BG)])
+        style.configure("Header.TButton", background=PANEL, foreground=FG,
+                        bordercolor=ACCENT, focuscolor=ACCENT, padding=(5, 2),
+                        font=("TkDefaultFont", 9))
+        style.map("Header.TButton", background=[("active", SEL_BG)])
         style.configure("Left.Treeview", background=PANEL, foreground=FG,
                         fieldbackground=PANEL, borderwidth=0, rowheight=24)
         style.map("Left.Treeview", background=[("selected", SEL_BG)], foreground=[("selected", FG)])
@@ -774,11 +1082,54 @@ class MinervaApp(tk.Tk):
                         font=("TkDefaultFont", 10, "bold"))
         style.configure("TEntry", fieldbackground=ENTRY_BG, foreground=FG,
                         insertcolor=FG, bordercolor=ACCENT, relief="flat", padding=4)
-        style.configure("TScrollbar", background=PANEL, troughcolor=BG,
-                        arrowcolor=FG_DIM, bordercolor=PANEL, darkcolor=PANEL, lightcolor=PANEL)
+        style.configure(
+            "TScrollbar",
+            background=SEL_BG,
+            troughcolor=PANEL,
+            arrowcolor=FG,
+            bordercolor=SEL_BG,
+            darkcolor=SEL_BG,
+            lightcolor=SEL_BG,
+            arrowsize=14,
+        )
+        style.map(
+            "TScrollbar",
+            background=[("active", ACCENT)],
+            arrowcolor=[("active", FG)],
+        )
+        style.configure(
+            "Visible.Vertical.TScrollbar",
+            background=SEL_BG,
+            troughcolor=PANEL,
+            arrowcolor=FG,
+            bordercolor=SEL_BG,
+            darkcolor=SEL_BG,
+            lightcolor=SEL_BG,
+            arrowsize=14,
+        )
+        style.configure(
+            "Visible.Horizontal.TScrollbar",
+            background=SEL_BG,
+            troughcolor=PANEL,
+            arrowcolor=FG,
+            bordercolor=SEL_BG,
+            darkcolor=SEL_BG,
+            lightcolor=SEL_BG,
+            arrowsize=14,
+        )
+        style.map(
+            "Visible.Vertical.TScrollbar",
+            background=[("active", ACCENT)],
+            arrowcolor=[("active", FG)],
+        )
+        style.map(
+            "Visible.Horizontal.TScrollbar",
+            background=[("active", ACCENT)],
+            arrowcolor=[("active", FG)],
+        )
 
     def _build_ui(self):
-        toolbar = ttk.Frame(self, style="Toolbar.TFrame", padding=(8, 4))
+        toolbar = ttk.Frame(self, style="Toolbar.TFrame", padding=(10, 6))
         toolbar.pack(fill="x", side="top")
         ttk.Label(toolbar, text="\U0001f5c2  MiNERVA Archive Browser",
                   background=PANEL, foreground=ACCENT,
@@ -790,7 +1141,8 @@ class MinervaApp(tk.Tk):
         self._loading_label.pack(side="right", padx=8)
 
         paned = ttk.PanedWindow(self, orient="horizontal")
-        paned.pack(fill="both", expand=True, padx=0, pady=0)
+        self._main_paned = paned
+        paned.pack(fill="both", expand=True, padx=0, pady=(2, 0))
 
         left_frame = ttk.Frame(paned, style="Panel.TFrame", width=250)
         left_frame.pack_propagate(False)
@@ -805,15 +1157,16 @@ class MinervaApp(tk.Tk):
         left_scroll.pack(side="right", fill="y")
         self._left_tree.pack(fill="both", expand=True)
         self._left_tree.bind("<<TreeviewSelect>>", self._on_left_select)
+        self._left_tree.bind("<<TreeviewOpen>>", self._on_left_open)
 
         right_frame = ttk.Frame(paned, style="TFrame")
         paned.add(right_frame, weight=1)
 
-        self._breadcrumb_frame = ttk.Frame(right_frame, padding=(8, 4))
+        self._breadcrumb_frame = ttk.Frame(right_frame, padding=(10, 6))
         self._breadcrumb_frame.pack(fill="x")
         self._update_breadcrumb()
 
-        search_frame = ttk.Frame(right_frame, padding=(8, 2))
+        search_frame = ttk.Frame(right_frame, padding=(10, 2))
         search_frame.pack(fill="x")
         ttk.Label(search_frame, text="\U0001f50d", background=BG, foreground=FG_DIM).pack(side="left")
         self._search_var = tk.StringVar()
@@ -821,9 +1174,61 @@ class MinervaApp(tk.Tk):
         search_entry = ttk.Entry(search_frame, textvariable=self._search_var, style="TEntry")
         search_entry.pack(side="left", fill="x", expand=True, padx=(4, 0))
 
+        filter_tags_row = tk.Frame(right_frame, bg=BG)
+        filter_tags_row.pack(fill="x", padx=10, pady=(4, 0))
+        tk.Label(
+            filter_tags_row,
+            text="Hide tags:",
+            bg=BG,
+            fg=FG_DIM,
+            font=("TkDefaultFont", 9)
+        ).pack(side="left")
+        for key, label in self._show_tag_specs:
+            tk.Checkbutton(
+                filter_tags_row,
+                text=label,
+                variable=self._show_tag_vars[key],
+                bg=BG,
+                fg=FG,
+                selectcolor=BG,
+                activebackground=BG,
+                activeforeground=FG,
+                relief="flat",
+                command=self._on_filter_change
+            ).pack(side="left", padx=(6, 0))
+
+        filter_regions_row = tk.Frame(right_frame, bg=BG)
+        filter_regions_row.pack(fill="x", padx=10, pady=(2, 4))
+        tk.Label(
+            filter_regions_row,
+            text="Show only regions:",
+            bg=BG,
+            fg=FG_DIM,
+            font=("TkDefaultFont", 9)
+        ).pack(anchor="w")
+        filter_regions_options = tk.Frame(filter_regions_row, bg=BG)
+        filter_regions_options.pack(fill="x")
+        for idx, (key, label) in enumerate(self._show_region_specs):
+            tk.Checkbutton(
+                filter_regions_options,
+                text=label,
+                variable=self._show_region_vars[key],
+                bg=BG,
+                fg=FG,
+                selectcolor=BG,
+                activebackground=BG,
+                activeforeground=FG,
+                relief="flat",
+                command=self._on_filter_change
+            ).grid(row=idx // 6, column=idx % 6, sticky="w", padx=(0, 10), pady=(0, 2))
+
         cols = ("check", "name", "size")
-        right_scroll_y = ttk.Scrollbar(right_frame, orient="vertical")
-        right_scroll_x = ttk.Scrollbar(right_frame, orient="horizontal")
+        right_scroll_y = ttk.Scrollbar(
+            right_frame, orient="vertical", style="Visible.Vertical.TScrollbar"
+        )
+        right_scroll_x = ttk.Scrollbar(
+            right_frame, orient="horizontal", style="Visible.Horizontal.TScrollbar"
+        )
         self._right_tree = ttk.Treeview(right_frame, style="Right.Treeview",
                                         columns=cols, show="headings",
                                         yscrollcommand=right_scroll_y.set,
@@ -837,14 +1242,14 @@ class MinervaApp(tk.Tk):
         self._right_tree.column("name", stretch=True, minwidth=200)
         self._right_tree.heading("size", text="Size")
         self._right_tree.column("size", width=100, stretch=False, anchor="e")
-        right_scroll_y.pack(side="right", fill="y")
-        right_scroll_x.pack(side="bottom", fill="x")
-        self._right_tree.pack(fill="both", expand=True, padx=(8, 0), pady=(4, 0))
+        right_scroll_y.pack(side="right", fill="y", padx=(0, 8))
+        right_scroll_x.pack(side="bottom", fill="x", padx=(10, 8))
+        self._right_tree.pack(fill="both", expand=True, padx=(10, 0), pady=(4, 0))
         self._right_tree.bind("<Double-1>", self._on_right_double_click)
         self._right_tree.bind("<Button-1>", self._on_right_click)
 
         # Inline selection action bar (hidden until items are checked)
-        self._sel_bar = tk.Frame(right_frame, bg=PANEL, pady=4)
+        self._sel_bar = tk.Frame(right_frame, bg=PANEL, pady=6)
         # Don't pack it yet — shown dynamically
 
         self._sel_count_lbl = tk.Label(
@@ -866,65 +1271,125 @@ class MinervaApp(tk.Tk):
             command=self._clear_checked
         ).pack(side="left", padx=4)
 
-        self._downloads_visible = False
+        self._downloads_visible = bool(self._settings.get("downloads_panel_open", False))
 
         # Downloads container (hidden by default)
         self._downloads_frame = tk.Frame(self, bg=PANEL)
 
-        # ── header row inside the panel ────────────────────────────────────
+        # ── header rows inside the panel ───────────────────────────────────
         hdr = tk.Frame(self._downloads_frame, bg=PANEL)
-        hdr.pack(fill="x", padx=6, pady=(4, 2))
+        hdr.pack(fill="x", padx=10, pady=(6, 2))
 
         tk.Label(hdr, text="Max concurrent:", bg=PANEL, fg=FG_DIM,
-                 font=("TkDefaultFont", 9)).pack(side="left")
-        self._max_concurrent_var = tk.IntVar(value=3)
+                 font=("TkDefaultFont", 9)).pack(side="left", padx=(0, 2))
+        self._max_concurrent_var = tk.IntVar(value=self._get_saved_max_concurrent())
         max_spin = tk.Spinbox(hdr, from_=1, to=10, width=3,
                               textvariable=self._max_concurrent_var,
                               command=self._on_max_concurrent_change,
                               bg=ENTRY_BG, fg=FG, buttonbackground=PANEL,
                               relief="flat", font=("TkDefaultFont", 9))
-        max_spin.pack(side="left", padx=(2, 12))
+        max_spin.pack(side="left", padx=(0, 10))
 
         tk.Label(hdr, text="Save to:", bg=PANEL, fg=FG_DIM,
-                 font=("TkDefaultFont", 9)).pack(side="left")
-        dir_entry = tk.Entry(hdr, textvariable=self._download_dir, width=32,
+                 font=("TkDefaultFont", 9)).pack(side="left", padx=(0, 4))
+        dir_entry = tk.Entry(hdr, textvariable=self._download_dir, width=1,
                              bg=ENTRY_BG, fg=FG, insertbackground=FG,
                              relief="flat", font=("TkDefaultFont", 9))
-        dir_entry.pack(side="left", padx=(2, 2))
-        ttk.Button(hdr, text="Browse…", style="Toolbar.TButton",
-                   command=self._browse_download_dir).pack(side="left", padx=(0, 8))
-
-        ttk.Button(hdr, text="Clear Completed", style="Toolbar.TButton",
-                   command=self._clear_completed).pack(side="right", padx=4)
-
+        dir_entry.pack(side="left", fill="x", expand=True, padx=(0, 6))
+        ttk.Button(hdr, text="Browse…", style="Header.TButton",
+                   command=self._browse_download_dir).pack(side="left", padx=(0, 6))
         tk.Checkbutton(
             hdr,
             text="Auto extract",
-            variable=self._auto_extract_var,
+            variable=self._auto_extract_default_var,
             bg=PANEL,
             fg=FG,
             selectcolor=PANEL,
             activebackground=PANEL,
             activeforeground=FG,
             relief="flat",
-            command=self._on_extract_options_change,
-        ).pack(side="right", padx=(0, 8))
-
+            command=self._on_extract_defaults_change,
+        ).pack(side="left", padx=(4, 0))
         tk.Checkbutton(
             hdr,
-            text="Delete archive after extract",
-            variable=self._delete_archive_var,
+            text="Delete archive",
+            variable=self._delete_archive_default_var,
             bg=PANEL,
             fg=FG,
             selectcolor=PANEL,
             activebackground=PANEL,
             activeforeground=FG,
             relief="flat",
-            command=self._on_extract_options_change,
-        ).pack(side="right", padx=(0, 8))
+            command=self._on_extract_defaults_change,
+        ).pack(side="left", padx=(4, 0))
+        tk.Checkbutton(
+            hdr,
+            text="Compress PS1 to CHD",
+            variable=self._compress_ps1_chd_var,
+            bg=PANEL,
+            fg=FG,
+            selectcolor=PANEL,
+            activebackground=PANEL,
+            activeforeground=FG,
+            relief="flat",
+            command=self._on_extract_defaults_change,
+        ).pack(side="left", padx=(6, 0))
+
+        hdr_actions = tk.Frame(self._downloads_frame, bg=PANEL)
+        hdr_actions.pack(fill="x", padx=10, pady=(0, 4))
+        ttk.Button(
+            hdr_actions,
+            text="Open Downloads",
+            style="Header.TButton",
+            command=self._open_current_downloads_folder
+        ).pack(side="left", padx=(0, 6))
+        ttk.Button(
+            hdr_actions,
+            text="Open Extracted",
+            style="Header.TButton",
+            command=self._open_current_extracted_folder
+        ).pack(side="left", padx=(0, 6))
+        ttk.Button(
+            hdr_actions,
+            text="Verify Extracted",
+            style="Header.TButton",
+            command=self._verify_extracted_button_click
+        ).pack(side="left", padx=(0, 6))
+        ttk.Button(
+            hdr_actions,
+            text="Compress PS1→CHD",
+            style="Header.TButton",
+            command=self._compress_ps1_button_click
+        ).pack(side="left", padx=(0, 6))
+        ttk.Button(
+            hdr_actions,
+            text="Clean BIN/CUE",
+            style="Header.TButton",
+            command=self._clean_bin_cue_button_click
+        ).pack(side="left", padx=(0, 6))
+        ttk.Button(
+            hdr_actions,
+            text="Clean Names",
+            style="Header.TButton",
+            command=self._clean_chd_names_button_click
+        ).pack(side="left", padx=(0, 6))
+        ttk.Button(
+            hdr_actions,
+            text="Delete BINs",
+            style="Header.TButton",
+            command=self._force_delete_bins_button_click
+        ).pack(side="left", padx=(0, 6))
+        ttk.Button(hdr_actions, text="Pause/Resume", style="Header.TButton",
+                   command=self._toggle_pause_all_active).pack(side="left", padx=(8, 6))
+        ttk.Button(hdr_actions, text="Start All Queued", style="Header.TButton",
+                   command=self._start_all_queued).pack(side="left", padx=(0, 6))
+        ttk.Button(hdr_actions, text="Start Selected", style="Header.TButton",
+                   command=self._start_selected_queued).pack(side="left", padx=(0, 6))
+        ttk.Button(hdr_actions, text="Clear Completed", style="Header.TButton",
+                   command=self._clear_completed).pack(side="left", padx=(0, 0))
 
         info_row = tk.Frame(self._downloads_frame, bg=PANEL)
-        info_row.pack(fill="x", padx=6, pady=(0, 2))
+        info_row.pack(fill="x", padx=10, pady=(0, 4))
         tk.Label(
             info_row,
             textvariable=self._extract_tool_var,
@@ -941,17 +1406,28 @@ class MinervaApp(tk.Tk):
             font=("TkDefaultFont", 8),
             anchor="e",
         ).pack(side="right")
+        ttk.Progressbar(
+            info_row,
+            variable=self._chd_progress_var,
+            maximum=100,
+            mode="determinate",
+            length=180,
+        ).pack(side="right", padx=(0, 8))
 
         # Separator
-        tk.Frame(self._downloads_frame, bg=SEL_BG, height=1).pack(fill="x", padx=4)
+        tk.Frame(self._downloads_frame, bg=SEL_BG, height=1).pack(fill="x", padx=8)
 
         # Scrollable inner area
         dl_canvas_frame = tk.Frame(self._downloads_frame, bg=PANEL)
         dl_canvas_frame.pack(fill="both", expand=True)
         dl_canvas = tk.Canvas(dl_canvas_frame, bg=PANEL, bd=0,
                               highlightthickness=0, height=180)
-        dl_scrollbar = ttk.Scrollbar(dl_canvas_frame, orient="vertical",
-                                     command=dl_canvas.yview)
+        dl_scrollbar = ttk.Scrollbar(
+            dl_canvas_frame,
+            orient="vertical",
+            style="Visible.Vertical.TScrollbar",
+            command=dl_canvas.yview
+        )
         dl_scrollbar.pack(side="right", fill="y")
         dl_canvas.pack(side="left", fill="both", expand=True)
         dl_canvas.configure(yscrollcommand=dl_scrollbar.set)
@@ -965,14 +1441,16 @@ class MinervaApp(tk.Tk):
         dl_canvas.bind("<Configure>",
             lambda e: dl_canvas.itemconfig(self._dl_canvas_window, width=e.width))
 
-        # The toggle button sits just above status bar
+        # The toggle button sits near the top for quicker access
         self._downloads_toggle_btn = ttk.Button(
             self,
             text="📥 Downloads",
             style="Toolbar.TButton",
             command=self._toggle_downloads,
         )
-        self._downloads_toggle_btn.pack(side="bottom", fill="x")
+        self._downloads_toggle_btn.pack(side="top", fill="x", padx=8, pady=(6, 0), before=self._main_paned)
+        if self._downloads_visible:
+            self._downloads_frame.pack(side="top", fill="x", pady=(6, 0), before=self._main_paned)
 
         self._poll_downloads()
 
@@ -1010,6 +1488,7 @@ class MinervaApp(tk.Tk):
                 entries = fetch_entries(BROWSE_ROOT)
             except Exception as e:
                 entries = []
+                log_error("MinervaApp._load_left_tree failed", e)
                 self.after(0, lambda: self._show_error(str(e)))
             self.after(0, lambda: self._populate_left_tree(entries))
 
@@ -1018,17 +1497,60 @@ class MinervaApp(tk.Tk):
     def _populate_left_tree(self, entries):
         self._set_loading(False)
         self._left_tree.delete(*self._left_tree.get_children())
+        self._left_loaded_nodes.clear()
+        self._left_loading_nodes.clear()
+        self._left_loaded_nodes.add(BROWSE_ROOT)
         for e in entries:
             if e["is_folder"]:
-                display = "\U0001f4c1 " + e["name"]
-                iid = e["href"]
-                self._left_tree.insert("", "end", iid=iid, text=display, tags=("folder",))
+                self._insert_left_folder("", e)
 
     def _on_left_select(self, event):
         sel = self._left_tree.selection()
         if sel:
             path = sel[0]
+            self._expand_left_path(path)
             self._navigate(path)
+
+    def _on_left_open(self, event):
+        path = self._left_tree.focus()
+        if path:
+            self._expand_left_path(path)
+
+    def _insert_left_folder(self, parent_iid: str, entry: dict):
+        display = "\U0001f4c1 " + entry["name"]
+        iid = entry["href"]
+        if self._left_tree.exists(iid):
+            return
+        self._left_tree.insert(parent_iid, "end", iid=iid, text=display, tags=("folder",))
+        # Add placeholder so tree item can be expanded before children are loaded.
+        self._left_tree.insert(iid, "end", text="")
+
+    def _expand_left_path(self, path: str):
+        if path in self._left_loaded_nodes or path in self._left_loading_nodes:
+            return
+        if not self._left_tree.exists(path):
+            return
+        self._left_loading_nodes.add(path)
+
+        def worker():
+            try:
+                entries = fetch_entries(path)
+                self.after(0, lambda: self._populate_left_children(path, entries))
+            except Exception as e:
+                log_error(f"MinervaApp._expand_left_path failed for path={path}", e)
+                self.after(0, lambda: self._left_loading_nodes.discard(path))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _populate_left_children(self, parent_path: str, entries: list[dict]):
+        self._left_loading_nodes.discard(parent_path)
+        if not self._left_tree.exists(parent_path):
+            return
+        self._left_tree.delete(*self._left_tree.get_children(parent_path))
+        for e in entries:
+            if e.get("is_folder"):
+                self._insert_left_folder(parent_path, e)
+        self._left_loaded_nodes.add(parent_path)
 
     def _navigate(self, path):
         self._current_path = path
@@ -1044,6 +1566,7 @@ class MinervaApp(tk.Tk):
                 entries = fetch_entries(path)
                 self.after(0, lambda: self._populate_right(entries))
             except Exception as e:
+                log_error(f"MinervaApp._navigate failed for path={path}", e)
                 self.after(0, lambda: self._show_error(str(e)))
 
         threading.Thread(target=worker, daemon=True).start()
@@ -1051,15 +1574,7 @@ class MinervaApp(tk.Tk):
     def _populate_right(self, entries):
         self._set_loading(False)
         self._all_entries = entries
-        self._checked_hrefs.clear()
-        self._right_tree.delete(*self._right_tree.get_children())
-        for e in entries:
-            icon = "\U0001f4c1 " if e["is_folder"] else "\U0001f4c4 "
-            self._right_tree.insert("", "end", iid=e["href"],
-                                    values=("", icon + e["name"], e["size"]),
-                                    tags=("folder" if e["is_folder"] else "file",))
-        self._update_sel_bar()
-        self._update_status(entries)
+        self._render_right_list()
 
     def _update_status(self, entries):
         folders = sum(1 for e in entries if e["is_folder"])
@@ -1073,16 +1588,131 @@ class MinervaApp(tk.Tk):
         self._status_var.set(f"{', '.join(parts)} ({total} items total)  |  {self._current_path}")
 
     def _on_search_change(self, *_):
+        self._render_right_list()
+
+    def _on_filter_change(self):
+        self._render_right_list()
+        self._save_settings()
+
+    def _render_right_list(self):
         query = self._search_var.get().lower()
+        filtered = [e for e in self._all_entries if self._entry_matches_filters(e, query)]
+        visible_files = [e for e in filtered if not e.get("is_folder", False)]
         self._right_tree.delete(*self._right_tree.get_children())
-        filtered = [e for e in self._all_entries if query in e["name"].lower()] if query else self._all_entries
-        for e in filtered:
-            icon = "\U0001f4c1 " if e["is_folder"] else "\U0001f4c4 "
+        visible_hrefs = {e["href"] for e in visible_files}
+        self._checked_hrefs.intersection_update(visible_hrefs)
+        for e in visible_files:
+            icon = "\U0001f4c4 "
             self._right_tree.insert("", "end", iid=e["href"],
                                     values=("", icon + e["name"], e["size"]),
-                                    tags=("folder" if e["is_folder"] else "file",))
+                                    tags=("file",))
+            if e["href"] in self._checked_hrefs:
+                self._right_tree.set(e["href"], "check", "✓")
         self._update_sel_bar()
-        self._update_status(filtered)
+        self._update_status(visible_files)
+
+    def _entry_matches_filters(self, entry: dict, query: str) -> bool:
+        name = entry.get("name", "")
+        low = name.lower()
+        if query and query not in low:
+            return False
+
+        if not entry.get("is_folder", False):
+            selected_tags = {key for key, var in self._show_tag_vars.items() if var.get()}
+            selected_regions = {key for key, var in self._show_region_vars.items() if var.get()}
+
+            if selected_tags:
+                tags = self._detect_release_tags(low)
+                if tags.intersection(selected_tags):
+                    return False
+            if selected_regions:
+                regions = self._detect_regions(low)
+                if not regions.intersection(selected_regions):
+                    return False
+
+        return True
+
+    @staticmethod
+    def _detect_release_tags(name_lower: str) -> set[str]:
+        tags = set()
+        if "(demo" in name_lower or " demo" in name_lower:
+            tags.add("demo")
+        if "(beta" in name_lower or " beta" in name_lower:
+            tags.add("beta")
+        if "(rev" in name_lower or "(revision" in name_lower:
+            tags.add("revision")
+        if "(proto" in name_lower or "prototype" in name_lower:
+            tags.add("proto")
+        if "(unl" in name_lower or "unlicensed" in name_lower:
+            tags.add("unlicensed")
+        if "(hack" in name_lower or "hack)" in name_lower:
+            tags.add("hack")
+        if "(translation" in name_lower or "(t+" in name_lower:
+            tags.add("translation")
+        return tags
+
+    @staticmethod
+    def _detect_regions(name_lower: str) -> set[str]:
+        regions = set()
+
+        def has_any(*needles: str) -> bool:
+            return any(n in name_lower for n in needles)
+
+        if has_any("(usa", "(us", "(u)", "usa/", "/usa", "usa,"):
+            regions.add("usa")
+        if has_any("(europe", "(eu", "(e)", "europe/", "/europe", "europe,"):
+            regions.add("europe")
+        if has_any("(japan", "(jp", "(j)", "japan/", "/japan", "japan,"):
+            regions.add("japan")
+        if has_any("(world", "(w)", "(global"):
+            regions.add("world")
+        if has_any("(asia", "(a)"):
+            regions.add("asia")
+        if has_any("(korea", "(kr", "(k)"):
+            regions.add("korea")
+        if has_any("(china", "(cn", "(c)"):
+            regions.add("china")
+        if has_any("(australia", "(au"):
+            regions.add("australia")
+        if has_any("(canada", "(ca"):
+            regions.add("canada")
+        if has_any("(brazil", "(br"):
+            regions.add("brazil")
+        if has_any("(france", "(fr", "(f)"):
+            regions.add("france")
+        if has_any("(germany", "(de", "(g)"):
+            regions.add("germany")
+        if has_any("(italy", "(it", "(i)"):
+            regions.add("italy")
+        if has_any("(spain", "(es", "(s)"):
+            regions.add("spain")
+        if has_any("(netherlands", "(nl"):
+            regions.add("netherlands")
+        if has_any("(sweden", "(se", "(sw)"):
+            regions.add("sweden")
+        if has_any("(russia", "(ru"):
+            regions.add("russia")
+        if has_any("(taiwan", "(tw"):
+            regions.add("taiwan")
+        if has_any("(hong kong", "(hk"):
+            regions.add("hong_kong")
+
+        # Handle compact combo region codes commonly seen in ROM sets, e.g. (UE), (JU), (JUE)
+        for grp in re.findall(r"\(([^)]*)\)", name_lower):
+            compact = re.sub(r"[^a-z]", "", grp)
+            if compact in {"u", "e", "j", "w", "ue", "uj", "uw", "ej", "ew", "jw", "uej", "uew", "ujw", "ejw", "uejw"}:
+                if "u" in compact:
+                    regions.add("usa")
+                if "e" in compact:
+                    regions.add("europe")
+                if "j" in compact:
+                    regions.add("japan")
+                if "w" in compact:
+                    regions.add("world")
+
+        if not regions:
+            regions.add("other")
+        return regions
 
     def _on_right_double_click(self, event):
         sel = self._right_tree.selection()
@@ -1122,19 +1752,25 @@ class MinervaApp(tk.Tk):
         else:
             webbrowser.open(BASE_URL + self._current_path)
 
-    def get_torrent_engine(self) -> "TorrentEngine | None":
+    def get_torrent_engine(self, show_errors: bool = True) -> "TorrentEngine | None":
         if not _LT_AVAILABLE:
-            messagebox.showinfo(
-                "libtorrent required",
-                "Install libtorrent to enable downloads:\n  pip install libtorrent",
-            )
+            if show_errors:
+                messagebox.showinfo(
+                    "libtorrent required",
+                    "Install libtorrent to enable downloads:\n  pip install libtorrent",
+                )
             return None
         if self._torrent_engine is None:
             try:
                 self._torrent_engine = TorrentEngine()
-                self._download_queue = DownloadQueue(self._torrent_engine, max_active=3)
+                self._download_queue = DownloadQueue(
+                    self._torrent_engine,
+                    max_active=self._get_current_max_concurrent()
+                )
             except Exception as e:
-                messagebox.showerror("Engine Error", f"Could not start torrent engine:\n{e}")
+                log_error("MinervaApp.get_torrent_engine failed to start engine", e)
+                if show_errors:
+                    messagebox.showerror("Engine Error", f"Could not start torrent engine:\n{e}")
                 return None
         return self._torrent_engine
 
@@ -1145,19 +1781,18 @@ class MinervaApp(tk.Tk):
         engine = self.get_torrent_engine()
         if engine is None:
             return
-        auto_extract = bool(self._auto_extract_var.get())
-        delete_archive = bool(self._delete_archive_var.get())
-        self._download_queue.enqueue(download_id, name, source, so_id, save_path,
-                                     auto_extract=auto_extract, delete_archive=delete_archive)
+        self._download_queue.enqueue(download_id, name, source, so_id, save_path)
+        self._save_settings()
         if not self._downloads_visible:
             self._toggle_downloads()
 
     def _toggle_downloads(self):
         self._downloads_visible = not self._downloads_visible
         if self._downloads_visible:
-            self._downloads_frame.pack(side="bottom", fill="x", before=self._downloads_toggle_btn)
+            self._downloads_frame.pack(side="top", fill="x", pady=(6, 0), before=self._main_paned)
         else:
             self._downloads_frame.pack_forget()
+        self._save_settings()
 
     def _refresh_toggle_label(self):
         if self._download_queue is None:
@@ -1179,6 +1814,8 @@ class MinervaApp(tk.Tk):
     def _poll_downloads(self):
         if self._torrent_engine is not None and self._download_queue is not None:
             # Drain engine events
+            finished_ids = []
+            queue_changed = False
             while True:
                 try:
                     event = self._torrent_engine.events.get_nowait()
@@ -1187,14 +1824,18 @@ class MinervaApp(tk.Tk):
                 etype = event.get("type")
                 did = event.get("id", "")
                 if etype == "finished":
+                    self._normalize_downloaded_file_location(did)
+                    self._torrent_engine.stop_seeding(did)
                     self._download_queue.on_finished(did)
-                    # Extract if checkbox is on OR if the download was queued with auto_extract=True
-                    meta = self._torrent_engine._meta.get(did) if self._torrent_engine else None
-                    should_extract = self._auto_extract_var.get() or bool(meta and meta.get("auto_extract"))
-                    if should_extract:
-                        self._extract_download(did)
+                    finished_ids.append(did)
+                    queue_changed = True
                 elif etype == "error":
                     self._download_queue.on_finished(did, error=event.get("msg", "Unknown error"))
+                    queue_changed = True
+            if finished_ids:
+                self._prompt_post_download_actions_batch(finished_ids)
+            if queue_changed:
+                self._save_settings()
 
             # Rebuild the inner panel from queue snapshot
             snap = self._download_queue.snapshot()
@@ -1203,8 +1844,49 @@ class MinervaApp(tk.Tk):
 
         self.after(500, self._poll_downloads)
 
+    def _normalize_downloaded_file_location(self, download_id: str):
+        """Move completed archive from mirrored category folders to save_path root."""
+        if not self._torrent_engine:
+            return
+        meta = self._torrent_engine._meta.get(download_id)
+        if not meta:
+            return
+        file_name = meta.get("name", "")
+        if not file_name:
+            return
+        save_path = pathlib.Path(meta.get("save_path", ""))
+        if not str(save_path):
+            return
+        target = save_path / file_name
+        if target.exists():
+            return
+        try:
+            src = None
+            for _ in range(10):
+                src = self._find_downloaded_file(save_path, file_name)
+                if src is not None:
+                    break
+                time.sleep(1)
+            if src is None or src == target:
+                return
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if target.exists():
+                try:
+                    target.unlink()
+                except OSError:
+                    pass
+            src.replace(target)
+            log_activity(f"download.flatten id={download_id} src='{src}' dst='{target}'")
+        except Exception as e:
+            log_error(
+                f"MinervaApp._normalize_downloaded_file_location failed for {file_name}",
+                e
+            )
+
     def _rebuild_dl_panel(self, snap: dict):
         active_ids = set(snap["active"])
+        pending_ids = {item["id"] for item in snap["pending"]}
+        self._queued_selected_ids.intersection_update(pending_ids)
         statuses = self._torrent_engine.get_all_statuses() if self._torrent_engine else {}
 
         # ── remove widgets for ids no longer present ──
@@ -1212,6 +1894,7 @@ class MinervaApp(tk.Tk):
         for did in gone:
             w = self._dl_active_widgets.pop(did)
             w["frame"].destroy()
+            self._dl_speed_samples.pop(did, None)
 
         # ── active downloads ──
         for did in snap["active"]:
@@ -1220,18 +1903,32 @@ class MinervaApp(tk.Tk):
                 self._make_active_row(did, st.get("name", did))
             self._update_active_row(did, st)
 
-        # ── queued items (re-render each poll cycle — list is usually short) ──
+        # ── queued items ──
         if not hasattr(self, "_dl_queued_frame"):
             self._dl_queued_frame = tk.Frame(self._dl_inner, bg=PANEL)
             self._dl_queued_frame.pack(fill="x")
-        for w in self._dl_queued_frame.winfo_children():
-            w.destroy()
+        pending_map = {item["id"]: item for item in snap["pending"]}
+        gone_pending = [did for did in list(self._dl_queued_widgets) if did not in pending_map]
+        for did in gone_pending:
+            w = self._dl_queued_widgets.pop(did)
+            w["frame"].destroy()
 
-        if snap["pending"]:
-            tk.Label(self._dl_queued_frame, text="  QUEUED",
-                     bg=PANEL, fg=FG_DIM, font=("TkDefaultFont", 8, "bold")).pack(anchor="w", padx=6)
+        if pending_map:
+            if not hasattr(self, "_dl_queued_header") or not self._dl_queued_header.winfo_exists():
+                self._dl_queued_header = tk.Label(
+                    self._dl_queued_frame, text="  QUEUED",
+                    bg=PANEL, fg=FG_DIM, font=("TkDefaultFont", 8, "bold")
+                )
+                self._dl_queued_header.pack(anchor="w", padx=6)
             for item in snap["pending"]:
-                self._make_queued_row(self._dl_queued_frame, item)
+                did = item["id"]
+                if did not in self._dl_queued_widgets:
+                    self._make_queued_row(self._dl_queued_frame, item)
+                self._update_queued_row(did, item)
+        else:
+            if hasattr(self, "_dl_queued_header") and self._dl_queued_header.winfo_exists():
+                self._dl_queued_header.destroy()
+                del self._dl_queued_header
 
         # ── completed ──
         if not hasattr(self, "_dl_done_frame"):
@@ -1288,9 +1985,9 @@ class MinervaApp(tk.Tk):
                              font=("TkDefaultFont", 9), width=11)
         state_lbl.pack(side="left")
 
-        pause_btn = ttk.Button(row, text="⏸", width=2,
+        pause_btn = ttk.Button(row, text="⏸", width=3,
                                command=lambda d=did: self._toggle_pause(d))
-        pause_btn.pack(side="left", padx=2)
+        pause_btn.pack(side="left", padx=(2, 3))
 
         cancel_btn = ttk.Button(row, text="✕", width=2,
                                 command=lambda d=did: self._cancel_download(d))
@@ -1312,24 +2009,69 @@ class MinervaApp(tk.Tk):
         pct = st.get("progress", 0) * 100
         w["pv"].set(pct)
         w["pct_lbl"].config(text=f"{pct:.0f}%")
-        rate = st.get("download_rate", 0)
-        w["speed_lbl"].config(text=self._fmt_rate(rate))
         state = st.get("state", "—")
-        w["state_lbl"].config(text=state)
         paused = st.get("paused", False)
+        total_done = int(st.get("total_done", 0) or 0)
+        now = time.monotonic()
+        sample = self._dl_speed_samples.get(did)
+        calc_rate = 0.0
+        if sample is not None:
+            prev_done, prev_ts = sample
+            delta_bytes = max(0, total_done - prev_done)
+            delta_t = max(1e-6, now - prev_ts)
+            calc_rate = delta_bytes / delta_t
+        self._dl_speed_samples[did] = (total_done, now)
+        raw_rate = float(st.get("download_rate", 0) or 0.0)
+        rate = calc_rate if (state == "Downloading" and not paused and calc_rate > 0) else raw_rate
+        w["speed_lbl"].config(text=self._fmt_rate(rate))
+        w["state_lbl"].config(text=state)
         w["pause_btn"].config(text="▶" if paused else "⏸")
 
     def _make_queued_row(self, parent: tk.Frame, item: dict):
         row = tk.Frame(parent, bg=PANEL)
         row.pack(fill="x")
+        did = item["id"]
+        is_selected = did in self._queued_selected_ids
+        sel_var = tk.BooleanVar(value=is_selected)
+        tk.Checkbutton(
+            row,
+            variable=sel_var,
+            bg=PANEL,
+            fg=FG,
+            selectcolor=PANEL,
+            activebackground=PANEL,
+            activeforeground=FG,
+            relief="flat",
+            command=lambda d=did, v=sel_var: self._set_queued_selected(d, v.get())
+        ).pack(side="left", padx=(4, 2))
         name = item["name"]
         tk.Label(row, text="🕐 " + (name[:48] + "…" if len(name) > 48 else name),
-                 bg=PANEL, fg=FG_DIM, font=("TkDefaultFont", 9), anchor="w").pack(side="left", padx=(6, 4))
-        tk.Label(row, text="Queued", bg=PANEL, fg=FG_DIM,
-                 font=("TkDefaultFont", 9), anchor="w").pack(side="left")
+                 bg=PANEL, fg=FG_DIM, font=("TkDefaultFont", 9), anchor="w").pack(side="left", padx=(2, 4))
+        state_lbl = tk.Label(row, text="Queued", bg=PANEL, fg=FG_DIM,
+                             font=("TkDefaultFont", 9), anchor="w")
+        state_lbl.pack(side="left")
+        ttk.Button(row, text="Start", width=6,
+                   command=lambda d=did: self._start_specific_queued(d)
+                   ).pack(side="right", padx=(0, 4))
         ttk.Button(row, text="✕", width=2,
-                   command=lambda d=item["id"]: self._cancel_download(d)
+                   command=lambda d=did: self._cancel_download(d)
                    ).pack(side="right", padx=4)
+        self._dl_queued_widgets[did] = {
+            "frame": row,
+            "sel_var": sel_var,
+            "state_lbl": state_lbl,
+        }
+
+    def _update_queued_row(self, download_id: str, item: dict):
+        w = self._dl_queued_widgets.get(download_id)
+        if not w:
+            return
+        try:
+            w["sel_var"].set(download_id in self._queued_selected_ids)
+            status = "Ready" if item.get("start_requested") else "Queued"
+            w["state_lbl"].config(text=status)
+        except tk.TclError:
+            pass
 
     def _make_done_row(self, parent: tk.Frame, item: dict):
         did = item["id"]
@@ -1354,6 +2096,22 @@ class MinervaApp(tk.Tk):
         ext_lbl = tk.Label(row, text="", bg=PANEL, fg=ACCENT,
                            font=("TkDefaultFont", 8), width=16, anchor="w")
         ext_lbl.pack(side="left", padx=(0, 4))
+
+        open_btn = ttk.Button(
+            row,
+            text="Open",
+            width=5,
+            command=lambda p=item.get("save_path", ""): self._open_folder(pathlib.Path(p))
+        )
+        open_btn.pack(side="right", padx=(0, 4))
+
+        open_extracted_btn = ttk.Button(
+            row,
+            text="Extracted",
+            width=9,
+            command=lambda p=item.get("save_path", ""): self._open_folder(pathlib.Path(p) / "extracted")
+        )
+        open_extracted_btn.pack(side="right", padx=(0, 4))
 
         self._dl_done_widgets[did] = {
             "frame": row,
@@ -1401,12 +2159,303 @@ class MinervaApp(tk.Tk):
                 self._download_queue.set_max_active(n)
             except (ValueError, tk.TclError):
                 pass
+        self._save_settings()
+
+    @staticmethod
+    def _sanitize_max_concurrent(value, fallback: int = 3) -> int:
+        try:
+            return max(1, min(10, int(value)))
+        except (TypeError, ValueError):
+            return fallback
+
+    def _get_saved_max_concurrent(self) -> int:
+        return self._sanitize_max_concurrent(self._settings.get("max_concurrent"), fallback=3)
+
+    def _get_current_max_concurrent(self) -> int:
+        try:
+            return self._sanitize_max_concurrent(self._max_concurrent_var.get(), fallback=3)
+        except tk.TclError:
+            return self._get_saved_max_concurrent()
+
+    def _collect_settings(self) -> dict:
+        hidden_tags = [key for key, var in self._show_tag_vars.items() if var.get()]
+        show_regions = [key for key, var in self._show_region_vars.items() if var.get()]
+        return {
+            "download_dir": self.get_download_dir(),
+            "max_concurrent": self._get_current_max_concurrent(),
+            "hidden_tags": hidden_tags,
+            "show_regions": show_regions,
+            "downloads_panel_open": bool(self._downloads_visible),
+            "auto_extract_default": bool(self._auto_extract_default_var.get()),
+            "delete_archive_default": bool(self._delete_archive_default_var.get()),
+            "compress_ps1_chd": bool(self._compress_ps1_chd_var.get()),
+            "download_queue": self._get_persisted_queue_for_settings(),
+        }
+
+    def _save_settings(self):
+        settings = self._collect_settings()
+        save_app_settings(settings)
+        self._settings = settings
+
+    @staticmethod
+    def _normalize_queue_item(raw: dict) -> dict | None:
+        if not isinstance(raw, dict):
+            return None
+        name = raw.get("name")
+        source = raw.get("source")
+        save_path = raw.get("save_path")
+        if not isinstance(name, str) or not name.strip():
+            return None
+        if not isinstance(source, str) or not source.strip():
+            return None
+        if not isinstance(save_path, str) or not save_path.strip():
+            return None
+        try:
+            so_id = int(raw.get("so_id"))
+        except (TypeError, ValueError):
+            return None
+        if so_id < 0:
+            return None
+        download_id = raw.get("id")
+        if not isinstance(download_id, str) or not download_id.strip():
+            download_id = str(uuid.uuid4())
+        return {
+            "id": download_id,
+            "name": name,
+            "source": source,
+            "so_id": so_id,
+            "save_path": save_path,
+            "start_requested": bool(raw.get("start_requested", False)),
+        }
+
+    def _get_persisted_queue_for_settings(self) -> list[dict]:
+        if self._download_queue is not None:
+            return self._download_queue.export_for_persistence()
+        existing = self._settings.get("download_queue", [])
+        if not isinstance(existing, list):
+            return []
+        cleaned: list[dict] = []
+        for raw in existing:
+            item = self._normalize_queue_item(raw)
+            if item is not None:
+                cleaned.append(item)
+        return cleaned
+
+    def _restore_persisted_queue(self):
+        saved = self._settings.get("download_queue", [])
+        if not isinstance(saved, list) or not saved:
+            return
+        if not _LT_AVAILABLE:
+            return
+        engine = self.get_torrent_engine(show_errors=False)
+        if engine is None or self._download_queue is None:
+            return
+
+        requested_ids: list[str] = []
+        seen_ids: set[str] = set()
+        restored_any = False
+        for raw in saved:
+            item = self._normalize_queue_item(raw)
+            if item is None:
+                continue
+            did = item["id"]
+            while did in seen_ids:
+                did = str(uuid.uuid4())
+            seen_ids.add(did)
+            item["id"] = did
+            self._download_queue.enqueue(
+                did,
+                item["name"],
+                item["source"],
+                item["so_id"],
+                item["save_path"],
+            )
+            restored_any = True
+            if item["start_requested"]:
+                requested_ids.append(did)
+
+        if requested_ids:
+            self._download_queue.start_selected(requested_ids)
+        if restored_any:
+            self._refresh_toggle_label()
+            self._save_settings()
+
+    def _on_download_dir_change(self, *_):
+        self._save_settings()
+
+    def _on_extract_defaults_change(self):
+        if self._compress_ps1_chd_var.get() and not self._chdman_path:
+            self._extract_status_var.set("PS1→CHD enabled but chdman.exe not found")
+            self._ensure_chdman_available_async()
+        elif self._chdman_path:
+            self._extract_status_var.set(f"CHD tool: {self._chdman_path}")
+        else:
+            self._extract_status_var.set("")
+        self._save_settings()
+
+    def _ensure_chdman_available_async(self):
+        if self._chd_download_in_progress or self._chdman_path:
+            return
+        self._chd_download_in_progress = True
+        self._extract_status_var.set("Installing CHD tool (chdman)…")
+
+        def worker():
+            path = self._auto_install_chdman()
+            self.after(0, lambda p=path: self._finish_chdman_install(p))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _auto_install_chdman(self) -> str | None:
+        found = find_chdman_executable()
+        if found:
+            return found
+
+        base = get_runtime_base_dir()
+        tmp_root = base / "_chdman_install_tmp"
+        pkg_path = tmp_root / "mame_release_windows_x64.exe"
+        extract_dir = tmp_root / "extracted"
+        out_dir = base / "tools" / "chdman"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = out_dir / "chdman.exe"
+
+        try:
+            if tmp_root.exists():
+                shutil.rmtree(tmp_root, ignore_errors=True)
+            tmp_root.mkdir(parents=True, exist_ok=True)
+            extract_dir.mkdir(parents=True, exist_ok=True)
+
+            release_url = "https://www.mamedev.org/release.html"
+            req = urllib.request.Request(release_url, headers={"User-Agent": "MiNERVA-Browser/1.0"})
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                html = resp.read().decode("utf-8", errors="replace")
+
+            links = re.findall(r'href="([^"]*mame\d+b_(?:x64|64bit)\.exe[^"]*)"', html, flags=re.IGNORECASE)
+            if not links:
+                raise RuntimeError("Could not find Windows x64 MAME binary link on release page")
+            mame_url = urllib.parse.urljoin(release_url, links[0].split('"')[0])
+            log_activity(f"chd.install.download url='{mame_url}'")
+
+            dl_req = urllib.request.Request(mame_url, headers={"User-Agent": "MiNERVA-Browser/1.0"})
+            with urllib.request.urlopen(dl_req, timeout=120) as resp, pkg_path.open("wb") as f:
+                while True:
+                    chunk = resp.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+
+            if not pkg_path.exists() or pkg_path.stat().st_size <= 0:
+                raise RuntimeError("Downloaded MAME package is empty")
+
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            startupinfo.wShowWindow = 6  # SW_MINIMIZE
+
+            extracted_ok = False
+            last_err = ""
+            for tool in self._extractors:
+                if tool["kind"] in ("7zip", "peazip"):
+                    cmd = [tool["exe"], "x", "-y", "-aoa", f"-o{extract_dir}", str(pkg_path)]
+                elif tool["kind"] == "winrar":
+                    cmd = [tool["exe"], "x", "-y", "-o+", str(pkg_path), str(extract_dir) + "\\"]
+                else:
+                    continue
+                log_activity(f"chd.install.extract tool={tool['label']} cmd={' '.join(cmd)}")
+                proc = subprocess.run(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    startupinfo=startupinfo,
+                )
+                if proc.returncode == 0:
+                    extracted_ok = True
+                    break
+                tail = " | ".join((proc.stdout or "").splitlines()[-3:])
+                last_err = f"{tool['label']} rc={proc.returncode}" + (f" ({tail})" if tail else "")
+
+            if not extracted_ok:
+                raise RuntimeError(f"Failed to extract MAME package ({last_err or 'no extractor available'})")
+
+            found_chd = next((p for p in extract_dir.rglob("chdman.exe") if p.is_file()), None)
+            if found_chd is None:
+                raise RuntimeError("chdman.exe was not found in extracted MAME package")
+
+            shutil.copy2(found_chd, out_path)
+            if not out_path.exists() or out_path.stat().st_size <= 0:
+                raise RuntimeError("Failed to place chdman.exe in tools folder")
+            log_activity(f"chd.install.ok copied='{out_path}'")
+            return str(out_path)
+        except Exception as e:
+            log_error("MinervaApp._auto_install_chdman failed", e)
+            return find_chdman_executable()
+        finally:
+            try:
+                if tmp_root.exists():
+                    shutil.rmtree(tmp_root, ignore_errors=True)
+            except Exception:
+                pass
+
+    def _finish_chdman_install(self, path: str | None):
+        self._chd_download_in_progress = False
+        self._chdman_path = path
+        if path:
+            self._extract_status_var.set(f"CHD tool ready: {path}")
+            log_activity(f"chd.install.ok path='{path}'")
+        else:
+            self._extract_status_var.set("Could not auto-install chdman. Install MAME and retry.")
+            log_activity("chd.install.fail no_path")
+
+    def _start_selected_queued(self):
+        if not self._download_queue or not self._queued_selected_ids:
+            return
+        selected_ids = list(self._queued_selected_ids)
+        self._download_queue.start_selected(selected_ids)
+        for did in selected_ids:
+            self._queued_selected_ids.discard(did)
+        self._save_settings()
+
+    def _start_specific_queued(self, download_id: str):
+        if not self._download_queue:
+            return
+        self._download_queue.start_selected([download_id])
+        self._queued_selected_ids.discard(download_id)
+        self._save_settings()
+
+    def _start_all_queued(self):
+        if not self._download_queue:
+            return
+        self._download_queue.start_all_pending()
+        self._save_settings()
+
+    def _set_queued_selected(self, download_id: str, selected: bool):
+        if selected:
+            self._queued_selected_ids.add(download_id)
+        else:
+            self._queued_selected_ids.discard(download_id)
+
+    def _toggle_pause_all_active(self):
+        if not self._download_queue or not self._torrent_engine:
+            return
+        snap = self._download_queue.snapshot()
+        active_ids = list(snap["active"])
+        if not active_ids:
+            return
+        statuses = self._torrent_engine.get_all_statuses()
+        should_pause = any(not statuses.get(did, {}).get("paused", False) for did in active_ids)
+        for did in active_ids:
+            if should_pause:
+                self._torrent_engine.pause(did)
+            else:
+                self._torrent_engine.resume(did)
 
     def _browse_download_dir(self):
         from tkinter import filedialog
         path = filedialog.askdirectory(parent=self, initialdir=self.get_download_dir())
         if path:
             self._download_dir.set(path)
+            self._save_settings()
 
     def _clear_completed(self):
         if self._download_queue:
@@ -1424,19 +2473,379 @@ class MinervaApp(tk.Tk):
             self._dl_done_header.destroy()
             del self._dl_done_header
 
-    def _on_extract_options_change(self):
-        enabled = bool(self._auto_extract_var.get())
-        delete_archive = bool(self._delete_archive_var.get())
-        if self._download_queue:
-            snap = self._download_queue.snapshot()
-            for did in snap["active"]:
-                if self._torrent_engine:
-                    self._torrent_engine.set_auto_extract(did, enabled)
-                    self._torrent_engine.set_delete_archive(did, delete_archive)
-            for item in snap["pending"]:
-                if self._torrent_engine:
-                    self._torrent_engine.set_auto_extract(item["id"], enabled)
-                    self._torrent_engine.set_delete_archive(item["id"], delete_archive)
+    def _prompt_post_download_actions_batch(self, download_ids: list[str]):
+        if not self._torrent_engine:
+            return
+        valid_items: list[tuple[str, dict]] = []
+        for did in download_ids:
+            meta = self._torrent_engine._meta.get(did)
+            if meta:
+                valid_items.append((did, meta))
+
+        if not valid_items:
+            return
+
+        if not self._auto_extract_default_var.get():
+            return
+
+        delete_archive = bool(self._delete_archive_default_var.get())
+        for did, meta in valid_items:
+            meta["auto_extract"] = True
+            meta["delete_archive"] = bool(delete_archive)
+            self._extract_download(did)
+
+    def _open_current_downloads_folder(self):
+        self._open_folder(pathlib.Path(self.get_download_dir()))
+
+    def _open_current_extracted_folder(self):
+        self._open_folder(pathlib.Path(self.get_download_dir()) / "extracted")
+
+    def _verify_extracted_button_click(self):
+        base = pathlib.Path(self.get_download_dir()) / "extracted"
+        if not base.exists():
+            messagebox.showinfo("Verify Extracted", "No extracted folder found yet.")
+            return
+        if not base.is_dir():
+            messagebox.showerror("Verify Extracted", "Extracted path exists but is not a folder.")
+            return
+
+        targets = [d for d in base.iterdir() if d.is_dir()]
+        if not targets:
+            messagebox.showinfo("Verify Extracted", "No extracted game folders found.")
+            return
+
+        ok = 0
+        failed: list[str] = []
+        for d in targets:
+            try:
+                self._verify_extracted_output(d, d.name)
+                ok += 1
+            except Exception as e:
+                failed.append(f"{d.name}: {e}")
+
+        total = len(targets)
+        if not failed:
+            msg = f"Verified {ok}/{total} extracted folders successfully."
+            self._extract_status_var.set(msg)
+            messagebox.showinfo("Verify Extracted", msg)
+            return
+
+        preview = "\n".join(failed[:8])
+        more = f"\n...and {len(failed) - 8} more" if len(failed) > 8 else ""
+        msg = f"Verified {ok}/{total}. Failed: {len(failed)}.\n\n{preview}{more}"
+        self._extract_status_var.set(f"Verify failed: {len(failed)} folder(s)")
+        messagebox.showwarning("Verify Extracted", msg)
+
+    def _compress_ps1_button_click(self):
+        if self._chd_compress_in_progress:
+            messagebox.showinfo("Compress PS1 to CHD", "CHD compression is already running.")
+            return
+        base = pathlib.Path(self.get_download_dir()) / "extracted"
+        if not base.exists() or not base.is_dir():
+            messagebox.showinfo("Compress PS1 to CHD", "No extracted folder found yet.")
+            return
+        if not self._chdman_path:
+            self._ensure_chdman_available_async()
+            messagebox.showinfo(
+                "Compress PS1 to CHD",
+                "chdman is not installed yet. Installation has started in the background."
+            )
+            return
+
+        targets = [d for d in base.iterdir() if d.is_dir()]
+        if not targets:
+            messagebox.showinfo("Compress PS1 to CHD", "No extracted game folders found.")
+            return
+        self._chd_compress_in_progress = True
+        self._chd_progress_var.set(0.0)
+        self._extract_status_var.set("CHD compression running…")
+
+        def worker():
+            converted = 0
+            failed: list[str] = []
+            total_done = 0
+            total_planned = 0
+            for d in targets:
+                cues = sorted(p for p in d.rglob("*.cue") if p.is_file())
+                total_planned += len(cues)
+
+            for d in targets:
+                try:
+                    def _manual_progress(done: int, total: int, cue_name: str):
+                        display_done = total_done + done
+                        display_total = max(total_planned, display_done)
+                        self.after(
+                            0,
+                            lambda dd=display_done, dt=display_total, cn=cue_name:
+                                self._update_chd_progress(dd, dt, cn)
+                        )
+
+                    made = self._compress_ps1_to_chd(d, progress_cb=_manual_progress)
+                    converted += made
+                    total_done += made
+                except Exception as e:
+                    failed.append(f"{d.name}: {e}")
+            self.after(0, lambda c=converted, f=failed, t=len(targets): self._finish_manual_chd_batch(c, f, t))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _clean_bin_cue_button_click(self):
+        base = pathlib.Path(self.get_download_dir()) / "extracted"
+        if not base.exists():
+            messagebox.showinfo("Clean BIN/CUE", "No extracted folder found yet.")
+            return
+        if not base.is_dir():
+            messagebox.showerror("Clean BIN/CUE", "Extracted path exists but is not a folder.")
+            return
+
+        chd_files = [p for p in base.rglob("*.chd") if p.is_file()]
+        if not chd_files:
+            messagebox.showinfo("Clean BIN/CUE", "No CHD files found under extracted folder.")
+            return
+
+        removed_bins = 0
+        removed_cues = 0
+        failed: list[str] = []
+        for chd in chd_files:
+            cue = chd.with_suffix(".cue")
+            bin_file = chd.with_suffix(".bin")
+            if cue.exists():
+                try:
+                    cue.unlink()
+                    removed_cues += 1
+                except Exception as e:
+                    failed.append(f"{cue.name}: {e}")
+            if bin_file.exists():
+                try:
+                    bin_file.unlink()
+                    removed_bins += 1
+                except Exception as e:
+                    failed.append(f"{bin_file.name}: {e}")
+
+        if not failed:
+            msg = f"Cleanup complete. Removed {removed_bins} BIN and {removed_cues} CUE files."
+            self._extract_status_var.set(msg)
+            messagebox.showinfo("Clean BIN/CUE", msg)
+            return
+
+        preview = "\n".join(failed[:8])
+        more = f"\n...and {len(failed) - 8} more" if len(failed) > 8 else ""
+        msg = (
+            f"Cleanup completed with issues.\n"
+            f"Removed {removed_bins} BIN and {removed_cues} CUE files.\n"
+            f"Failed: {len(failed)}\n\n{preview}{more}"
+        )
+        self._extract_status_var.set(f"BIN/CUE cleanup issues: {len(failed)} file(s)")
+        messagebox.showwarning("Clean BIN/CUE", msg)
+
+    @staticmethod
+    def _normalize_chd_stem(stem: str) -> str:
+        s = stem
+        removable_parenthetical = re.compile(
+            r"\(([^()]*)\)",
+            flags=re.IGNORECASE
+        )
+
+        def _is_important_descriptor(text: str) -> bool:
+            t = text.strip().lower()
+            if not t:
+                return False
+            return bool(
+                re.match(r"^(disc|disk|cd|track)\s*[-#:]?\s*\d+[a-z]?$", t)
+                or re.match(r"^side\s*[a-d]$", t)
+                or re.match(r"^part\s*\d+[a-z]?$", t)
+            )
+
+        def _is_removable_descriptor(text: str) -> bool:
+            t = text.strip().lower()
+            if not t:
+                return False
+            if _is_important_descriptor(t):
+                return False
+            if re.match(r"^(rev|revision)\s*[a-z0-9.]+$", t):
+                return True
+            if re.match(r"^v\d+([._]\d+)*$", t):
+                return True
+            if re.match(r"^(usa|europe|japan|world|korea|asia|australia|germany|france|italy|spain|sweden|netherlands|brazil|canada|uk|uae)$", t):
+                return True
+            tokens = [tok.strip(" .,_-/") for tok in re.split(r"[,+/&]", t) if tok.strip(" .,_-/")]
+            if tokens and all(tok in {"en", "fr", "de", "es", "it", "pt", "nl", "sv", "no", "da", "fi", "pl", "ru", "jp", "ja", "zh", "ko"} for tok in tokens):
+                return True
+            if t in {"unl", "proto", "prototype", "beta", "demo", "sample", "alt"}:
+                return True
+            return False
+
+        def _replace(match: re.Match) -> str:
+            inside = match.group(1)
+            # Fast path: the whole content is a single removable descriptor
+            if _is_removable_descriptor(inside):
+                return " "
+            # Split compound groups (e.g. "USA, En" or "En, Disc 1") and filter
+            tokens = [tok.strip(" .,_-/") for tok in re.split(r"[,+/&]", inside) if tok.strip(" .,_-/")]
+            if len(tokens) > 1:
+                kept = [tok for tok in tokens if not _is_removable_descriptor(tok)]
+                if len(kept) < len(tokens):
+                    # At least one token was removed — rebuild with only kept tokens
+                    return f" ({', '.join(kept)}) " if kept else " "
+            return match.group(0)
+
+        last = None
+        while last != s:
+            last = s
+            s = removable_parenthetical.sub(_replace, s)
+
+        s = re.sub(r"\s*-\s*(rev|revision)\s*[a-z0-9.]+\b", "", s, flags=re.IGNORECASE)
+        s = re.sub(r"\s+", " ", s).strip()
+        s = re.sub(r"\s+([)\]])", r"\1", s)
+        s = re.sub(r"([(\[])\s+", r"\1", s)
+        return s
+
+    def _clean_chd_names_button_click(self):
+        TITLE = "Clean Names"
+        FILE_EXTS = {".chd", ".bin", ".cue", ".iso", ".img", ".mdf", ".mds"}
+        base = pathlib.Path(self.get_download_dir()) / "extracted"
+        if not base.exists():
+            messagebox.showinfo(TITLE, "No extracted folder found yet.")
+            return
+        if not base.is_dir():
+            messagebox.showerror(TITLE, "Extracted path exists but is not a folder.")
+            return
+
+        renamed = 0
+        unchanged = 0
+        failed: list[str] = []
+
+        def _try_rename(path: pathlib.Path, new_name: str) -> bool:
+            """Rename path to new_name in the same directory. Returns True on success."""
+            nonlocal renamed, unchanged
+            if new_name == path.name:
+                unchanged += 1
+                return True
+            target = path.parent / new_name
+            if target.exists():
+                failed.append(f"{path.name}: target exists ({new_name})")
+                return False
+            try:
+                path.rename(target)
+                renamed += 1
+                return True
+            except Exception as e:
+                failed.append(f"{path.name}: {e}")
+                return False
+
+        # Rename files first (deepest first so folder renames don't break paths)
+        all_files = sorted(
+            (p for p in base.rglob("*") if p.is_file() and p.suffix.lower() in FILE_EXTS),
+            key=lambda p: (-len(p.parts), p.name),
+        )
+        for f in all_files:
+            new_stem = self._normalize_chd_stem(f.stem)
+            if not new_stem:
+                unchanged += 1
+                continue
+            _try_rename(f, new_stem + f.suffix)
+
+        # Rename game sub-folders (immediate children of base only, deepest first)
+        game_dirs = sorted(
+            (p for p in base.rglob("*") if p.is_dir() and p != base),
+            key=lambda p: -len(p.parts),
+        )
+        for d in game_dirs:
+            new_name = self._normalize_chd_stem(d.name)
+            if not new_name:
+                unchanged += 1
+                continue
+            _try_rename(d, new_name)
+
+        if not failed:
+            msg = f"Name cleanup complete. Renamed {renamed}, unchanged {unchanged}."
+            self._extract_status_var.set(msg)
+            messagebox.showinfo(TITLE, msg)
+            return
+
+        preview = "\n".join(failed[:8])
+        more = f"\n...and {len(failed) - 8} more" if len(failed) > 8 else ""
+        msg = (
+            f"Name cleanup completed with issues.\n"
+            f"Renamed: {renamed}, Unchanged: {unchanged}, Failed: {len(failed)}\n\n"
+            f"{preview}{more}"
+        )
+        self._extract_status_var.set(f"Name cleanup issues: {len(failed)} file(s)")
+        messagebox.showwarning(TITLE, msg)
+
+    def _force_delete_bins_button_click(self):
+        TITLE = "Delete BINs"
+        base = pathlib.Path(self.get_download_dir()) / "extracted"
+        if not base.exists():
+            messagebox.showinfo(TITLE, "No extracted folder found yet.")
+            return
+        if not base.is_dir():
+            messagebox.showerror(TITLE, "Extracted path exists but is not a folder.")
+            return
+
+        bin_files = [p for p in base.rglob("*.bin") if p.is_file()]
+        if not bin_files:
+            messagebox.showinfo(TITLE, "No BIN files found under extracted folder.")
+            return
+
+        if not messagebox.askyesno(
+            TITLE,
+            f"Permanently delete {len(bin_files)} BIN file(s) under:\n{base}\n\nThis cannot be undone.",
+        ):
+            return
+
+        deleted = 0
+        failed: list[str] = []
+        for f in bin_files:
+            try:
+                f.unlink()
+                deleted += 1
+                log_activity(f"force_delete_bin removed='{f}'")
+            except Exception as e:
+                failed.append(f"{f.name}: {e}")
+
+        if not failed:
+            msg = f"Deleted {deleted} BIN file(s)."
+            self._extract_status_var.set(msg)
+            messagebox.showinfo(TITLE, msg)
+            return
+
+        preview = "\n".join(failed[:8])
+        more = f"\n...and {len(failed) - 8} more" if len(failed) > 8 else ""
+        msg = f"Deleted {deleted}, failed {len(failed)}:\n\n{preview}{more}"
+        self._extract_status_var.set(f"Delete BINs: {len(failed)} failed")
+        messagebox.showwarning(TITLE, msg)
+
+    def _update_chd_progress(self, done: int, total: int, cue_name: str):
+        self._extract_status_var.set(f"CHD converting {done}/{total}: {cue_name}")
+        self._chd_progress_var.set(0.0 if total <= 0 else (done * 100.0 / total))
+
+    def _finish_manual_chd_batch(self, converted: int, failed: list[str], total_folders: int):
+        self._chd_compress_in_progress = False
+        self._chd_progress_var.set(100.0)
+        if not failed:
+            msg = f"CHD compression finished: {converted} file(s) converted across {total_folders} folder(s)."
+            self._extract_status_var.set(msg)
+            messagebox.showinfo("Compress PS1 to CHD", msg)
+            return
+
+        preview = "\n".join(failed[:8])
+        more = f"\n...and {len(failed) - 8} more" if len(failed) > 8 else ""
+        msg = (
+            f"CHD conversion completed with issues.\n"
+            f"Converted: {converted} file(s), Failed folders: {len(failed)}.\n\n"
+            f"{preview}{more}"
+        )
+        self._extract_status_var.set(f"CHD conversion issues: {len(failed)} folder(s)")
+        messagebox.showwarning("Compress PS1 to CHD", msg)
+
+    def _open_folder(self, path: pathlib.Path):
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+            subprocess.Popen(["explorer", str(path)])
+        except Exception as e:
+            log_error(f"MinervaApp._open_folder failed for {path}", e)
+            messagebox.showerror("Open Folder Failed", f"Could not open folder:\n{e}")
 
     def _toggle_pause(self, download_id: str):
         engine = self._torrent_engine
@@ -1450,12 +2859,14 @@ class MinervaApp(tk.Tk):
             engine.pause(download_id)
 
     def _cancel_download(self, download_id: str):
+        self._queued_selected_ids.discard(download_id)
         if self._download_queue:
             self._download_queue.cancel(download_id)
         w = self._dl_active_widgets.pop(download_id, None)
         if w:
             w["frame"].destroy()
         self._refresh_toggle_label()
+        self._save_settings()
 
     def _on_right_click(self, event):
         col = self._right_tree.identify_column(event.x)
@@ -1529,6 +2940,7 @@ class MinervaApp(tk.Tk):
             db = SQLiteHTTP(HASHES_DB_URL)
             row = db.lookup(full_path)
         except Exception as e:
+            log_error(f"MinervaApp._lookup_and_enqueue db lookup failed for {file_name}", e)
             self.after(0, lambda: messagebox.showerror(
                 "DB Lookup Failed", f"Could not look up {file_name}:\n{e}"
             ))
@@ -1552,8 +2964,11 @@ class MinervaApp(tk.Tk):
         if torrent_url:
             try:
                 torrent_dir = get_torrent_dir()
-                # Use a safe filename derived from the torrent path
-                torrent_filename = row["torrents"].replace("/", "_").replace("\\", "_")
+                # Use a unique local filename per queued file so each queue item has its own torrent file.
+                source_key = hashlib.sha1(full_path.encode("utf-8", errors="ignore")).hexdigest()[:10]
+                torrent_filename = (
+                    row["torrents"].replace("/", "_").replace("\\", "_") + f"__{source_key}.torrent"
+                )
                 torrent_local = torrent_dir / torrent_filename
                 if not torrent_local.exists():
                     req = urllib.request.Request(
@@ -1564,6 +2979,7 @@ class MinervaApp(tk.Tk):
                     torrent_local.write_bytes(torrent_data)
                 torrent_source = str(torrent_local)
             except Exception as e:
+                log_error(f"MinervaApp._lookup_and_enqueue torrent fetch failed for {file_name}", e)
                 # Fall back to magnet if torrent file download fails
                 torrent_source = None
                 if row.get("magnet"):
@@ -1601,9 +3017,181 @@ class MinervaApp(tk.Tk):
             matches = list(save_path.glob(pattern))
             if matches:
                 return matches[0]
+        # Fallback: if torrent renamed output, pick largest likely archive-like file.
+        archive_exts = {".zip", ".7z", ".rar", ".tar", ".gz", ".bz2", ".xz", ".iso", ".chd"}
+        candidates: list[tuple[int, pathlib.Path]] = []
+        for depth in range(0, 4):
+            pattern = "*"
+            if depth > 0:
+                pattern = "/".join(["*"] * depth) + "/*"
+            for p in save_path.glob(pattern):
+                if not p.is_file() or p.suffix.lower() not in archive_exts:
+                    continue
+                try:
+                    size = p.stat().st_size
+                except OSError:
+                    continue
+                if size > 0:
+                    candidates.append((size, p))
+        if candidates:
+            candidates.sort(key=lambda t: t[0], reverse=True)
+            chosen = candidates[0][1]
+            log_activity(f"extract.lookup fallback picked '{chosen}' for requested '{file_name}'")
+            return chosen
         return None
 
+    def _extract_worker_loop(self):
+        while True:
+            download_id = self._extract_request_queue.get()
+            if download_id is None:
+                self._extract_request_queue.task_done()
+                break
+            try:
+                self._extract_download_sync(download_id)
+            finally:
+                with self._extract_pending_lock:
+                    self._extract_pending_ids.discard(download_id)
+                self._extract_request_queue.task_done()
+
     def _extract_download(self, download_id: str):
+        with self._extract_pending_lock:
+            if download_id in self._extract_pending_ids:
+                return
+            self._extract_pending_ids.add(download_id)
+        self._extract_progress[download_id] = {"pct": 0, "status": "Queued for extraction…"}
+        self.after(0, self._refresh_extract_rows)
+        self._extract_request_queue.put(download_id)
+
+    @staticmethod
+    def _is_likely_rom_file(path: pathlib.Path) -> bool:
+        rom_exts = {
+            ".cue", ".bin", ".iso", ".chd", ".cso", ".pbp", ".img", ".ccd", ".mdf", ".nrg",
+            ".gdi", ".cdi", ".zip", ".7z", ".rar", ".z64", ".n64", ".v64", ".smc", ".sfc",
+            ".nes", ".gb", ".gbc", ".gba", ".nds", ".3ds", ".cia", ".xci", ".nsp", ".md",
+            ".gen", ".32x", ".gg", ".sms", ".pce", ".ws", ".wsc", ".ngp", ".ngc", ".a26",
+            ".a78", ".lnx", ".jag", ".m3u"
+        }
+        return path.suffix.lower() in rom_exts
+
+    def _verify_extracted_output(self, out_dir: pathlib.Path, source_name: str):
+        if not out_dir.exists() or not out_dir.is_dir():
+            raise RuntimeError("Extraction output folder was not created")
+        files = [p for p in out_dir.rglob("*") if p.is_file()]
+        if not files:
+            raise RuntimeError("No files were extracted")
+        meaningful: list[pathlib.Path] = []
+        metadata_exts = {".txt", ".nfo", ".sfv", ".md5", ".sha1", ".sha256", ".json"}
+        for p in files:
+            try:
+                size = p.stat().st_size
+            except OSError:
+                continue
+            if size <= 0:
+                continue
+            if p.suffix.lower() in metadata_exts:
+                continue
+            meaningful.append(p)
+        if not meaningful:
+            raise RuntimeError("Extracted output contains no usable ROM files")
+        if not any(self._is_likely_rom_file(p) for p in meaningful):
+            sample = ", ".join(sorted({p.suffix.lower() or "<no-ext>" for p in meaningful[:6]}))
+            raise RuntimeError(
+                f"Extracted files from {source_name} do not look like ROM content ({sample})"
+            )
+
+    def _compress_ps1_to_chd(
+        self,
+        extracted_dir: pathlib.Path,
+        progress_cb=None
+    ) -> int:
+        if not self._compress_ps1_chd_var.get():
+            return 0
+        chdman = self._chdman_path
+        if not chdman:
+            log_activity("chd.skip reason=no_chdman")
+            return 0
+        cue_files = sorted(p for p in extracted_dir.rglob("*.cue") if p.is_file())
+        if not cue_files:
+            return 0
+
+        converted = 0
+
+        total = len(cue_files)
+        cpu_threads = max(1, (os.cpu_count() or 1))
+        for idx, cue in enumerate(cue_files, start=1):
+            out_chd = cue.with_suffix(".chd")
+            if progress_cb is not None:
+                try:
+                    progress_cb(idx - 1, total, cue.name)
+                except Exception:
+                    pass
+            if out_chd.exists():
+                if progress_cb is not None:
+                    try:
+                        progress_cb(idx, total, cue.name)
+                    except Exception:
+                        pass
+                continue
+            cmd = [chdman, "createcd", "-np", str(cpu_threads), "-i", str(cue), "-o", str(out_chd)]
+            log_activity(f"chd.run cmd={' '.join(cmd)}")
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            startupinfo.wShowWindow = 6
+            proc = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                startupinfo=startupinfo,
+            )
+            if proc.returncode != 0:
+                tail = " | ".join((proc.stdout or "").splitlines()[-3:])
+                raise RuntimeError(
+                    f"CHD conversion failed for {cue.name} (rc={proc.returncode})"
+                    + (f" ({tail})" if tail else "")
+                )
+            if not out_chd.exists() or out_chd.stat().st_size <= 0:
+                raise RuntimeError(f"CHD output missing for {cue.name}")
+            log_activity(f"chd.ok cue='{cue}' chd='{out_chd}'")
+            # Remove all BIN files referenced by this CUE sheet
+            try:
+                cue_text = cue.read_text(encoding="utf-8", errors="replace")
+                referenced_bins = [
+                    cue.parent / m.group(1)
+                    for m in re.finditer(r'^\s*FILE\s+"?([^"]+\.bin)"?\s+BINARY', cue_text, re.IGNORECASE | re.MULTILINE)
+                ]
+            except Exception:
+                referenced_bins = []
+            # Fall back: find BINs in the same folder whose stem matches the parent folder name
+            if not referenced_bins:
+                folder_name = cue.parent.name
+                referenced_bins = [
+                    p for p in cue.parent.iterdir()
+                    if p.suffix.lower() == ".bin" and p.stem.lower().startswith(folder_name.lower())
+                ]
+            # Last resort: the single-stem BIN matching the CUE
+            if not referenced_bins:
+                referenced_bins = [cue.with_suffix(".bin")]
+            for bin_path in referenced_bins:
+                if bin_path.exists():
+                    try:
+                        bin_path.unlink()
+                        log_activity(f"chd.cleanup.bin removed='{bin_path}'")
+                    except Exception as e:
+                        log_activity(f"chd.cleanup.bin failed='{bin_path}' err='{e}'")
+            cue.unlink()
+            log_activity(f"chd.cleanup.cue removed='{cue}'")
+            converted += 1
+            if progress_cb is not None:
+                try:
+                    progress_cb(idx, total, cue.name)
+                except Exception:
+                    pass
+        return converted
+
+    def _extract_download_sync(self, download_id: str):
         if not self._torrent_engine:
             return
         meta = self._torrent_engine._meta.get(download_id)
@@ -1614,27 +3202,76 @@ class MinervaApp(tk.Tk):
         torrent_dir = save_path / "extracted"
         torrent_dir.mkdir(parents=True, exist_ok=True)
         delete_archive = bool(meta.get("delete_archive"))
-        seven_zip = self._seven_zip_path
+        extractors = list(self._extractors)
         file_name = meta["name"]
+        log_activity(f"extract.start id={download_id} file='{file_name}' save_path='{save_path}'")
 
         def _set_progress(pct: int, status: str):
             self._extract_progress[download_id] = {"pct": pct, "status": status}
             self.after(0, self._refresh_extract_rows)
 
-        def worker():
-            try:
+        self.after(0, lambda: self._chd_progress_var.set(0.0))
+
+        try:
+            src = None
+            for _ in range(20):
                 src = self._find_downloaded_file(save_path, file_name)
-                if src is None:
-                    _set_progress(0, f"Missing: {file_name}")
-                    return
+                if src is not None:
+                    break
 
-                _set_progress(0, "Extracting…")
-                extracted_ok = False
+                _set_progress(0, "Waiting for downloaded file…")
+                time.sleep(1)
 
-                if seven_zip:
-                    out_dir = torrent_dir / src.stem
-                    out_dir.mkdir(parents=True, exist_ok=True)
-                    cmd = [seven_zip, "x", "-y", "-bd", "-bso1", "-bsp1", f"-o{out_dir}", str(src)]
+            if src is None:
+                log_activity(f"extract.missing id={download_id} file='{file_name}'")
+                _set_progress(0, f"Missing downloaded file: {file_name}")
+                return
+            log_activity(f"extract.source id={download_id} src='{src}' size={src.stat().st_size if src.exists() else -1}")
+
+            # Give the filesystem a brief moment to finish writes/locks before extraction.
+            stable_count = 0
+            last_size = -1
+            for _ in range(10):
+                try:
+                    current_size = src.stat().st_size
+                except OSError:
+                    current_size = -1
+                if current_size > 0 and current_size == last_size:
+                    stable_count += 1
+                    if stable_count >= 2:
+                        break
+                else:
+                    stable_count = 0
+                last_size = current_size
+                time.sleep(1)
+
+            _set_progress(0, "Extracting…")
+            extracted_ok = False
+            extracted_dir: pathlib.Path | None = None
+
+            last_tool_error = ""
+            for tool in extractors:
+                if extracted_ok:
+                    break
+                out_dir = torrent_dir / src.stem
+                out_dir.mkdir(parents=True, exist_ok=True)
+
+                if tool["kind"] in ("7zip", "peazip"):
+                    cmd = [tool["exe"], "x", "-y", "-aoa", "-bd", "-bso1", "-bsp1", f"-o{out_dir}", str(src)]
+                elif tool["kind"] == "winrar":
+                    cmd = [tool["exe"], "x", "-y", "-o+", str(src), str(out_dir) + "\\"]
+                else:
+                    continue
+
+                log_activity(
+                    f"extract.tool.run id={download_id} tool={tool['label']} cmd={' '.join(cmd)}"
+                )
+                last_lines = []
+                rc = 1
+                for attempt in range(1, 4):
+                    startupinfo = subprocess.STARTUPINFO()
+                    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                    startupinfo.wShowWindow = 6  # SW_MINIMIZE
                     proc = subprocess.Popen(
                         cmd,
                         stdout=subprocess.PIPE,
@@ -1643,10 +3280,16 @@ class MinervaApp(tk.Tk):
                         encoding="utf-8",
                         errors="replace",
                         bufsize=1,
+                        startupinfo=startupinfo,
                     )
                     last_pct = -1
                     if proc.stdout is not None:
                         for line in proc.stdout:
+                            line = line.strip()
+                            if line:
+                                last_lines.append(line)
+                                if len(last_lines) > 20:
+                                    last_lines.pop(0)
                             m = re.search(r"(\d{1,3})%", line)
                             if m:
                                 pct = min(100, int(m.group(1)))
@@ -1654,11 +3297,37 @@ class MinervaApp(tk.Tk):
                                     last_pct = pct
                                     _set_progress(pct, f"Extracting… {pct}%")
                     rc = proc.wait()
-                    if rc != 0:
-                        raise RuntimeError(f"7-Zip exited with code {rc}")
-                    extracted_ok = True
+                    if rc == 0:
+                        log_activity(
+                            f"extract.tool.ok id={download_id} tool={tool['label']} attempt={attempt}"
+                        )
+                        extracted_ok = True
+                        extracted_dir = out_dir
+                        break
+                    if attempt < 3:
+                        log_activity(
+                            f"extract.tool.retry id={download_id} tool={tool['label']} attempt={attempt} rc={rc}"
+                        )
+                        _set_progress(0, f"{tool['label']} retry {attempt}/2…")
+                        time.sleep(2)
 
-                elif src.suffix.lower() == ".zip":
+                if not extracted_ok:
+                    tail = " | ".join(last_lines[-3:]) if last_lines else ""
+                    last_tool_error = f"{tool['label']} exited with code {rc}" + (f" ({tail})" if tail else "")
+                    log_activity(
+                        f"extract.tool.fail id={download_id} tool={tool['label']} rc={rc} tail={tail}"
+                    )
+
+            if not extracted_ok and src.suffix.lower() == ".zip":
+                if extractors:
+                    _set_progress(0, "External extractor failed, trying ZIP fallback…")
+                else:
+                    _set_progress(0, "Using Python ZIP fallback…")
+            elif not extracted_ok and extractors:
+                raise RuntimeError(last_tool_error or "All external extractors failed")
+
+            if not extracted_ok and src.suffix.lower() == ".zip":
+                if zipfile.is_zipfile(src):
                     out_dir = torrent_dir / src.stem
                     out_dir.mkdir(parents=True, exist_ok=True)
                     with zipfile.ZipFile(src, "r") as zf:
@@ -1669,30 +3338,67 @@ class MinervaApp(tk.Tk):
                             pct = int(i * 100 / total)
                             _set_progress(pct, f"Extracting… {pct}%")
                     extracted_ok = True
-
+                    extracted_dir = out_dir
+                    log_activity(f"extract.zip.ok id={download_id} src='{src}'")
                 else:
-                    shutil.copy2(src, torrent_dir / src.name)
-                    extracted_ok = True
+                    log_activity(f"extract.zip.invalid id={download_id} src='{src}'")
+                    raise RuntimeError(
+                        "Downloaded .zip is not a valid ZIP archive. Download may be incomplete."
+                    )
 
-                if extracted_ok and delete_archive and src.exists():
-                    src.unlink()
+            elif not extracted_ok:
+                out_dir = torrent_dir / src.stem
+                out_dir.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src, out_dir / src.name)
+                extracted_ok = True
+                extracted_dir = out_dir
+                log_activity(f"extract.copy_passthrough id={download_id} src='{src}'")
 
-                _set_progress(100, "Extracted ✓" if extracted_ok else "Failed")
+            if extracted_ok and extracted_dir is not None:
+                self._verify_extracted_output(extracted_dir, src.name)
+                def _chd_progress(done: int, total: int, cue_name: str):
+                    if total <= 0:
+                        return
+                    pct = 90 + int((done / total) * 9)
+                    pct = max(90, min(99, pct))
+                    self.after(0, lambda d=done, t=total: self._chd_progress_var.set(d * 100.0 / t))
+                    _set_progress(pct, f"Converting to CHD ({done}/{total}): {cue_name}")
 
-            except Exception as e:
-                _set_progress(0, f"Error: {str(e)[:40]}")
+                self._compress_ps1_to_chd(
+                    extracted_dir,
+                    progress_cb=_chd_progress
+                )
+                log_activity(f"extract.verify.ok id={download_id} dir='{extracted_dir}'")
 
-        threading.Thread(target=worker, daemon=True).start()
+            if extracted_ok and delete_archive and src.exists():
+                src.unlink()
+                log_activity(f"extract.delete_archive id={download_id} src='{src}'")
+
+            _set_progress(100, "Extracted ✓" if extracted_ok else "Failed")
+            self.after(0, lambda: self._chd_progress_var.set(100.0 if extracted_ok else 0.0))
+            log_activity(f"extract.done id={download_id} ok={extracted_ok}")
+
+        except Exception as e:
+            log_error(f"MinervaApp._extract_download_sync failed for {file_name}", e)
+            log_activity(f"extract.error id={download_id} file='{file_name}' err={repr(e)}")
+            _set_progress(0, f"Error: {str(e)[:40]}")
+            self.after(0, lambda: self._chd_progress_var.set(0.0))
 
     def _on_close(self):
+        self._save_settings()
         if self._torrent_engine is not None:
             try:
                 self._torrent_engine.shutdown()
             except Exception:
-                pass
+                log_error("MinervaApp._on_close engine shutdown failed")
+        try:
+            self._extract_request_queue.put_nowait(None)
+        except Exception as e:
+            log_error("MinervaApp._on_close extraction queue shutdown failed", e)
         self.destroy()
 
     def _show_error(self, msg):
+        log_error(f"MinervaApp._show_error: {msg}")
         self._set_loading(False)
         self._right_tree.delete(*self._right_tree.get_children())
         self._status_var.set(f"Error: {msg}")
@@ -1700,5 +3406,8 @@ class MinervaApp(tk.Tk):
 
 
 if __name__ == "__main__":
+    log_activity("app.launch")
     app = MinervaApp()
+    log_activity("app.mainloop.start")
     app.mainloop()
+    log_activity("app.mainloop.exit")
