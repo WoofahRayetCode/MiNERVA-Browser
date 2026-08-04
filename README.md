@@ -18,16 +18,20 @@ A portable desktop GUI for browsing and downloading from [minerva-archive.org](h
 - ⚡ Double-click a game to queue it instantly
 - 🔄 Download queue with configurable concurrency (1–10 simultaneous downloads)
 - 📂 Choose your save folder via Browse button
+- 💾 Download/filter preferences and queued downloads persist between app launches
 - 🗂️ Torrent files cached locally in `torrentfiles/` — no redundant fetches
 - 🚫 Deduplication — skips games already pending, active, or completed
 - 📊 Per-download progress bars with speed, peers, and state
 
 ### Extraction
 - 📦 **Auto-extract** — automatically extract archives after download completes
-- 🗜️ Uses **7-Zip** when detected (preferred); falls back to Python `zipfile` for `.zip`
-- 🔍 7-Zip detection shown in the UI (path displayed if found)
+- 🗜️ Uses external extractors when detected (**7-Zip**, **PeaZip**, **WinRAR**); falls back to Python `zipfile` for `.zip`
+- 🔍 Extractor detection shown in the UI (tool paths displayed when found)
 - 📊 Per-download extraction progress bar
 - 🗑️ Optional **delete archive** after successful extraction
+- ⚙️ **Auto extract**, **delete archive**, and **PS1 BIN/CUE → CHD** defaults are configurable in the Downloads panel and persist across launches
+- ⬇️ If CHD compression is enabled and `chdman` is missing, the app parses the latest MAME release page, downloads the Windows package, extracts only `chdman.exe`, and cleans up the rest
+- ✅ Extraction now verifies that ROM content was actually produced in the game output folder
 
 ## Requirements
 
@@ -78,4 +82,4 @@ MiNERVA distributes all files via BitTorrent. The app:
 1. Looks up the selected file in `hashes.db` (fetched via HTTP range requests — no full DB download)
 2. Downloads the collection `.torrent` file to `torrentfiles/`
 3. Tells libtorrent to download only the selected file within that torrent (`so_id` file priority)
-4. Optionally extracts the result with 7-Zip after completion
+4. Optionally extracts the result with a detected external extractor (7-Zip / PeaZip / WinRAR) after completion
