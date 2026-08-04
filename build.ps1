@@ -135,6 +135,17 @@ if ($LASTEXITCODE -eq 0) {
     Write-Warn "To enable: use Python 3.10 or 3.13 and rebuild."
 }
 
+# ── stamp build version ──────────────────────────────────────────────────────
+
+Write-Step "Stamping build version"
+$BuildVersion = Get-Date -Format "yyyy.MMdd.HHmm"
+$SourceFile   = Join-Path $ScriptDir "minerva_browser.py"
+$SourceText   = Get-Content $SourceFile -Raw
+$OriginalText = $SourceText
+$SourceText   = $SourceText -replace '(?m)^APP_VERSION\s*=\s*"[^"]*"', "APP_VERSION = `"$BuildVersion`""
+Set-Content -Path $SourceFile -Value $SourceText -NoNewline
+Write-Ok "APP_VERSION = `"$BuildVersion`""
+
 # ── build ────────────────────────────────────────────────────────────────────
 
 Write-Step "Building portable executable"
@@ -142,6 +153,8 @@ Push-Location $ScriptDir
 try {
     & $VenvPyInstaller $SpecFile --noconfirm
 } finally {
+    # Restore original source so version line stays clean in git
+    Set-Content -Path $SourceFile -Value $OriginalText -NoNewline
     Pop-Location
 }
 
