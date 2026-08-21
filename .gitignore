@@ -2,25 +2,27 @@
 dist/
 build/
 *.spec.bak
+*.tmp
+*.tmp.*
 
 # Virtual environment
 .venv/
+venv/
+env/
 
 # Python cache
 __pycache__/
-*.pyc
+*.py[cod]
 *.pyo
 *.pyd
 
-# Torrent cache (user-generated at runtime)
+# Runtime data and caches (generated locally by the app)
 torrentfiles/
-
-# Downloaded / extracted files
 downloads/
 extracted/
-
-# Logs
 *.log
+minerva_settings.json
+minerva_error.log
 activity_log*.txt
 startup_cleanup_debug.txt
 
