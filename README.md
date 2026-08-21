@@ -77,6 +77,10 @@ python minerva_browser.py
 
 > libtorrent is required for downloading. Without it the browser still works but downloads are disabled.
 
+### Generated local files
+
+The app writes a few files next to the executable/script while running, including `torrentfiles/`, `downloads/`, `extracted/`, `minerva_settings.json`, and `minerva_error.log`. These are local runtime artifacts and are intentionally excluded from source control by the repository `.gitignore`.
+
 ## How downloads work
 
 MiNERVA distributes all files via BitTorrent. The app:
