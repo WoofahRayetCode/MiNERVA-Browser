@@ -18,9 +18,13 @@ import hashlib
 import traceback
 import json
 import os
-import winreg
 from datetime import datetime
 from html.parser import HTMLParser
+
+try:
+    import winreg
+except ImportError:  # pragma: no cover - Linux/macOS build support
+    winreg = None
 
 APP_VERSION = "0.0.0"  # replaced at build time by build.ps1
 GITHUB_REPO = "WoofahRayetCode/MiNERVA-Browser"
@@ -183,15 +187,33 @@ def format_extractor_status(extractors: list[dict]) -> str:
     return "Extractors detected: " + " | ".join(labels)
 
 
+IS_WINDOWS = sys.platform.startswith("win")
+
+
+def _windows_startupinfo():
+    """Return a STARTUPINFO configured to hide the console window, or None
+    on non-Windows platforms where subprocess.STARTUPINFO doesn't exist."""
+    if not IS_WINDOWS:
+        return None
+    startupinfo = subprocess.STARTUPINFO()
+    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    startupinfo.wShowWindow = 6  # SW_MINIMIZE
+    return startupinfo
+
+
 def find_chdman_executable() -> str | None:
-    managed = get_runtime_base_dir() / "tools" / "chdman" / "chdman.exe"
+    managed_dir = get_runtime_base_dir() / "tools" / "chdman"
     candidates = [
-        str(managed),
+        str(managed_dir / "chdman.exe"),
+        str(managed_dir / "chdman"),
         shutil.which("chdman"),
         shutil.which("chdman.exe"),
         str(pathlib.Path.home() / "scoop" / "apps" / "mame" / "current" / "chdman.exe"),
         r"C:\Program Files\MAME\chdman.exe",
         r"C:\Program Files (x86)\MAME\chdman.exe",
+        "/usr/bin/chdman",
+        "/usr/local/bin/chdman",
+        "/opt/homebrew/bin/chdman",
     ]
     for candidate in candidates:
         if candidate and pathlib.Path(candidate).exists():
@@ -223,14 +245,24 @@ class EntryParser(HTMLParser):
                 self._href = None
                 self._name = attrs.get("data-name", "")
                 self._size = ""
-        elif self._in_entry and not self._skip and tag == "a":
+        elif self._in_entry and not self._skip and tag == "a" and self._href is None:
+            # Each entry div contains the real navigable link first, followed
+            # by extra action links (e.g. a magnet "javascript:void(0)"
+            # download button). Only the first <a> is the real entry link.
             self._href = attrs.get("href", "")
         elif self._in_entry and not self._skip and tag == "span":
             self._in_span = True
 
     def handle_endtag(self, tag):
         if tag == "div" and self._in_entry:
-            if not self._skip and self._href:
+            # Skip placeholder/decorative links (e.g. href="javascript:void(0)")
+            # which aren't real navigable entries and can collide as duplicate
+            # Treeview iids, crashing the UI.
+            if (
+                not self._skip
+                and self._href
+                and not self._href.lower().startswith("javascript:")
+            ):
                 is_folder = self._href.endswith("/")
                 self.entries.append({
                     "name": self._name or urllib.parse.unquote(self._href.rstrip("/").split("/")[-1]),
@@ -259,6 +291,32 @@ def fetch_entries(path):
     parser = EntryParser()
     parser.feed(html)
     return parser.entries
+
+
+_ROM_JS_RE = re.compile(r"window\.rom\s*=\s*(\{.*?\});", re.DOTALL)
+
+
+def fetch_rom_info(rom_id: str) -> dict | None:
+    """Fetch metadata (full_path, torrents, so_id, magnet, etc.) for a rom by
+    its numeric id from the site's /rom?id=<id> detail page, which embeds the
+    row as a `window.rom = {...};` JSON literal."""
+    url = f"{BASE_URL}/rom?id={rom_id}"
+    req = urllib.request.Request(url, headers={"User-Agent": "MiNERVA-Browser/1.0"})
+    with urllib.request.urlopen(req, timeout=45) as resp:
+        html = resp.read().decode("utf-8", errors="replace")
+    match = _ROM_JS_RE.search(html)
+    if not match:
+        return None
+    return json.loads(match.group(1))
+
+
+def extract_rom_id(href: str) -> str | None:
+    """Extract the numeric rom id from a file entry href like '/rom?id=1840326'."""
+    qs = urllib.parse.parse_qs(urllib.parse.urlparse(href).query)
+    values = qs.get("id")
+    if not values:
+        return None
+    return values[0]
 
 
 class SQLiteHTTP:
@@ -546,6 +604,45 @@ except ImportError:
     _LT_AVAILABLE = False
 
 
+def _build_torrent_state_map() -> dict:
+    """Map libtorrent torrent_status state constants to display labels.
+    Built defensively with getattr since some states (e.g. 'allocating')
+    have been removed in newer libtorrent versions."""
+    if not _LT_AVAILABLE:
+        return {}
+    labels = {
+        "checking_files": "Checking",
+        "downloading_metadata": "Metadata",
+        "downloading": "Downloading",
+        "finished": "Seeding",
+        "seeding": "Seeding",
+        "allocating": "Allocating",
+        "checking_resume_data": "Checking",
+    }
+    state_map = {}
+    for attr, label in labels.items():
+        value = getattr(lt.torrent_status, attr, None)
+        if value is not None:
+            state_map[value] = label
+    return state_map
+
+
+_TORRENT_STATE_MAP = _build_torrent_state_map()
+
+
+def _status_is_paused(status):
+    """Return whether a torrent_status object represents a paused torrent.
+    Newer libtorrent removed the ``paused`` attribute from torrent_status in
+    favor of a ``flags`` bitmask (``lt.torrent_flags.paused``)."""
+    if hasattr(status, "paused"):
+        return bool(status.paused)
+    flags = getattr(status, "flags", None)
+    paused_flag = getattr(getattr(lt, "torrent_flags", None), "paused", None)
+    if flags is not None and paused_flag is not None:
+        return bool(flags & paused_flag)
+    return False
+
+
 class TorrentEngine:
     def __init__(self):
         if not _LT_AVAILABLE:
@@ -557,8 +654,18 @@ class TorrentEngine:
             "enable_natpmp": True,
         }
         self._session = lt.session(settings)
-        self._session.add_dht_router("router.bittorrent.com", 6881)
-        self._session.add_dht_router("router.utorrent.com", 6881)
+        # libtorrent's DHT bootstrap API differs across versions: older
+        # bindings expose add_dht_router(host, port); newer ones replaced it
+        # with add_dht_node((host, port)). Support both so downloads aren't
+        # blocked by an AttributeError on either version.
+        for host, port in (("router.bittorrent.com", 6881), ("router.utorrent.com", 6881)):
+            try:
+                self._session.add_dht_router(host, port)
+            except AttributeError:
+                try:
+                    self._session.add_dht_node((host, port))
+                except Exception as e:
+                    log_error(f"TorrentEngine.__init__ add_dht_node failed for {host}", e)
         self._handles = {}
         self._meta = {}
         self._finished_ids: set[str] = set()  # prevent duplicate finished events
@@ -597,7 +704,19 @@ class TorrentEngine:
                         )
                         with urllib.request.urlopen(req, timeout=30) as resp:
                             torrent_data = resp.read()
-                    ti = lt.torrent_info(lt.bdecode(torrent_data))
+                    # Pass raw bytes directly to torrent_info with relaxed
+                    # bdecode limits — MiNERVA's collection .torrent files can
+                    # contain 100k+ files/entries, which exceeds libtorrent's
+                    # conservative default item-count safety limit. Fall back
+                    # to the older bdecode()-based API for older libtorrent
+                    # bindings that don't accept a limits dict.
+                    try:
+                        ti = lt.torrent_info(
+                            torrent_data,
+                            {"max_decode_depth": 100, "max_decode_tokens": 5_000_000},
+                        )
+                    except TypeError:
+                        ti = lt.torrent_info(lt.bdecode(torrent_data))
                     num_files = ti.num_files()
                     priorities = [0] * num_files
                     if 0 <= so_id < num_files:
@@ -703,16 +822,7 @@ class TorrentEngine:
                     continue
                 try:
                     s = handle.status()
-                    state_map = {
-                        lt.torrent_status.checking_files: "Checking",
-                        lt.torrent_status.downloading_metadata: "Metadata",
-                        lt.torrent_status.downloading: "Downloading",
-                        lt.torrent_status.finished: "Seeding",
-                        lt.torrent_status.seeding: "Seeding",
-                        lt.torrent_status.allocating: "Allocating",
-                        lt.torrent_status.checking_resume_data: "Checking",
-                    }
-                    state_str = state_map.get(s.state, str(s.state))
+                    state_str = _TORRENT_STATE_MAP.get(s.state, str(s.state))
                     self.events.put({
                         "type": "status",
                         "id": did,
@@ -724,14 +834,14 @@ class TorrentEngine:
                         "num_peers": s.num_peers,
                         "total_done": s.total_done,
                         "total": s.total_wanted,
-                        "paused": s.paused,
+                        "paused": _status_is_paused(s),
                         "error": s.errc.message() if s.errc else "",
                     })
                     is_complete = self._is_target_file_complete(did, handle, s) or (
                         (state_str in ("Seeding", "Finished")) and s.progress >= 0.999
                     )
                     has_file = self._has_downloaded_file(did)
-                    if is_complete and has_file and state_str in ("Seeding", "Finished") and not s.paused:
+                    if is_complete and has_file and state_str in ("Seeding", "Finished") and not _status_is_paused(s):
                         if did not in self._finished_ids:
                             self._finished_ids.add(did)
                             self.events.put({"type": "finished", "id": did})
@@ -745,16 +855,7 @@ class TorrentEngine:
                 continue
             try:
                 s = handle.status()
-                state_map = {
-                    lt.torrent_status.checking_files: "Checking",
-                    lt.torrent_status.downloading_metadata: "Metadata",
-                    lt.torrent_status.downloading: "Downloading",
-                    lt.torrent_status.finished: "Seeding",
-                    lt.torrent_status.seeding: "Seeding",
-                    lt.torrent_status.allocating: "Allocating",
-                    lt.torrent_status.checking_resume_data: "Checking",
-                }
-                state_str = state_map.get(s.state, str(s.state))
+                state_str = _TORRENT_STATE_MAP.get(s.state, str(s.state))
                 statuses[did] = {
                     "name": self._meta[did]["name"],
                     "progress": s.progress,
@@ -764,7 +865,7 @@ class TorrentEngine:
                     "num_peers": s.num_peers,
                     "total_done": s.total_done,
                     "total": s.total_wanted,
-                    "paused": s.paused,
+                    "paused": _status_is_paused(s),
                     "error": s.errc.message() if s.errc else "",
                 }
             except Exception as e:
@@ -950,20 +1051,6 @@ class DownloadQueue:
 class MinervaApp(tk.Tk):
     def __init__(self):
         super().__init__()
-        # TEST: Create a marker file to verify __init__ is being called
-        try:
-            test_file = pathlib.Path(pathlib.Path.home()) / "minerva_init_test.txt"
-            with open(test_file, "w") as f:
-                f.write(f"__init__ called at {datetime.now()}\n")
-        except Exception as e:
-            try:
-                import traceback
-                test_file = pathlib.Path(pathlib.Path.home()) / "minerva_init_error.txt"
-                with open(test_file, "w") as f:
-                    f.write(f"ERROR in __init__: {str(e)}\n{traceback.format_exc()}\n")
-            except:
-                pass
-        
         self.title(f"MiNERVA Archive Browser v{APP_VERSION}")
         self.geometry("1100x650")
         self.configure(bg=BG)
@@ -1068,18 +1155,19 @@ class MinervaApp(tk.Tk):
         self._extract_worker_thread = threading.Thread(target=self._extract_worker_loop, daemon=True)
         self._extract_worker_thread.start()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
-        self._load_left_tree()
-        self._navigate(BROWSE_ROOT)
+        saved_last_path = self._settings.get("last_path")
+        if not isinstance(saved_last_path, str) or not saved_last_path.strip():
+            saved_last_path = BROWSE_ROOT
+        saved_last_query = self._settings.get("last_search_query")
+        if not isinstance(saved_last_query, str):
+            saved_last_query = ""
+        self._load_left_tree(
+            on_done=lambda: self._restore_left_tree_selection(saved_last_path)
+        )
+        self._navigate(saved_last_path, preserve_search=True, restore_query=saved_last_query)
         if self._start_minimized_var.get() or "--minimized" in sys.argv:
             self.after(100, self.iconify)
         self.after(100, self._run_startup_cleanup)
-        # TEST: Verify after() call is reached
-        try:
-            test_file = pathlib.Path(pathlib.Path.home()) / "minerva_after_scheduled.txt"
-            with open(test_file, "w") as f:
-                f.write(f"after() called at {datetime.now()}\n")
-        except:
-            pass
         self.after(2500, self._check_for_updates_async)
 
     def _setup_styles(self):
@@ -1233,6 +1321,9 @@ class MinervaApp(tk.Tk):
                 activebackground=BG,
                 activeforeground=FG,
                 relief="flat",
+                highlightthickness=1,
+                highlightbackground=ACCENT,
+                highlightcolor=ACCENT,
                 command=self._on_filter_change
             ).pack(side="left", padx=(6, 0))
 
@@ -1258,6 +1349,9 @@ class MinervaApp(tk.Tk):
                 activebackground=BG,
                 activeforeground=FG,
                 relief="flat",
+                highlightthickness=1,
+                highlightbackground=ACCENT,
+                highlightcolor=ACCENT,
                 command=self._on_filter_change
             ).grid(row=idx // 6, column=idx % 6, sticky="w", padx=(0, 10), pady=(0, 2))
 
@@ -1347,6 +1441,9 @@ class MinervaApp(tk.Tk):
             activebackground=PANEL,
             activeforeground=FG,
             relief="flat",
+            highlightthickness=1,
+            highlightbackground=ACCENT,
+            highlightcolor=ACCENT,
             command=self._on_extract_defaults_change,
         ).pack(side="left", padx=(4, 0))
         tk.Checkbutton(
@@ -1359,6 +1456,9 @@ class MinervaApp(tk.Tk):
             activebackground=PANEL,
             activeforeground=FG,
             relief="flat",
+            highlightthickness=1,
+            highlightbackground=ACCENT,
+            highlightcolor=ACCENT,
             command=self._on_extract_defaults_change,
         ).pack(side="left", padx=(4, 0))
         tk.Checkbutton(
@@ -1371,6 +1471,9 @@ class MinervaApp(tk.Tk):
             activebackground=PANEL,
             activeforeground=FG,
             relief="flat",
+            highlightthickness=1,
+            highlightbackground=ACCENT,
+            highlightcolor=ACCENT,
             command=self._on_extract_defaults_change,
         ).pack(side="left", padx=(6, 0))
         tk.Checkbutton(
@@ -1383,6 +1486,9 @@ class MinervaApp(tk.Tk):
             activebackground=PANEL,
             activeforeground=FG,
             relief="flat",
+            highlightthickness=1,
+            highlightbackground=ACCENT,
+            highlightcolor=ACCENT,
             command=self._on_startup_settings_change,
         ).pack(side="left", padx=(10, 0))
         tk.Checkbutton(
@@ -1395,6 +1501,9 @@ class MinervaApp(tk.Tk):
             activebackground=PANEL,
             activeforeground=FG,
             relief="flat",
+            highlightthickness=1,
+            highlightbackground=ACCENT,
+            highlightcolor=ACCENT,
             command=self._on_startup_settings_change,
         ).pack(side="left", padx=(4, 0))
 
@@ -1548,7 +1657,7 @@ class MinervaApp(tk.Tk):
     def _set_loading(self, loading: bool):
         self._loading_label.config(text="\u23f3 Loading\u2026" if loading else "")
 
-    def _load_left_tree(self):
+    def _load_left_tree(self, on_done=None):
         self._set_loading(True)
 
         def worker():
@@ -1557,12 +1666,12 @@ class MinervaApp(tk.Tk):
             except Exception as e:
                 entries = []
                 log_error("MinervaApp._load_left_tree failed", e)
-                self.after(0, lambda: self._show_error(str(e)))
-            self.after(0, lambda: self._populate_left_tree(entries))
+                self.after(0, lambda err=e: self._show_error(str(err)))
+            self.after(0, lambda: self._populate_left_tree(entries, on_done))
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _populate_left_tree(self, entries):
+    def _populate_left_tree(self, entries, on_done=None):
         self._set_loading(False)
         self._left_tree.delete(*self._left_tree.get_children())
         self._left_loaded_nodes.clear()
@@ -1571,12 +1680,19 @@ class MinervaApp(tk.Tk):
         for e in entries:
             if e["is_folder"]:
                 self._insert_left_folder("", e)
+        if on_done:
+            on_done()
 
     def _on_left_select(self, event):
         sel = self._left_tree.selection()
         if sel:
             path = sel[0]
             self._expand_left_path(path)
+            if path == self._current_path:
+                # Already viewing this path (e.g. selection was restored
+                # programmatically on startup) - avoid clearing search text
+                # or re-fetching entries needlessly.
+                return
             self._navigate(path)
 
     def _on_left_open(self, event):
@@ -1593,8 +1709,12 @@ class MinervaApp(tk.Tk):
         # Add placeholder so tree item can be expanded before children are loaded.
         self._left_tree.insert(iid, "end", text="")
 
-    def _expand_left_path(self, path: str):
-        if path in self._left_loaded_nodes or path in self._left_loading_nodes:
+    def _expand_left_path(self, path: str, on_done=None):
+        if path in self._left_loaded_nodes:
+            if on_done:
+                self.after(0, on_done)
+            return
+        if path in self._left_loading_nodes:
             return
         if not self._left_tree.exists(path):
             return
@@ -1603,14 +1723,14 @@ class MinervaApp(tk.Tk):
         def worker():
             try:
                 entries = fetch_entries(path)
-                self.after(0, lambda: self._populate_left_children(path, entries))
+                self.after(0, lambda: self._populate_left_children(path, entries, on_done))
             except Exception as e:
                 log_error(f"MinervaApp._expand_left_path failed for path={path}", e)
                 self.after(0, lambda: self._left_loading_nodes.discard(path))
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _populate_left_children(self, parent_path: str, entries: list[dict]):
+    def _populate_left_children(self, parent_path: str, entries: list[dict], on_done=None):
         self._left_loading_nodes.discard(parent_path)
         if not self._left_tree.exists(parent_path):
             return
@@ -1619,10 +1739,53 @@ class MinervaApp(tk.Tk):
             if e.get("is_folder"):
                 self._insert_left_folder(parent_path, e)
         self._left_loaded_nodes.add(parent_path)
+        if on_done:
+            on_done()
 
-    def _navigate(self, path):
+    def _left_tree_ancestor_chain(self, path: str) -> list[str]:
+        """Return the sequence of left-tree node hrefs (ancestors then the
+        target itself) leading to `path`, so it can be lazily expanded."""
+        prefix = "/browse/./"
+        if not path.startswith(prefix):
+            return []
+        remainder = path[len(prefix):].strip("/")
+        if not remainder:
+            return []
+        cumulative = prefix
+        chain = []
+        for part in remainder.split("/"):
+            cumulative = cumulative + part + "/"
+            chain.append(cumulative)
+        return chain
+
+    def _restore_left_tree_selection(self, path: str):
+        """Expand and select the left category tree down to `path` so the UI
+        reflects the previously visited location on startup."""
+        chain = self._left_tree_ancestor_chain(path)
+        if not chain:
+            return
+
+        def step(idx: int):
+            if idx >= len(chain):
+                return
+            node = chain[idx]
+            if not self._left_tree.exists(node):
+                return
+            if idx == len(chain) - 1:
+                self._left_tree.selection_set(node)
+                self._left_tree.see(node)
+                return
+            self._left_tree.item(node, open=True)
+            self._expand_left_path(node, on_done=lambda: step(idx + 1))
+
+        step(0)
+
+    def _navigate(self, path, preserve_search=False, restore_query=""):
         self._current_path = path
-        self._search_var.set("")
+        if preserve_search:
+            self._search_var.set(restore_query)
+        else:
+            self._search_var.set("")
         self._update_breadcrumb()
         self._set_loading(True)
         self._right_tree.delete(*self._right_tree.get_children())
@@ -1635,9 +1798,10 @@ class MinervaApp(tk.Tk):
                 self.after(0, lambda: self._populate_right(entries))
             except Exception as e:
                 log_error(f"MinervaApp._navigate failed for path={path}", e)
-                self.after(0, lambda: self._show_error(str(e)))
+                self.after(0, lambda err=e: self._show_error(str(err)))
 
         threading.Thread(target=worker, daemon=True).start()
+        self._save_settings()
 
     def _populate_right(self, entries):
         self._set_loading(False)
@@ -1657,6 +1821,9 @@ class MinervaApp(tk.Tk):
 
     def _on_search_change(self, *_):
         self._render_right_list()
+        if getattr(self, "_search_save_after_id", None):
+            self.after_cancel(self._search_save_after_id)
+        self._search_save_after_id = self.after(500, self._save_settings)
 
     def _on_filter_change(self):
         self._render_right_list()
@@ -1669,7 +1836,13 @@ class MinervaApp(tk.Tk):
         self._right_tree.delete(*self._right_tree.get_children())
         visible_hrefs = {e["href"] for e in visible_files}
         self._checked_hrefs.intersection_update(visible_hrefs)
+        seen_hrefs = set()
         for e in visible_files:
+            # Guard against duplicate hrefs (e.g. malformed source HTML), which
+            # would otherwise raise a TclError when reused as a Treeview iid.
+            if e["href"] in seen_hrefs:
+                continue
+            seen_hrefs.add(e["href"])
             icon = "\U0001f4c4 "
             self._right_tree.insert("", "end", iid=e["href"],
                                     values=("", icon + e["name"], e["size"]),
@@ -1800,13 +1973,18 @@ class MinervaApp(tk.Tk):
                     "Install libtorrent to enable downloads:\n  pip install libtorrent",
                 )
                 return
-            full_path = urllib.parse.unquote(href.split("name=")[1])
-            file_name = full_path.split("/")[-1]
+            rom_id = extract_rom_id(href)
+            if not rom_id:
+                messagebox.showerror(
+                    "Download Failed", f"Could not determine rom id for {entry['name']}."
+                )
+                return
+            file_name = entry["name"]
             save_path = self.get_download_dir()
             download_id = str(uuid.uuid4())
             threading.Thread(
                 target=self._lookup_and_enqueue,
-                args=(download_id, full_path, file_name, save_path),
+                args=(download_id, rom_id, file_name, save_path),
                 daemon=True,
             ).start()
             if not self._downloads_visible:
@@ -2110,6 +2288,9 @@ class MinervaApp(tk.Tk):
             activebackground=PANEL,
             activeforeground=FG,
             relief="flat",
+            highlightthickness=1,
+            highlightbackground=ACCENT,
+            highlightcolor=ACCENT,
             command=lambda d=did, v=sel_var: self._set_queued_selected(d, v.get())
         ).pack(side="left", padx=(4, 2))
         name = item["name"]
@@ -2260,6 +2441,8 @@ class MinervaApp(tk.Tk):
             "autostart_with_windows": bool(self._autostart_var.get()),
             "start_minimized": bool(self._start_minimized_var.get()),
             "download_queue": self._get_persisted_queue_for_settings(),
+            "last_path": self._current_path,
+            "last_search_query": self._search_var.get(),
         }
 
     def _save_settings(self):
@@ -2368,6 +2551,8 @@ class MinervaApp(tk.Tk):
         self._save_settings()
 
     def _apply_autostart(self, enabled: bool):
+        if winreg is None:
+            return
         _AUTOSTART_KEY = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run"
         _APP_NAME = "MiNERVA Browser"
         try:
@@ -2398,6 +2583,15 @@ class MinervaApp(tk.Tk):
         found = find_chdman_executable()
         if found:
             return found
+
+        if not IS_WINDOWS:
+            # The auto-download path fetches a Windows MAME .exe package and
+            # extracts chdman.exe from it, which cannot run on Linux/macOS.
+            # On these platforms chdman must come from the system's own MAME
+            # package (e.g. `sudo pacman -S mame`, `sudo apt install mame-tools`,
+            # `brew install mame`) or be placed on PATH.
+            log_activity("chd.install.skip reason=non_windows_platform")
+            return None
 
         base = get_runtime_base_dir()
         tmp_root = base / "_chdman_install_tmp"
@@ -2435,9 +2629,7 @@ class MinervaApp(tk.Tk):
             if not pkg_path.exists() or pkg_path.stat().st_size <= 0:
                 raise RuntimeError("Downloaded MAME package is empty")
 
-            startupinfo = subprocess.STARTUPINFO()
-            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-            startupinfo.wShowWindow = 6  # SW_MINIMIZE
+            startupinfo = _windows_startupinfo()
 
             extracted_ok = False
             last_err = ""
@@ -2492,6 +2684,12 @@ class MinervaApp(tk.Tk):
         if path:
             self._extract_status_var.set(f"CHD tool ready: {path}")
             log_activity(f"chd.install.ok path='{path}'")
+        elif not IS_WINDOWS:
+            self._extract_status_var.set(
+                "chdman not found. Install MAME (e.g. 'sudo pacman -S mame', "
+                "'sudo apt install mame-tools', or 'brew install mame') and retry."
+            )
+            log_activity("chd.install.fail non_windows_no_chdman")
         else:
             self._extract_status_var.set("Could not auto-install chdman. Install MAME and retry.")
             log_activity("chd.install.fail no_path")
@@ -2881,55 +3079,23 @@ class MinervaApp(tk.Tk):
     def _run_startup_cleanup(self):
         """Run cleanup on startup if processed ROM files (CHD) are detected."""
         try:
-            # Create debug file at the start - with a test write
             download_dir = self.get_download_dir()
-            debug_file_path = pathlib.Path(download_dir) / "startup_cleanup_debug.txt"
-            
-            # Test write
-            try:
-                with open(debug_file_path, "a") as f:
-                    f.write(f"TEST: _run_startup_cleanup() called\n")
-            except Exception as write_err:
-                # If we can't write, at least try to create empty file
-                try:
-                    debug_file_path.touch()
-                except:
-                    pass
-            
-            with open(debug_file_path, "a") as f:
-                f.write(f"[STARTUP CLEANUP] Method called at {datetime.now()}\n")
-            
             base = pathlib.Path(download_dir) / "extracted"
-            with open(debug_file_path, "a") as f:
-                f.write(f"[STARTUP CLEANUP] Checking directory: {base}\n")
-            
             if not base.exists() or not base.is_dir():
-                with open(debug_file_path, "a") as f:
-                    f.write(f"[STARTUP CLEANUP] Directory does not exist or is not a directory\n")
                 return
 
-            # Check if any CHD files exist (indicates processing has happened)
             chd_files = list(base.rglob("*.chd"))
-            with open(debug_file_path, "a") as f:
-                f.write(f"[STARTUP CLEANUP] Found {len(chd_files)} CHD files\n")
-            
             if not chd_files:
-                with open(debug_file_path, "a") as f:
-                    f.write(f"[STARTUP CLEANUP] No CHD files found, skipping cleanup\n")
                 return
 
             log_activity(f"startup.cleanup detected {len(chd_files)} CHD files")
-            with open(debug_file_path, "a") as f:
-                f.write(f"[STARTUP CLEANUP] Processing {len(chd_files)} CHD files\n")
 
-            # Check for source files that should be cleaned up
             bin_files = list(base.rglob("*.bin"))
             cue_files = list(base.rglob("*.cue"))
             iso_files = list(base.rglob("*.iso"))
             source_count = len(bin_files) + len(cue_files) + len(iso_files)
 
-            if source_count > 0 or True:
-                # Run name cleanup on all extracted content
+            if source_count > 0:
                 renamed, unchanged, cleanup_failed = self._clean_chd_names_in_base(base)
                 log_activity(
                     f"startup.cleanup names renamed={renamed} unchanged={unchanged} failed={len(cleanup_failed)}"
@@ -2942,65 +3108,42 @@ class MinervaApp(tk.Tk):
             delete_failed: list[str] = []
 
             for chd in chd_files:
-                with open(debug_file_path, "a") as f:
-                    f.write(f"[STARTUP CLEANUP] Processing CHD: {chd}\n")
-                
                 cue = chd.with_suffix(".cue")
                 bin_file = chd.with_suffix(".bin")
                 iso_file = chd.with_suffix(".iso")
 
                 if cue.exists():
                     try:
-                        with open(debug_file_path, "a") as f:
-                            f.write(f"[STARTUP CLEANUP] Deleting CUE: {cue}\n")
                         cue.unlink()
                         removed_cues += 1
                         log_activity(f"startup.cleanup.delete cue='{cue}'")
                     except Exception as e:
                         delete_failed.append(f"{cue.name}: {e}")
                         log_activity(f"startup.cleanup.delete_failed cue='{cue}' err={e}")
-                        with open(debug_file_path, "a") as f:
-                            f.write(f"[STARTUP CLEANUP] Failed to delete CUE: {e}\n")
 
                 if bin_file.exists():
                     try:
-                        with open(debug_file_path, "a") as f:
-                            f.write(f"[STARTUP CLEANUP] Deleting BIN: {bin_file}\n")
                         bin_file.unlink()
                         removed_bins += 1
                         log_activity(f"startup.cleanup.delete bin='{bin_file}'")
                     except Exception as e:
                         delete_failed.append(f"{bin_file.name}: {e}")
                         log_activity(f"startup.cleanup.delete_failed bin='{bin_file}' err={e}")
-                        with open(debug_file_path, "a") as f:
-                            f.write(f"[STARTUP CLEANUP] Failed to delete BIN: {e}\n")
 
                 if iso_file.exists():
                     try:
-                        with open(debug_file_path, "a") as f:
-                            f.write(f"[STARTUP CLEANUP] Deleting ISO: {iso_file}\n")
                         iso_file.unlink()
                         removed_isos += 1
                         log_activity(f"startup.cleanup.delete iso='{iso_file}'")
                     except Exception as e:
                         delete_failed.append(f"{iso_file.name}: {e}")
                         log_activity(f"startup.cleanup.delete_failed iso='{iso_file}' err={e}")
-                        with open(debug_file_path, "a") as f:
-                            f.write(f"[STARTUP CLEANUP] Failed to delete ISO: {e}\n")
 
             if removed_bins > 0 or removed_cues > 0 or removed_isos > 0:
                 msg = f"Cleanup: Removed {removed_bins} BIN, {removed_cues} CUE, {removed_isos} ISO files"
                 log_activity(f"startup.cleanup.done {msg}")
-                with open(debug_file_path, "a") as f:
-                    f.write(f"[STARTUP CLEANUP] {msg}\n")
-            else:
-                with open(debug_file_path, "a") as f:
-                    f.write(f"[STARTUP CLEANUP] No files needed deletion\n")
 
         except Exception as e:
-            debug_file_path = pathlib.Path(self.get_download_dir()) / "startup_cleanup_debug.txt"
-            with open(debug_file_path, "a") as f:
-                f.write(f"[STARTUP CLEANUP] ERROR: {e}\n")
             log_error("MinervaApp._run_startup_cleanup failed", e)
 
 
@@ -3103,7 +3246,8 @@ class MinervaApp(tk.Tk):
         col = self._right_tree.identify_column(event.x)
         if col == "#1":
             iid = self._right_tree.identify_row(event.y)
-            if iid and "/rom?name=" in iid:
+            entry = next((e for e in self._all_entries if e["href"] == iid), None)
+            if entry is not None and not entry.get("is_folder", False):
                 if iid in self._checked_hrefs:
                     self._checked_hrefs.discard(iid)
                     self._right_tree.set(iid, "check", "")
@@ -3144,46 +3288,46 @@ class MinervaApp(tk.Tk):
             return
         save_path = self.get_download_dir()
         for href in hrefs:
-            full_path = urllib.parse.unquote(href.split("name=")[1])
-            file_name = full_path.split("/")[-1]
+            rom_id = extract_rom_id(href)
+            if not rom_id:
+                continue
+            entry = next((e for e in self._all_entries if e["href"] == href), None)
+            file_name = entry["name"] if entry else href
             download_id = str(uuid.uuid4())
             threading.Thread(
                 target=self._lookup_and_enqueue,
-                args=(download_id, full_path, file_name, save_path),
+                args=(download_id, rom_id, file_name, save_path),
                 daemon=True
             ).start()
         self._clear_checked()
         if not self._downloads_visible:
             self._toggle_downloads()
 
-    def _lookup_and_enqueue(self, download_id: str, full_path: str, file_name: str, save_path: str):
-        """Background thread: look up file in hashes.db, download the .torrent file, then enqueue."""
+    def _lookup_and_enqueue(self, download_id: str, rom_id: str, file_name: str, save_path: str):
+        """Background thread: look up rom metadata by id, download the .torrent file, then enqueue."""
         # Deduplicate: skip if already pending/active/done
         if self._download_queue and self._download_queue.has_name(file_name):
             return
 
-        # The href from the site is already the full DB key, e.g.:
-        # ./No-Intro/Nintendo - Nintendo 64 (ByteSwapped)/Game.zip
-        # Pass it directly — no stripping needed.
         self.after(0, lambda: self._status_var.set(f"Looking up: {file_name}…"))
 
         try:
-            db = SQLiteHTTP(HASHES_DB_URL)
-            row = db.lookup(full_path)
+            row = fetch_rom_info(rom_id)
         except Exception as e:
-            log_error(f"MinervaApp._lookup_and_enqueue db lookup failed for {file_name}", e)
-            self.after(0, lambda: messagebox.showerror(
-                "DB Lookup Failed", f"Could not look up {file_name}:\n{e}"
+            log_error(f"MinervaApp._lookup_and_enqueue rom lookup failed for {file_name}", e)
+            self.after(0, lambda err=e: messagebox.showerror(
+                "Lookup Failed", f"Could not look up {file_name}:\n{err}"
             ))
             return
 
         if row is None:
             self.after(0, lambda: messagebox.showwarning(
-                "Not Found", f"{file_name} was not found in the database."
+                "Not Found", f"{file_name} was not found on the server."
             ))
             return
 
         so_id = row.get("so_id") or 0
+        full_path = row.get("full_path") or file_name
 
         # Prefer .torrent file; fall back to magnet
         torrent_url = None
@@ -3216,8 +3360,8 @@ class MinervaApp(tk.Tk):
                 if row.get("magnet"):
                     torrent_source = row["magnet"] + TRACKERS
                 if torrent_source is None:
-                    self.after(0, lambda: messagebox.showerror(
-                        "Torrent Download Failed", f"Could not download torrent for {file_name}:\n{e}"
+                    self.after(0, lambda err=e: messagebox.showerror(
+                        "Torrent Download Failed", f"Could not download torrent for {file_name}:\n{err}"
                     ))
                     return
         elif row.get("magnet"):
@@ -3383,9 +3527,7 @@ class MinervaApp(tk.Tk):
                 continue
             cmd = [chdman, mode, "-np", str(cpu_threads), "-i", str(source), "-o", str(out_chd)]
             log_activity(f"chd.run cmd={' '.join(cmd)}")
-            startupinfo = subprocess.STARTUPINFO()
-            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-            startupinfo.wShowWindow = 6
+            startupinfo = _windows_startupinfo()
             proc = subprocess.run(
                 cmd,
                 stdout=subprocess.PIPE,
@@ -3522,9 +3664,7 @@ class MinervaApp(tk.Tk):
                 last_lines = []
                 rc = 1
                 for attempt in range(1, 4):
-                    startupinfo = subprocess.STARTUPINFO()
-                    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-                    startupinfo.wShowWindow = 6  # SW_MINIMIZE
+                    startupinfo = _windows_startupinfo()
                     proc = subprocess.Popen(
                         cmd,
                         stdout=subprocess.PIPE,
@@ -3651,10 +3791,8 @@ class MinervaApp(tk.Tk):
 
     @staticmethod
     def _parse_version(tag: str) -> tuple[int, ...]:
-        try:
-            return tuple(int(x) for x in tag.lstrip("vV").strip().split("."))
-        except ValueError:
-            return (0,)
+        parts = [int(x) for x in re.findall(r"\d+", tag)]
+        return tuple(parts) if parts else (0,)
 
     @staticmethod
     def _fetch_latest_release() -> tuple[str, str]:
