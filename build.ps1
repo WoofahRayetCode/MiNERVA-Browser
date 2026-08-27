@@ -27,25 +27,31 @@ $BuildDir  = Join-Path $ScriptDir "build"
 $SpecFile  = Join-Path $ScriptDir "minerva_browser.spec"
 $OutExe    = Join-Path $DistDir "MiNERVA-Browser.exe"
 
-# ── helpers ─────────────────────────────────────────────────────────────────
+# --- helpers -----------------------------------------------------------------
 
 function Write-Step([string]$msg) {
     Write-Host "`n==> $msg" -ForegroundColor Cyan
 }
 
 function Write-Ok([string]$msg) {
-    Write-Host "    ✓ $msg" -ForegroundColor Green
+    Write-Host "    OK $msg" -ForegroundColor Green
 }
 
 function Write-Warn([string]$msg) {
     Write-Host "    ! $msg" -ForegroundColor Yellow
 }
 
+function Get-CommandSource([string]$Name) {
+    $cmd = Get-Command $Name -ErrorAction SilentlyContinue
+    if ($cmd) { return $cmd.Source }
+    return $null
+}
+
 function Find-Python {
     # Prefer a real Python over the Windows Store stub
     $candidates = @(
-        (Get-Command python3 -ErrorAction SilentlyContinue)?.Source,
-        (Get-Command python  -ErrorAction SilentlyContinue)?.Source
+        (Get-CommandSource "python3"),
+        (Get-CommandSource "python")
     ) | Where-Object { $_ -and $_ -notmatch "WindowsApps" }
 
     foreach ($p in $candidates) {
@@ -66,7 +72,7 @@ function Find-Python {
     return $null
 }
 
-# ── optional clean ───────────────────────────────────────────────────────────
+# --- optional clean ----------------------------------------------------------
 
 if ($Clean) {
     Write-Step "Cleaning previous build artifacts"
@@ -78,7 +84,7 @@ if ($Clean) {
     }
 }
 
-# ── ensure Python 3 ──────────────────────────────────────────────────────────
+# --- ensure Python 3 ---------------------------------------------------------
 
 if (-not $SkipPythonCheck) {
     Write-Step "Checking for Python 3"
@@ -103,7 +109,7 @@ if (-not $SkipPythonCheck) {
     if (-not $PythonExe) { $PythonExe = "python3" }
 }
 
-# ── create / reuse venv ──────────────────────────────────────────────────────
+# --- create / reuse venv -----------------------------------------------------
 
 Write-Step "Setting up virtual environment"
 
@@ -118,25 +124,36 @@ $VenvPython      = Join-Path $VenvDir "Scripts\python.exe"
 $VenvPip         = Join-Path $VenvDir "Scripts\pip.exe"
 $VenvPyInstaller = Join-Path $VenvDir "Scripts\pyinstaller.exe"
 
-# ── install / upgrade PyInstaller ────────────────────────────────────────────
+# --- install / upgrade PyInstaller -------------------------------------------
 
 Write-Step "Installing PyInstaller"
 & $VenvPip install --quiet --upgrade pip
 & $VenvPip install --quiet pyinstaller
 Write-Ok "PyInstaller ready"
 
-# ── install libtorrent (optional) ────────────────────────────────────────────
-Write-Step "Installing libtorrent (optional — enables inline torrent downloads)"
-$ltOut = & $VenvPip install --quiet libtorrent 2>&1
-if ($LASTEXITCODE -eq 0) {
-    Write-Ok "libtorrent installed — downloads will be fully functional"
+# --- install libtorrent (optional) -------------------------------------------
+# Pip writes errors to stderr. With $ErrorActionPreference = Stop, that becomes
+# a terminating NativeCommandError, so this step must temporarily allow failures.
+Write-Step "Installing libtorrent (optional - enables inline torrent downloads)"
+$oldEap = $ErrorActionPreference
+$ErrorActionPreference = "Continue"
+try {
+    & $VenvPip install --quiet libtorrent 2>&1 | Out-Null
+    $ltOk = ($LASTEXITCODE -eq 0)
+} catch {
+    $ltOk = $false
+} finally {
+    $ErrorActionPreference = $oldEap
+}
+if ($ltOk) {
+    Write-Ok "libtorrent installed - downloads will be fully functional"
 } else {
     Write-Warn "No libtorrent wheel available for this Python version."
     Write-Warn "The app will still build and run; downloads will show an install prompt."
     Write-Warn "To enable: use Python 3.10 or 3.13 and rebuild."
 }
 
-# ── download / verify chdman.exe (optional) ──────────────────────────────────
+# --- download / verify chdman.exe (optional) ---------------------------------
 Write-Step "Checking for chdman.exe (CHD disc compression tool)"
 $ToolsDir = Join-Path $ScriptDir "tools\chdman"
 $ChdmanExe = Join-Path $ToolsDir "chdman.exe"
@@ -164,7 +181,9 @@ if (Test-Path $ChdmanExe) {
             Write-Host "    Downloading MAME package from $mameRelUrl ..." -ForegroundColor DarkGray
             Invoke-WebRequest -Uri $mameRelUrl -OutFile $mameInstaller -UseBasicParsing -TimeoutSec 120
 
-            $sevenZip = (Get-Command 7z, 7za -ErrorAction SilentlyContinue)?.Source
+            $sevenZipCmd = Get-Command 7z, 7za -ErrorAction SilentlyContinue | Select-Object -First 1
+            $sevenZip = $null
+            if ($sevenZipCmd) { $sevenZip = $sevenZipCmd.Source }
             if (-not $sevenZip -and (Test-Path "C:\Program Files\7-Zip\7z.exe")) { $sevenZip = "C:\Program Files\7-Zip\7z.exe" }
 
             if ($sevenZip) {
@@ -187,7 +206,7 @@ if (Test-Path $ChdmanExe) {
     }
 }
 
-# ── run unit tests ───────────────────────────────────────────────────────────
+# --- run unit tests ----------------------------------------------------------
 if (-not $SkipTests) {
     Write-Step "Running unit tests"
     & $VenvPython -m unittest discover -s (Join-Path $ScriptDir "tests") -v
@@ -197,7 +216,7 @@ if (-not $SkipTests) {
     Write-Ok "All unit tests passed"
 }
 
-# ── stamp build version ──────────────────────────────────────────────────────
+# --- stamp build version -----------------------------------------------------
 
 Write-Step "Stamping build version"
 $BuildVersion = Get-Date -Format "yyyy.MMdd.HHmm"
@@ -211,7 +230,7 @@ Set-Content -Path $VersionFile -Value $NewConstants -NoNewline
 Set-Content -Path $VersionInit -Value $NewInit -NoNewline
 Write-Ok "APP_VERSION = `"$BuildVersion`""
 
-# ── build ────────────────────────────────────────────────────────────────────
+# --- build -------------------------------------------------------------------
 
 Write-Step "Building portable executable"
 Push-Location $ScriptDir
@@ -225,14 +244,14 @@ try {
 }
 
 
-# ── verify output ────────────────────────────────────────────────────────────
+# --- verify output -----------------------------------------------------------
 
 Write-Step "Verifying output"
 if (Test-Path $OutExe) {
     $size = [math]::Round((Get-Item $OutExe).Length / 1MB, 1)
     Write-Ok "Built successfully: $OutExe  ($size MB)"
     Write-Host ""
-    Write-Host "  Portable exe is ready — copy MiNERVA-Browser.exe anywhere and run it." -ForegroundColor White
+    Write-Host "  Portable exe is ready - copy MiNERVA-Browser.exe anywhere and run it." -ForegroundColor White
 } else {
     throw "Build finished but $OutExe was not found. Check PyInstaller output above."
 }
