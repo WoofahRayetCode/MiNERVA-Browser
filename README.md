@@ -1,91 +1,130 @@
 # MiNERVA Archive Browser
 
-A portable desktop GUI for browsing and downloading from [minerva-archive.org](https://minerva-archive.org/browse/), built with Python + tkinter + libtorrent.
+A portable desktop GUI for browsing and downloading from [minerva-archive.org](https://minerva-archive.org/browse/), built with Python + Tkinter + libtorrent.
 
-![Dark theme, two-panel layout](https://img.shields.io/badge/platform-Windows-blue) ![Python 3.13](https://img.shields.io/badge/python-3.13-blue) ![libtorrent 2.0](https://img.shields.io/badge/libtorrent-2.0-green)
+![Windows](https://img.shields.io/badge/platform-Windows%20%7C%20Linux-blue) ![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue) ![libtorrent 2.0](https://img.shields.io/badge/libtorrent-2.0-green)
+
+---
 
 ## Features
 
-### Browsing
-- 📁 Two-panel layout — category tree on the left, file listing on the right
-- 🔍 Live search/filter with no extra network requests
-- 🧭 Clickable breadcrumb navigation
-- ⚡ Async loading — GUI stays responsive while fetching
-- 🌑 Dark theme
+### Browsing & Modern UI
+- 📁 **Two-panel layout** — category tree on the left, file listing on the right
+- 🔍 **Integrated search** — instant client-side filtering with live results and `Escape` shortcut
+- 💊 **Interactive region pills** — click-to-filter region chips (USA, Europe, Japan, World, etc.) with active glow
+- 🏷️ **Dynamic tag filter dropdown** — compact popover menu to hide Demos, Betas, Prototypes, Unlicensed, or Hacks without consuming screen space
+- 🧭 **Clickable breadcrumb navigation**
+- ⚡ **Async loading** — GUI stays responsive while fetching
+- 🌑 **Refined dark theme** — Catppuccin Mocha-inspired palette with comfortable typography, clear metrics, and styled scrollbars
 
 ### Downloading
-- ✅ Inline checkboxes — tick multiple games then click **Download Checked**
-- ⚡ Double-click a game to queue it instantly
-- 🔄 Download queue with configurable concurrency (1–10 simultaneous downloads)
-- 📂 Choose your save folder via Browse button
-- 💾 Download/filter preferences and queued downloads persist between app launches
-- 🗂️ Torrent files cached locally in `torrentfiles/` — no redundant fetches
-- 🚫 Deduplication — skips games already pending, active, or completed
-- 📊 Per-download progress bars with speed, peers, and state
+- ✅ **Inline checkboxes & multi-select** — select multiple games then click **Queue Downloads**
+- ⚡ **Double-click** any game to queue it instantly
+- 🔄 **Download queue** with configurable concurrency (1–10 simultaneous downloads)
+- 📂 **Custom save folder** via the Browse button
+- 💾 **State persistence** — preferences, filters, and active/queued downloads persist across app launches
+- 🗂️ **Torrent caching** — `.torrent` files cached in `torrentfiles/` to eliminate redundant fetches
+- 🚫 **Deduplication** — automatically skips items already pending, active, or completed
+- 📊 **Real-time metrics** — speed, ETA, progress bars, and state tracking without text clipping
 
-### Extraction
-- 📦 **Auto-extract** — automatically extract archives after download completes
-- 🗜️ Uses external extractors when detected (**7-Zip**, **PeaZip**, **WinRAR**); falls back to Python `zipfile` for `.zip`
-- 🔍 Extractor detection shown in the UI (tool paths displayed when found)
-- 📊 Per-download extraction progress bar
-- 🗑️ Optional **delete archive** after successful extraction
-- ⚙️ **Auto extract**, **delete archive**, and **PS1/PS2 BIN/CUE/ISO → CHD** defaults are configurable in the Downloads panel and persist across launches
-- 🧹 CHD conversion now auto-cleans names after conversion and removes the old BIN/CUE/ISO inputs
-- ⬇️ If CHD compression is enabled and `chdman` is missing, the app parses the latest MAME release page, downloads the Windows package, extracts only `chdman.exe`, and cleans up the rest
-- ✅ Extraction now verifies that ROM content was actually produced in the game output folder
-- 🚀 **Startup cleanup** — on every app launch, scans the extracted folder for processed CHD files and automatically cleans file names (removes region tags) and deletes source files (BIN/CUE/ISO)
+### Extraction & CHD Compression
+- 📦 **Auto-extract** — extract archives automatically once download finishes
+- 🗜️ **Extractor detection** — auto-detects external extractors (**7-Zip**, **PeaZip**, **WinRAR**) with fallback to Python `zipfile`
+- 🎮 **PS1/PS2 BIN/CUE/ISO → CHD** — convert disc images to CHD directly from the app (using system or auto-installed `chdman`)
+- 🛠️ **Unified ROM Tools menu** — grouped utilities for CHD conversion, BIN/CUE cleaning, verification, and name standardization
+- 🧹 **Automatic name cleaning** — cleans region tags and disc descriptors while preserving disc numbering
+- 🗑️ **Optional source deletion** — automatically deletes source archives and BIN/CUE/ISO files post-conversion
+- 🚀 **Startup cleanup** — scans the extracted folder on launch to clean names and remove leftover BIN/CUE files
+
+---
 
 ## Requirements
 
-- Windows 10/11 (64-bit)
-- For the portable exe: nothing — just run `MiNERVA-Browser.exe`
-- For building from source: Python 3.13 + libtorrent
+- **Windows 10/11** or **Linux** (x86_64)
+- **Standalone binary:** No installation required — download from [Releases](../../releases) and run
+- **From source:** Python 3.10+ and `libtorrent` (optional, for inline downloads)
 
-## Portable exe (recommended)
+---
 
-Download `MiNERVA-Browser.exe` from [Releases](../../releases) and run it — no installation required.
+## Building from Source
 
-## Building from source
-
+### Windows (PowerShell)
 ```powershell
 .\build.ps1
 ```
 
-The script will:
-1. Detect Python 3.13 (installs via [Scoop](https://scoop.sh) if not found)
-2. Create an isolated `.venv`
-3. Install PyInstaller + libtorrent
-4. Build `dist\MiNERVA-Browser.exe` (~15 MB, fully self-contained)
-
-### Build options
-
-| Flag | Description |
-|---|---|
-| `-Clean` | Wipe `build/`, `dist/`, `.venv` before building |
-| `-SkipPythonCheck` | Skip the Scoop auto-install check |
-
+Options:
 ```powershell
-.\build.ps1 -Clean        # recommended for a reproducible build
+.\build.ps1 -Clean            # Wipe build/, dist/, and .venv/ first
+.\build.ps1 -SkipPythonCheck  # Skip Scoop Python auto-install check
 ```
 
-## Running from source
+### Linux (Bash)
+```bash
+./build.sh
+```
 
-```powershell
-pip install libtorrent
+Options:
+```bash
+./build.sh --clean            # Wipe build/, dist/, and .venv/ first
+./build.sh --skip-tests       # Skip running the test suite
+```
+
+---
+
+## Running from Source
+
+```bash
+# Install dependencies
+pip install -r requirements-build.txt
+
+# Run the test suite
+python -m unittest discover -s tests -v
+
+# Run the application
 python minerva_browser.py
 ```
 
-> libtorrent is required for downloading. Without it the browser still works but downloads are disabled.
+> **Note:** `libtorrent` is required for downloading. Without it, the browser still works for navigating and searching, but downloads will be disabled.
 
-### Generated local files
+---
 
-The app writes a few files next to the executable/script while running, including `torrentfiles/`, `downloads/`, `extracted/`, `minerva_settings.json`, and `minerva_error.log`. These are local runtime artifacts and are intentionally excluded from source control by the repository `.gitignore`.
+## Project Structure
 
-## How downloads work
+```
+├── minerva_browser.py         # Application entry point
+├── minerva_browser.spec       # PyInstaller standalone build configuration
+├── build.ps1                  # Windows build automation script
+├── build.sh                   # Linux build automation script
+├── minerva/
+│   ├── constants.py           # Paths, theme tokens, trackers, and logging
+│   ├── core/
+│   │   ├── sqlite_http.py     # HTTP range SQLite reader & web parser
+│   │   ├── torrent_engine.py  # libtorrent session engine & DownloadQueue
+│   │   └── extractors.py      # Archive extraction & CHD compression tools
+│   └── ui/
+│       ├── theme.py           # Catppuccin palette & modern TTK style configurations
+│       ├── app.py             # Main Tkinter desktop application window
+│       └── components/
+│           ├── filter_bar.py  # Search entry, Region pills, and Tag popover
+│           └── tools_dialog.py# ROM tools menu & utilities modal dialog
+└── tests/
+    ├── test_sqlite_http.py    # Varint & SQLite B-Tree record unit tests
+    ├── test_parsers.py        # HTML & ROM ID parsing tests
+    ├── test_extractors.py     # ROM detection & name cleaning tests
+    ├── test_download_queue.py # Download queue state & concurrency tests
+    ├── test_ui_components.py  # UI theme, filter pills & tag popover tests
+    └── test_assets.py         # Asset and icon integrity tests
+```
 
-MiNERVA distributes all files via BitTorrent. The app:
+---
 
-1. Looks up the selected file in `hashes.db` (fetched via HTTP range requests — no full DB download)
-2. Downloads the collection `.torrent` file to `torrentfiles/`
-3. Tells libtorrent to download only the selected file within that torrent (`so_id` file priority)
-4. Optionally extracts the result with a detected external extractor (7-Zip / PeaZip / WinRAR) after completion
+## How Downloads Work
+
+MiNERVA distributes all files via BitTorrent:
+
+1. Looks up the selected file in `hashes.db` (fetched via HTTP range requests — no full DB download needed)
+2. Downloads the collection `.torrent` file into `torrentfiles/`
+3. Instructs libtorrent to download only the selected file within that torrent (`so_id` file priority)
+4. Optionally extracts the file using detected extractors (7-Zip / PeaZip / WinRAR / zipfile)
+5. Optionally converts disc images to CHD and cleans up input files
