@@ -2,6 +2,7 @@
 dist/
 build/
 *.spec.bak
+*.bak
 *.tmp
 *.tmp.*
 
@@ -9,12 +10,17 @@ build/
 .venv/
 venv/
 env/
+ENV/
 
-# Python cache
+# Python cache & compiled bytecode
 __pycache__/
 *.py[cod]
+*$py.class
 *.pyo
 *.pyd
+.pytest_cache/
+.coverage
+htmlcov/
 
 # Runtime data and caches (generated locally by the app)
 torrentfiles/
@@ -25,6 +31,8 @@ minerva_settings.json
 minerva_error.log
 activity_log*.txt
 startup_cleanup_debug.txt
+_chdman_install_tmp/
+_minerva_update.ps1
 
 # Runtime tools (auto-installed at runtime)
 tools/
@@ -32,12 +40,12 @@ tools/
 # PyInstaller
 *.manifest
 
-# OS
+# OS metadata
 .DS_Store
 Thumbs.db
 desktop.ini
 
-# IDE
+# IDE & editors
 .vscode/
 .idea/
 *.suo
