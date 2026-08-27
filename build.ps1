@@ -13,7 +13,8 @@
 #>
 param(
     [switch]$Clean,
-    [switch]$SkipPythonCheck
+    [switch]$SkipPythonCheck,
+    [switch]$SkipTests
 )
 
 Set-StrictMode -Version Latest
@@ -135,15 +136,79 @@ if ($LASTEXITCODE -eq 0) {
     Write-Warn "To enable: use Python 3.10 or 3.13 and rebuild."
 }
 
+# ── download / verify chdman.exe (optional) ──────────────────────────────────
+Write-Step "Checking for chdman.exe (CHD disc compression tool)"
+$ToolsDir = Join-Path $ScriptDir "tools\chdman"
+$ChdmanExe = Join-Path $ToolsDir "chdman.exe"
+
+if (Test-Path $ChdmanExe) {
+    Write-Ok "chdman.exe already present at $ChdmanExe"
+} else {
+    Write-Step "Downloading chdman.exe automatically..."
+    try {
+        if (-not (Test-Path $ToolsDir)) {
+            New-Item -ItemType Directory -Path $ToolsDir -Force | Out-Null
+        }
+        $tmpDir = Join-Path $ScriptDir "_chdman_dl_tmp"
+        if (Test-Path $tmpDir) { Remove-Item $tmpDir -Recurse -Force }
+        New-Item -ItemType Directory -Path $tmpDir -Force | Out-Null
+
+        $mameDevUrl = "https://www.mamedev.org/release.html"
+        $html = (Invoke-WebRequest -Uri $mameDevUrl -UseBasicParsing -TimeoutSec 30).Content
+        if ($html -match 'href="([^"]*mame\d+b_(?:x64|64bit)\.exe[^"]*)"') {
+            $mameRelUrl = $matches[1]
+            if (-not ($mameRelUrl -match "^https?://")) {
+                $mameRelUrl = "https://www.mamedev.org/$mameRelUrl"
+            }
+            $mameInstaller = Join-Path $tmpDir "mame_installer.exe"
+            Write-Host "    Downloading MAME package from $mameRelUrl ..." -ForegroundColor DarkGray
+            Invoke-WebRequest -Uri $mameRelUrl -OutFile $mameInstaller -UseBasicParsing -TimeoutSec 120
+
+            $sevenZip = (Get-Command 7z, 7za -ErrorAction SilentlyContinue)?.Source
+            if (-not $sevenZip -and (Test-Path "C:\Program Files\7-Zip\7z.exe")) { $sevenZip = "C:\Program Files\7-Zip\7z.exe" }
+
+            if ($sevenZip) {
+                & $sevenZip x -y "-o$tmpDir\extracted" $mameInstaller chdman.exe | Out-Null
+            } else {
+                Start-Process -FilePath $mameInstaller -ArgumentList "-y -o`"$tmpDir\extracted`"" -Wait -NoNewWindow
+            }
+
+            $extractedChd = Get-ChildItem -Path "$tmpDir\extracted" -Filter "chdman.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($extractedChd) {
+                Copy-Item -Path $extractedChd.FullName -Destination $ChdmanExe -Force
+                Write-Ok "chdman.exe downloaded and installed to $ChdmanExe"
+            } else {
+                Write-Warn "Could not find chdman.exe in extracted archive."
+            }
+        }
+        if (Test-Path $tmpDir) { Remove-Item $tmpDir -Recurse -Force }
+    } catch {
+        Write-Warn "Automatic download of chdman.exe failed: $_"
+    }
+}
+
+# ── run unit tests ───────────────────────────────────────────────────────────
+if (-not $SkipTests) {
+    Write-Step "Running unit tests"
+    & $VenvPython -m unittest discover -s (Join-Path $ScriptDir "tests") -v
+    if ($LASTEXITCODE -ne 0) {
+        throw "Unit tests failed. Build aborted."
+    }
+    Write-Ok "All unit tests passed"
+}
+
 # ── stamp build version ──────────────────────────────────────────────────────
 
 Write-Step "Stamping build version"
 $BuildVersion = Get-Date -Format "yyyy.MMdd.HHmm"
-$SourceFile   = Join-Path $ScriptDir "minerva_browser.py"
-$SourceText   = Get-Content $SourceFile -Raw
-$OriginalText = $SourceText
-$SourceText   = $SourceText -replace '(?m)^APP_VERSION\s*=\s*"[^"]*"', "APP_VERSION = `"$BuildVersion`""
-Set-Content -Path $SourceFile -Value $SourceText -NoNewline
+$VersionFile  = Join-Path $ScriptDir "minerva\constants.py"
+$VersionInit  = Join-Path $ScriptDir "minerva\__init__.py"
+$OriginalConstants = Get-Content $VersionFile -Raw
+$OriginalInit      = Get-Content $VersionInit -Raw
+$NewConstants = $OriginalConstants -replace '(?m)^APP_VERSION\s*=\s*"[^"]*"', "APP_VERSION = `"$BuildVersion`""
+$NewInit      = $OriginalInit -replace '(?m)^APP_VERSION\s*=\s*"[^"]*"', "APP_VERSION = `"$BuildVersion`""
+Set-Content -Path $VersionFile -Value $NewConstants -NoNewline
+Set-Content -Path $VersionInit -Value $NewInit -NoNewline
 Write-Ok "APP_VERSION = `"$BuildVersion`""
 
 # ── build ────────────────────────────────────────────────────────────────────
@@ -153,10 +218,12 @@ Push-Location $ScriptDir
 try {
     & $VenvPyInstaller $SpecFile --noconfirm
 } finally {
-    # Restore original source so version line stays clean in git
-    Set-Content -Path $SourceFile -Value $OriginalText -NoNewline
+    # Restore original source so version lines stay clean in git
+    Set-Content -Path $VersionFile -Value $OriginalConstants -NoNewline
+    Set-Content -Path $VersionInit -Value $OriginalInit -NoNewline
     Pop-Location
 }
+
 
 # ── verify output ────────────────────────────────────────────────────────────
 
