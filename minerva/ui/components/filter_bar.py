@@ -154,7 +154,7 @@ class FilterBar(tk.Frame):
         self.tags_btn.pack(side="right")
         self._update_tag_btn_label()
 
-        # Bottom Row: Region Pills
+        # Bottom row: region pills wrap onto extra lines so none are clipped
         pill_row = tk.Frame(self, bg=BG)
         pill_row.pack(fill="x", padx=10, pady=(0, 4))
 
@@ -165,12 +165,16 @@ class FilterBar(tk.Frame):
             fg=FG_DIM,
             font=("TkDefaultFont", 9),
         )
-        region_lbl.pack(side="left", padx=(0, 6))
+        region_lbl.pack(side="left", padx=(0, 6), anchor="n", pady=3)
 
-        # "All" toggle shortcut pill
+        self._pill_wrap = tk.Frame(pill_row, bg=BG)
+        self._pill_wrap.pack(side="left", fill="x", expand=True)
+        self._pill_wrap.pack_propagate(False)
+        self._wrap_pills: list[tk.Widget] = []
+
         self.all_regions_var = tk.BooleanVar(value=all(v.get() for v in self.region_vars.values()))
         self.all_pill = tk.Label(
-            pill_row,
+            self._pill_wrap,
             text="All",
             bg=PILL_ACTIVE_BG if self.all_regions_var.get() else PILL_INACTIVE_BG,
             fg=PILL_ACTIVE_FG if self.all_regions_var.get() else PILL_INACTIVE_FG,
@@ -180,16 +184,42 @@ class FilterBar(tk.Frame):
             cursor="hand2",
             relief="flat",
         )
-        self.all_pill.pack(side="left", padx=(0, 4))
+        self._wrap_pills.append(self.all_pill)
         self.all_pill.bind("<Button-1>", self._on_all_regions_click)
         self.all_pill.bind("<Enter>", lambda e: self._on_all_pill_hover(True))
         self.all_pill.bind("<Leave>", lambda e: self._on_all_pill_hover(False))
 
         for key, label in self.region_specs:
             var = self.region_vars[key]
-            pill = RegionPill(pill_row, text=label, var=var, command=self._on_region_pill_toggled)
-            pill.pack(side="left", padx=(0, 4))
+            pill = RegionPill(self._pill_wrap, text=label, var=var, command=self._on_region_pill_toggled)
+            self._wrap_pills.append(pill)
             self._pills.append(pill)
+
+        self._pill_wrap.bind("<Configure>", self._reflow_region_pills)
+        self.after_idle(self._reflow_region_pills)
+
+    def _reflow_region_pills(self, event=None):
+        wrap = getattr(self, "_pill_wrap", None)
+        if wrap is None:
+            return
+        width = max(wrap.winfo_width(), 1)
+        x = 0
+        y = 0
+        row_h = 0
+        gap = 4
+        for child in self._wrap_pills:
+            w = child.winfo_reqwidth()
+            h = child.winfo_reqheight()
+            if x > 0 and x + w > width:
+                x = 0
+                y += row_h + gap
+                row_h = 0
+            child.place(x=x, y=y)
+            x += w + gap
+            row_h = max(row_h, h)
+        new_h = max(y + row_h, 1)
+        if int(wrap.cget("height") or 0) != new_h:
+            wrap.configure(height=new_h)
 
     def _on_all_pill_hover(self, entering: bool):
         if not self.all_regions_var.get():
