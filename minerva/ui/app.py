@@ -55,6 +55,11 @@ from minerva.ui.theme import (
 from minerva.ui.components.filter_bar import FilterBar
 from minerva.ui.components.tools_dialog import ToolsMenu, ToolsDialog
 from minerva.core.sqlite_http import fetch_entries, fetch_rom_info, extract_rom_id
+from minerva.core.ps3_dkeys import (
+    PS3_DISC_KEYS_TXT_PATH,
+    find_dkey_entry,
+    is_ps3_iso_browse_path,
+)
 from minerva.core.torrent_engine import (
     TorrentEngine,
     DownloadQueue,
@@ -913,10 +918,11 @@ class MinervaApp(tk.Tk):
             return
         file_name = entry["name"]
         save_path = self.get_download_dir()
+        browse_path = self._current_path
         download_id = str(uuid.uuid4())
         threading.Thread(
             target=self._lookup_and_enqueue,
-            args=(download_id, rom_id, file_name, save_path),
+            args=(download_id, rom_id, file_name, save_path, browse_path),
             daemon=True,
         ).start()
         if not self._downloads_visible:
@@ -2388,15 +2394,27 @@ class MinervaApp(tk.Tk):
             download_id = str(uuid.uuid4())
             threading.Thread(
                 target=self._lookup_and_enqueue,
-                args=(download_id, rom_id, file_name, save_path),
+                args=(download_id, rom_id, file_name, save_path, self._current_path),
                 daemon=True
             ).start()
         self._clear_checked()
         if not self._downloads_visible:
             self._toggle_downloads()
 
-    def _lookup_and_enqueue(self, download_id: str, rom_id: str, file_name: str, save_path: str):
-        if self._download_queue and self._download_queue.has_name(file_name):
+    def _lookup_and_enqueue(
+        self,
+        download_id: str,
+        rom_id: str,
+        file_name: str,
+        save_path: str,
+        browse_path: str = "",
+        *,
+        skip_name_dedupe: bool = False,
+        fetch_ps3_dkey: bool = True,
+    ):
+        if not skip_name_dedupe and self._download_queue and self._download_queue.has_name(file_name):
+            if fetch_ps3_dkey and is_ps3_iso_browse_path(browse_path):
+                self._enqueue_matching_ps3_dkey(file_name, save_path)
             return
 
         self.after(0, lambda: self._status_var.set(f"Looking up: {file_name}…"))
@@ -2465,6 +2483,34 @@ class MinervaApp(tk.Tk):
             so_id=so_id,
             save_path=save_path,
         ))
+        if fetch_ps3_dkey and is_ps3_iso_browse_path(browse_path):
+            self._enqueue_matching_ps3_dkey(file_name, save_path)
+
+    def _enqueue_matching_ps3_dkey(self, iso_file_name: str, save_path: str):
+        try:
+            self.after(0, lambda: self._status_var.set(f"Looking up dkey for: {iso_file_name}…"))
+            entry = find_dkey_entry(iso_file_name)
+            if entry is None:
+                log_activity(f"ps3_dkeys.miss file='{iso_file_name}'")
+                self.after(0, lambda: self._status_var.set(f"No dkey found for {iso_file_name}"))
+                return
+            rom_id = extract_rom_id(entry.get("href") or "")
+            if not rom_id:
+                return
+            dkey_name = entry.get("name") or iso_file_name
+            log_activity(f"ps3_dkeys.match iso='{iso_file_name}' dkey='{dkey_name}' id={rom_id}")
+            self._lookup_and_enqueue(
+                str(uuid.uuid4()),
+                rom_id,
+                dkey_name,
+                save_path,
+                PS3_DISC_KEYS_TXT_PATH,
+                skip_name_dedupe=True,
+                fetch_ps3_dkey=False,
+            )
+        except Exception as e:
+            log_error(f"MinervaApp._enqueue_matching_ps3_dkey failed for {iso_file_name}", e)
+            log_activity(f"ps3_dkeys.error file='{iso_file_name}' err={repr(e)}")
 
     def _find_downloaded_file(self, save_path: pathlib.Path, file_name: str) -> pathlib.Path | None:
         direct = save_path / file_name
