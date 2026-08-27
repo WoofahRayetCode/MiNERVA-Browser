@@ -39,6 +39,10 @@ jobs:
         run: python -m py_compile minerva_browser.py && echo "Syntax OK"
         shell: pwsh
 
+      - name: Run unit tests
+        run: python -m unittest discover -s tests -v
+        shell: pwsh
+
       - name: Build exe
         run: pyinstaller minerva_browser.spec
         shell: pwsh
