@@ -33,6 +33,7 @@ activity_log*.txt
 startup_cleanup_debug.txt
 _chdman_install_tmp/
 _minerva_update.ps1
+MiNERVA-Browser-update*
 
 # Runtime tools (auto-installed at runtime)
 tools/
@@ -50,3 +51,4 @@ desktop.ini
 .idea/
 *.suo
 *.user
+.agents/
