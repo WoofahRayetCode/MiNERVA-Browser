@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import threading
 import time
 import urllib.parse
 import zipfile
@@ -114,12 +115,21 @@ def find_chdman_executable() -> str | None:
 
 XDVDFS_GITHUB_REPO = "antangelo/xdvdfs"
 XDVDFS_MAGIC = b"MICROSOFT*XBOX*MEDIA"
-# Sector 32 of the game partition, plus known Redump video-partition prefixes.
+# XDVDFS magic lives at sector 32 (0x10000) of the game partition.
+# Redump images keep the video partition in front, so magic is at
+# XGDn prefix + 0x10000. Some trimmed dumps put magic at the prefix itself.
+_XISO_SECTOR32 = 0x10000
+_XGD3_PREFIX = 0x2080000
+_XGD2_PREFIX = 0xFD90000
+_XGD1_PREFIX = 0x18300000
 _XBOX_VOLUME_OFFSETS = (
-    (0x10000, "xbox"),       # trimmed XISO (OG or 360)
-    (0x2080000, "xbox360"),  # XGD3
-    (0xFD90000, "xbox360"),  # XGD2
-    (0x18300000, "xbox"),    # XGD1 (original Xbox Redump)
+    (_XISO_SECTOR32, "xbox"),  # trimmed XISO (OG or 360)
+    (_XGD3_PREFIX + _XISO_SECTOR32, "xbox360"),
+    (_XGD2_PREFIX + _XISO_SECTOR32, "xbox360"),
+    (_XGD1_PREFIX + _XISO_SECTOR32, "xbox"),
+    (_XGD3_PREFIX, "xbox360"),
+    (_XGD2_PREFIX, "xbox360"),
+    (_XGD1_PREFIX, "xbox"),
     (0x0, "xbox"),
 )
 _XBOX_ISO_SUFFIXES = {".iso", ".xiso"}
@@ -837,6 +847,63 @@ def _hoist_unpacked_xbox_tree(out_dir: pathlib.Path) -> None:
         pass
 
 
+def xbox_dump_percent(written: int, iso_size: int) -> int:
+    """Map dumped bytes onto 0–99. 100 is reserved for process completion."""
+    if iso_size <= 0 or written <= 0:
+        return 0
+    return max(0, min(99, int(written * 99 / iso_size)))
+
+
+def _tree_bytes_excluding(root: pathlib.Path, exclude: set[pathlib.Path] | None = None) -> int:
+    """Sum file sizes under root, skipping excluded paths (e.g. the source ISO)."""
+    if not root.exists():
+        return 0
+    skip = set()
+    for path in exclude or ():
+        try:
+            skip.add(path.resolve())
+        except OSError:
+            skip.add(path)
+    total = 0
+    try:
+        walker = os.walk(root)
+    except OSError:
+        return 0
+    for dirpath, dirnames, filenames in walker:
+        for name in filenames:
+            path = pathlib.Path(dirpath) / name
+            try:
+                resolved = path.resolve()
+            except OSError:
+                resolved = path
+            if resolved in skip or path in skip:
+                continue
+            try:
+                total += path.stat().st_size
+            except OSError:
+                continue
+    return total
+
+
+_XBOX_PCT_RE = re.compile(r"(\d{1,3})\s*%")
+
+
+def _parse_xbox_unpack_progress_line(line: str) -> int | None:
+    text = (line or "").strip()
+    if not text:
+        return None
+    match = _XBOX_PCT_RE.search(text)
+    if not match:
+        return None
+    try:
+        pct = int(match.group(1))
+    except ValueError:
+        return None
+    if 0 <= pct <= 100:
+        return min(99, pct)
+    return None
+
+
 def unpack_xbox_iso(
     iso: pathlib.Path,
     out_dir: pathlib.Path,
@@ -850,20 +917,72 @@ def unpack_xbox_iso(
     out_dir.mkdir(parents=True, exist_ok=True)
     cmd = xbox_unpack_command(tool, iso, out_dir)
     log_activity(f"xbox.unpack.run cmd={' '.join(cmd)}")
-    _report_progress(progress_cb, 0, f"Unpacking {display_filename(iso.name)}…")
-    proc = subprocess.run(
+    label = display_filename(iso.name)
+    try:
+        iso_size = iso.stat().st_size
+    except OSError:
+        iso_size = 0
+    baseline = _tree_bytes_excluding(out_dir, exclude={iso})
+    _report_progress(progress_cb, 0, f"Dumping Xbox ISO {label}…")
+
+    proc = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
         encoding="utf-8",
         errors="replace",
+        bufsize=1,
         **_hidden_subprocess_kwargs(),
     )
-    tail = " | ".join((proc.stdout or "").splitlines()[-3:])
-    if proc.returncode != 0:
+    stop = threading.Event()
+    last_pct = {"n": -1}
+    stdout_lines: list[str] = []
+
+    def _emit(pct: int, status: str):
+        if pct == last_pct["n"]:
+            return
+        last_pct["n"] = pct
+        _report_progress(progress_cb, pct, status)
+
+    def _poll_written():
+        while not stop.wait(0.4):
+            written = max(0, _tree_bytes_excluding(out_dir, exclude={iso}) - baseline)
+            pct = xbox_dump_percent(written, iso_size)
+            if pct > 0:
+                _emit(pct, f"Dumping {label} — {format_bytes(written)} ({pct}%)")
+
+    def _drain_stdout():
+        if proc.stdout is None:
+            return
+        for line in proc.stdout:
+            stdout_lines.append(line.rstrip())
+            if len(stdout_lines) > 40:
+                del stdout_lines[: len(stdout_lines) - 40]
+            parsed = _parse_xbox_unpack_progress_line(line)
+            if parsed is not None:
+                _emit(parsed, f"Dumping {label} — {parsed}%")
+
+    poller = threading.Thread(target=_poll_written, name="xbox-unpack-progress", daemon=True)
+    drainer = threading.Thread(target=_drain_stdout, name="xbox-unpack-stdout", daemon=True)
+    poller.start()
+    drainer.start()
+    try:
+        rc = proc.wait()
+    finally:
+        stop.set()
+        drainer.join(timeout=2)
+        poller.join(timeout=2)
+        if proc.stdout is not None:
+            try:
+                proc.stdout.close()
+            except OSError:
+                pass
+
+    tail = " | ".join(stdout_lines[-3:])
+    if rc != 0:
         raise RuntimeError(
-            f"Xbox unpack failed for {iso.name} (rc={proc.returncode})"
+            f"Xbox unpack failed for {iso.name} (rc={rc})"
             + (f" ({tail})" if tail else "")
         )
     _hoist_unpacked_xbox_tree(out_dir)
@@ -880,7 +999,7 @@ def unpack_xbox_iso(
         except OSError as e:
             log_activity(f"xbox.cleanup.iso failed='{iso}' err={e}")
     log_activity(f"xbox.unpack.ok iso='{iso}' dir='{out_dir}' tool={tool.get('kind')}")
-    _report_progress(progress_cb, 100, f"Unpacked {display_filename(iso.name)} ✓")
+    _report_progress(progress_cb, 100, f"Unpacked {label} ✓")
     return True
 
 
@@ -906,11 +1025,20 @@ def unpack_xbox_isos_in_dir(
                 progress_cb(idx - 1, total, iso.name)
             except Exception:
                 pass
+
+        def _file_progress(pct: int, status: str, *, _idx=idx, _iso=iso):
+            if progress_cb is None:
+                return
+            try:
+                progress_cb((_idx - 1) + (max(0, min(100, pct)) / 100.0), total, _iso.name)
+            except Exception:
+                pass
+
         unpack_xbox_iso(
             iso,
             iso.parent,
             tool,
-            progress_cb=None,
+            progress_cb=_file_progress,
             delete_iso=delete_iso,
         )
         unpacked += 1
@@ -1485,6 +1613,57 @@ def is_archive_path(path: pathlib.Path) -> bool:
 
 
 _SKIP_ARCHIVE_SCAN_DIRS = {"extracted", "torrentfiles", "tools", "build", "dist", "dkeys"}
+
+
+_LIBRARY_EXTRA_EXTS = {
+    ".iso", ".chd", ".rvz", ".wia", ".ciso", ".nsp", ".xci", ".cia",
+    ".gdi", ".cue", ".pkg", ".xiso",
+}
+
+
+def collect_library_match_keys(root: pathlib.Path) -> set[str]:
+    """Lowercased names and stems for archives and extracted ROMs already on disk."""
+    keys: set[str] = set()
+    if not root.exists() or not root.is_dir():
+        return keys
+    for path in collect_downloaded_archives(root):
+        keys.add(path.name.lower())
+        keys |= _match_keys_for_name(path.name)
+    extracted = root / "extracted"
+    if extracted.is_dir():
+        for path in extracted.rglob("*"):
+            if not path.is_file():
+                continue
+            if path.suffix.lower() not in _LIBRARY_EXTRA_EXTS and not is_archive_path(path):
+                continue
+            keys.add(path.name.lower())
+            keys |= _match_keys_for_name(path.name)
+    keys.discard("")
+    return keys
+
+
+def library_status_for_name(
+    name: str,
+    queued_names: set[str],
+    library_keys: set[str],
+) -> str:
+    """Return 'downloaded', 'queued', or '' for a browse/search row name."""
+    if not name:
+        return ""
+    keys = {name.lower()} | _match_keys_for_name(name)
+    keys.discard("")
+    if keys & library_keys:
+        return "downloaded"
+    queued_keys: set[str] = set()
+    for qn in queued_names:
+        if not qn:
+            continue
+        queued_keys.add(qn.lower())
+        queued_keys |= _match_keys_for_name(qn)
+    queued_keys.discard("")
+    if keys & queued_keys:
+        return "queued"
+    return ""
 
 
 def collect_downloaded_archives(
