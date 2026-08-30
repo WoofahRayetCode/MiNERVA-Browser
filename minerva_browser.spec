@@ -31,6 +31,7 @@ _hidden = [
     'minerva.core.sqlite_http',
     'minerva.core.torrent_engine',
     'minerva.core.extractors',
+    'minerva.core.companions',
     'minerva.ui',
     'minerva.ui.app',
     'pystray',
@@ -39,6 +40,19 @@ _hidden = [
     'PIL.PngImagePlugin',
     'PIL.IcoImagePlugin',
 ]
+for _mod in (
+    'pystray._win32',
+    'pystray._util',
+    'pystray._appindicator',
+    'pystray._gtk',
+    'pystray._xorg',
+    'pystray._darwin',
+):
+    try:
+        __import__(_mod)
+    except ImportError:
+        continue
+    _hidden.append(_mod)
 try:
     import libtorrent  # noqa: F401
     _hidden.append('libtorrent')
