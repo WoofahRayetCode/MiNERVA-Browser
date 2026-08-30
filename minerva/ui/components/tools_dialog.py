@@ -38,12 +38,28 @@ class ToolsMenu:
             command=callbacks.get("compress_chd"),
         )
         menu.add_command(
+            label="🎮 Unpack Xbox / Xbox 360 ISOs",
+            command=callbacks.get("unpack_xbox"),
+        )
+        menu.add_command(
+            label="↩️ Fix incorrect CHD conversions",
+            command=callbacks.get("repair_chd"),
+        )
+        menu.add_command(
             label="🧹 Clean BIN / CUE Source Files",
             command=callbacks.get("clean_bin_cue"),
         )
         menu.add_command(
             label="🏷 Standardize ROM / CHD Names",
             command=callbacks.get("clean_names"),
+        )
+        menu.add_command(
+            label="🔍 Verify Downloaded Archives",
+            command=callbacks.get("verify_archives"),
+        )
+        menu.add_command(
+            label="🔑 Fix / Redownload PS3 Dkeys",
+            command=callbacks.get("ensure_dkeys"),
         )
         menu.add_command(
             label="🔍 Verify Extracted ROM Integrity",
@@ -77,7 +93,7 @@ class ToolsDialog(tk.Toplevel):
         super().__init__(parent)
         self.title("MiNERVA ROM & Disc Utilities")
         self.configure(bg=BG)
-        self.geometry("540x440")
+        self.geometry("540x580")
         self.resizable(False, False)
         self.transient(parent)
         self.grab_set()
@@ -136,8 +152,18 @@ class ToolsDialog(tk.Toplevel):
         tools_list = [
             (
                 "💿 Compress PS1/PS2 to CHD",
-                "Convert disc cue/bin or iso files to compressed CHD",
+                "Convert PS1/PS2/Dreamcast-style discs to CHD; skip PSP/PS3/GC and other non-CHD formats",
                 self.callbacks.get("compress_chd"),
+            ),
+            (
+                "🎮 Unpack Xbox / Xbox 360 ISOs",
+                "Dump XISO/XGD contents (skip $SystemUpdate) for a modded Xbox 360",
+                self.callbacks.get("unpack_xbox"),
+            ),
+            (
+                "↩️ Fix incorrect CHD conversions",
+                "Restore PSP/PS3/GC discs that were turned into CHD, or redownload if needed",
+                self.callbacks.get("repair_chd"),
             ),
             (
                 "🧹 Clean BIN/CUE Sources",
@@ -145,8 +171,18 @@ class ToolsDialog(tk.Toplevel):
                 self.callbacks.get("clean_bin_cue"),
             ),
             (
+                "🔍 Verify Downloaded Archives",
+                "CRC-test zip/7z/rar files already in the download folder",
+                self.callbacks.get("verify_archives"),
+            ),
+            (
+                "🔑 Fix / Redownload PS3 Dkeys",
+                "Scan PS3 ROMs and queue or redownload missing or corrupt disc keys",
+                self.callbacks.get("ensure_dkeys"),
+            ),
+            (
                 "🔍 Verify Extracted Integrity",
-                "Scan downloaded files and verify extracted ROM folder consistency",
+                "Check extracted ROM folders for usable content",
                 self.callbacks.get("verify_extracted"),
             ),
             (
