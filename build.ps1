@@ -4,17 +4,20 @@
 
 .DESCRIPTION
     Checks for Python 3, installs it via Scoop if missing, creates a virtual
-    environment, installs PyInstaller, and produces dist\MiNERVA-Browser.exe
+    environment, installs PyInstaller, and produces dist\MiNERVA-Browser.exe.
+    Pass -DeployDir to copy the exe somewhere else after the build.
 
 .EXAMPLE
     .\build.ps1
     .\build.ps1 -SkipPythonCheck   # skip the Python install check
     .\build.ps1 -Clean             # delete build/ and dist/ first
+    .\build.ps1 -DeployDir "$env:USERPROFILE\Desktop\MiNERVA Browser"
 #>
 param(
     [switch]$Clean,
     [switch]$SkipPythonCheck,
-    [switch]$SkipTests
+    [switch]$SkipTests,
+    [string]$DeployDir = ""
 )
 
 Set-StrictMode -Version Latest
@@ -130,6 +133,10 @@ Write-Step "Installing PyInstaller"
 & $VenvPip install --quiet --upgrade pip
 & $VenvPip install --quiet pyinstaller
 Write-Ok "PyInstaller ready"
+
+Write-Step "Installing tray icon dependencies (pillow, pystray)"
+& $VenvPip install --quiet pillow pystray
+Write-Ok "pillow and pystray ready"
 
 # --- install libtorrent (optional) -------------------------------------------
 # Pip writes errors to stderr. With $ErrorActionPreference = Stop, that becomes
@@ -250,8 +257,41 @@ Write-Step "Verifying output"
 if (Test-Path $OutExe) {
     $size = [math]::Round((Get-Item $OutExe).Length / 1MB, 1)
     Write-Ok "Built successfully: $OutExe  ($size MB)"
-    Write-Host ""
-    Write-Host "  Portable exe is ready - copy MiNERVA-Browser.exe anywhere and run it." -ForegroundColor White
 } else {
     throw "Build finished but $OutExe was not found. Check PyInstaller output above."
+}
+
+# --- copy to desktop deploy folder ------------------------------------------
+
+if ($DeployDir) {
+    Write-Step "Copying exe to $DeployDir"
+    if (-not (Test-Path -LiteralPath $DeployDir)) {
+        New-Item -ItemType Directory -Path $DeployDir -Force | Out-Null
+        Write-Ok "Created $DeployDir"
+    }
+    $destExe = Join-Path $DeployDir "MiNERVA-Browser.exe"
+    $copied = $false
+    for ($attempt = 1; $attempt -le 3 -and -not $copied; $attempt++) {
+        try {
+            Copy-Item -LiteralPath $OutExe -Destination $destExe -Force
+            $copied = $true
+        } catch {
+            $running = Get-Process -Name "MiNERVA-Browser" -ErrorAction SilentlyContinue
+            if ($running) {
+                Write-Warn "MiNERVA-Browser.exe is running; stopping it to replace the file"
+                $running | Stop-Process -Force
+                Start-Sleep -Seconds 1
+            } elseif ($attempt -lt 3) {
+                Start-Sleep -Seconds 1
+            } else {
+                throw "Could not copy to $destExe : $_"
+            }
+        }
+    }
+    Write-Ok "Copied to $destExe"
+    Write-Host ""
+    Write-Host "  Portable exe is ready at $destExe" -ForegroundColor White
+} else {
+    Write-Host ""
+    Write-Host "  Portable exe is ready - copy MiNERVA-Browser.exe anywhere and run it." -ForegroundColor White
 }
