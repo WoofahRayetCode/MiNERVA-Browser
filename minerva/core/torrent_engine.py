@@ -194,14 +194,19 @@ class TorrentEngine:
                     }
                 else:
                     local_path = pathlib.Path(torrent_source)
+                    looks_like_url = torrent_source.startswith(("http://", "https://"))
                     if local_path.exists():
                         torrent_data = local_path.read_bytes()
-                    else:
+                    elif looks_like_url:
                         req = urllib.request.Request(
                             torrent_source, headers={"User-Agent": "MiNERVA-Browser/1.0"}
                         )
                         with urllib.request.urlopen(req, timeout=30) as resp:
                             torrent_data = resp.read()
+                    else:
+                        raise FileNotFoundError(
+                            f"Torrent file not found: {torrent_source}"
+                        )
                     try:
                         ti = lt.torrent_info(
                             torrent_data,
@@ -460,6 +465,7 @@ class DownloadQueue:
         self._try_advance()
 
     def _try_advance(self):
+        to_start: list[dict] = []
         with self._lock:
             while len(self._active) < self.max_active and self._pending:
                 next_item = next(
@@ -471,14 +477,17 @@ class DownloadQueue:
                 did, item = next_item
                 del self._pending[did]
                 self._active[did] = item
-                if self.engine is not None:
-                    self.engine.add_download(
-                        item["source"],
-                        item["so_id"],
-                        item["name"],
-                        item["save_path"],
-                        download_id=did,
-                    )
+                to_start.append(item)
+        if self.engine is None:
+            return
+        for item in to_start:
+            self.engine.add_download(
+                item["source"],
+                item["so_id"],
+                item["name"],
+                item["save_path"],
+                download_id=item["id"],
+            )
 
     def on_finished(self, download_id: str, error: str = ""):
         with self._lock:
@@ -487,11 +496,46 @@ class DownloadQueue:
                 self._done[download_id] = {
                     "id": download_id,
                     "name": item["name"],
+                    "source": item.get("source", ""),
+                    "so_id": item.get("so_id", 0),
                     "save_path": item["save_path"],
                     "status": "error" if error else "done",
                     "error": error,
                 }
         self._try_advance()
+
+    def mark_error(self, download_id: str, error: str):
+        with self._lock:
+            item = self._done.get(download_id)
+            if item:
+                item["status"] = "error"
+                item["error"] = error
+
+    def find_by_name(self, name: str) -> dict | None:
+        with self._lock:
+            for d in (*self._pending.values(), *self._active.values(), *self._done.values()):
+                if d.get("name") == name:
+                    return dict(d)
+        return None
+
+    def pop_done(self, download_id: str) -> dict | None:
+        with self._lock:
+            return self._done.pop(download_id, None)
+
+    def requeue_done(self, download_id: str, new_id: str, start: bool = True) -> dict | None:
+        item = self.pop_done(download_id)
+        if item is None:
+            return None
+        self.enqueue(
+            new_id,
+            item["name"],
+            item.get("source", ""),
+            int(item.get("so_id") or 0),
+            item.get("save_path", ""),
+        )
+        if start:
+            self.start_selected([new_id])
+        return item
 
     def cancel(self, download_id: str):
         with self._lock:
@@ -536,6 +580,17 @@ class DownloadQueue:
             if idx < len(keys) - 1:
                 keys[idx + 1], keys[idx] = keys[idx], keys[idx + 1]
                 self._pending = {k: self._pending[k] for k in keys}
+
+    def in_progress_names(self) -> set[str]:
+        with self._lock:
+            names = {item.get("name", "") for item in self._pending.values()}
+            names |= {item.get("name", "") for item in self._active.values()}
+            names.discard("")
+            return names
+
+    def in_progress_items(self) -> list[dict]:
+        with self._lock:
+            return [dict(item) for item in (*self._pending.values(), *self._active.values())]
 
     def snapshot(self) -> dict:
         with self._lock:
