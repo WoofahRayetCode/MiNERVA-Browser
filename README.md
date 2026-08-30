@@ -11,6 +11,7 @@ A portable desktop GUI for browsing and downloading from [minerva-archive.org](h
 ### Browsing & Modern UI
 - 📁 **Two-panel layout** — category tree on the left, file listing on the right
 - 🔍 **Integrated search** — instant client-side filtering with live results and `Escape` shortcut
+- ⬇ / ✓ **Library status icons** — search rows show if a title is already in the download queue or already on disk (archive or extracted ISO/CHD)
 - 💊 **Interactive region pills** — click-to-filter region chips (USA, Europe, Japan, World, etc.) with active glow
 - 🏷️ **Dynamic tag filter dropdown** — compact popover menu to hide Demos, Betas, Prototypes, Unlicensed, or Hacks without consuming screen space
 - 🧭 **Clickable breadcrumb navigation**
@@ -28,15 +29,17 @@ A portable desktop GUI for browsing and downloading from [minerva-archive.org](h
 - 📦 **DLC / update matching** — after queueing a game, offers matching DLC and updates from the same folder or related digital/PSN/CDN collections (select, download all, or skip)
 - 📊 **Real-time metrics** — speed, ETA, progress bars, and state tracking without text clipping
 
-### Extraction & CHD Compression
+### Extraction, CHD, and Xbox dumps
 - 📦 **Auto-extract** — extract archives automatically once download finishes
 - 🗜️ **Extractor detection** — auto-detects external extractors (**7-Zip**, **PeaZip**, **WinRAR**) with fallback to Python `zipfile`
 - 🎮 **PS1/PS2 BIN/CUE/ISO → CHD** — convert supported disc images to CHD (`chdman`); skips PSP/PS3/GameCube/Wii/Xbox
-- 🎮 **Xbox / Xbox 360 ISO unpack** — dump XISO/XGD contents with **xdvdfs** (falls back to **extract-xiso**) into a folder with `default.xex` / `default.xbe` for a modded 360; skips `$SystemUpdate`
+- 🎮 **Xbox / Xbox 360 ISO unpack** — dump Redump and trimmed XISO/XGD images with **xdvdfs** (falls back to **extract-xiso**) into a folder with `default.xex` / `default.xbe` for a modded 360; skips `$SystemUpdate`
+- 📡 **Redump XGD detection** — recognizes original Xbox (XGD1), Xbox 360 XGD2/XGD3, and trimmed XISO by XDVDFS magic at the game-partition start plus sector 32 (including `0xFDA0000` for typical 360 Redump ISOs)
+- 📊 **ISO dump progress** — Downloads panel and per-item extract bars track dumped bytes while xdvdfs runs (xdvdfs itself does not print a percent)
 - ↩️ **Fix incorrect CHD conversions** — restore PSP/PS3/GC discs that were turned into CHD, or redownload if needed
 - 🔍 **Verify downloaded archives** — CRC-test zip/7z/rar files in the save folder and offer redownload on failure
 - 🔑 **PS3 disc keys** — auto-queue matching Redump `.dkey` zips into `downloads/dkeys/`, plus a tools action to repair missing keys
-- 🛠️ **Unified ROM Tools menu** — grouped utilities for CHD conversion, BIN/CUE cleaning, verification, and name standardization
+- 🛠️ **Unified ROM Tools menu** — grouped utilities for CHD conversion, Xbox ISO unpack, BIN/CUE cleaning, verification, and name standardization
 - 🧹 **Automatic name cleaning** — cleans region tags and disc descriptors while preserving disc numbering
 - 🗑️ **Optional source deletion** — automatically deletes source archives and BIN/CUE/ISO files post-conversion
 - 🚀 **Startup cleanup** — scans the extracted folder on launch to clean names and remove leftover BIN/CUE files next to valid CHDs only
@@ -48,6 +51,14 @@ A portable desktop GUI for browsing and downloading from [minerva-archive.org](h
 - **Windows 10/11** or **Linux** (x86_64)
 - **Standalone binary:** No installation required — download from [Releases](../../releases) and run
 - **From source:** Python 3.10+ and `libtorrent` (optional, for inline downloads)
+
+Runtime tools are downloaded next to the app when needed (not stored in git):
+
+| Tool | Used for | Location |
+| --- | --- | --- |
+| **chdman** | PS1/PS2 (and other CHD-eligible) disc compression | `tools/chdman/` |
+| **xdvdfs** | Xbox / Xbox 360 ISO dump | `tools/xdvdfs/` |
+| **extract-xiso** | Fallback Xbox unpacker if xdvdfs is missing | PATH or `tools/` |
 
 ---
 
@@ -62,7 +73,11 @@ Options:
 ```powershell
 .\build.ps1 -Clean            # Wipe build/, dist/, and .venv/ first
 .\build.ps1 -SkipPythonCheck  # Skip Scoop Python auto-install check
+.\build.ps1 -SkipTests        # Skip the unit test suite
+.\build.ps1 -DeployDir "$env:USERPROFILE\Desktop\MiNERVA Browser"  # Copy the exe after build
 ```
+
+`-DeployDir` copies only `MiNERVA-Browser.exe`. Keep `downloads/`, `tools/`, and `torrentfiles/` in that folder if you already use a portable desktop copy.
 
 ### Linux (Bash)
 ```bash
@@ -92,6 +107,8 @@ python minerva_browser.py
 
 > **Note:** `libtorrent` is required for downloading. Without it, the browser still works for navigating and searching, but downloads will be disabled. `pillow` and `pystray` enable the system tray icon.
 
+Local settings (`minerva_settings.json`), logs, torrents, downloads, extracted dumps, and auto-installed tools stay next to the working copy (or the portable exe) and are gitignored.
+
 ---
 
 ## Project Structure
@@ -106,21 +123,25 @@ python minerva_browser.py
 │   ├── core/
 │   │   ├── sqlite_http.py     # HTTP range SQLite reader & web parser
 │   │   ├── torrent_engine.py  # libtorrent session engine & DownloadQueue
-│   │   ├── extractors.py      # Archive extraction & CHD compression tools
+│   │   ├── extractors.py      # Archives, CHD, Xbox ISO classify/unpack
+│   │   ├── companions.py      # DLC / update matching
 │   │   └── ps3_dkeys.py       # Redump PS3 disc-key catalog matching
 │   └── ui/
 │       ├── theme.py           # Catppuccin palette & modern TTK style configurations
 │       ├── app.py             # Main Tkinter desktop application window
 │       └── components/
 │           ├── filter_bar.py  # Search entry, Region pills, and Tag popover
+│           ├── companion_dialog.py
 │           └── tools_dialog.py# ROM tools menu & utilities modal dialog
 └── tests/
-    ├── test_sqlite_http.py    # Varint & SQLite B-Tree record unit tests
-    ├── test_parsers.py        # HTML & ROM ID parsing tests
-    ├── test_extractors.py     # ROM detection & name cleaning tests
-    ├── test_download_queue.py # Download queue state & concurrency tests
-    ├── test_ui_components.py  # UI theme, filter pills & tag popover tests
-    └── test_assets.py         # Asset and icon integrity tests
+    ├── test_sqlite_http.py
+    ├── test_parsers.py
+    ├── test_extractors.py     # ROM detection, CHD, Xbox ISO classify/unpack
+    ├── test_download_queue.py
+    ├── test_companions.py
+    ├── test_ps3_dkeys.py
+    ├── test_ui_components.py
+    └── test_assets.py
 ```
 
 ---
@@ -134,5 +155,7 @@ MiNERVA distributes all files via BitTorrent:
 3. Instructs libtorrent to download only the selected file within that torrent (`so_id` file priority)
 4. Optionally extracts the file using detected extractors (7-Zip / PeaZip / WinRAR / zipfile)
 5. Optionally converts supported disc images to CHD and cleans up input files
-6. Optionally unpacks Xbox / Xbox 360 ISOs with xdvdfs (or extract-xiso) into a folder with `default.xex` for a modded console
+6. Optionally unpacks Xbox / Xbox 360 ISOs with xdvdfs (or extract-xiso) into a folder with `default.xex` for a modded console, with a live dump progress bar
 7. For Redump PS3 ISOs, queues the matching disc-key zip into `dkeys/` when one exists
+
+Xbox dumps are identified by XDVDFS magic (`MICROSOFT*XBOX*MEDIA`) at known XGD/XISO offsets. Folder names such as `Microsoft - Xbox 360` are used as a hint when magic is missing. Use **ROM Tools → Unpack Xbox ISOs** to dump ISOs that are already in `downloads/extracted/`.
