@@ -16,6 +16,8 @@ from minerva.core.extractors import (
     migrate_app_root_roms,
     is_archive_path,
     collect_downloaded_archives,
+    collect_library_match_keys,
+    library_status_for_name,
     verify_archive,
     ArchiveVerificationError,
     chd_source_mode,
@@ -46,6 +48,8 @@ from minerva.core.extractors import (
     remove_xbox_system_update,
     unpack_xbox_iso,
     unpack_xbox_isos_in_dir,
+    xbox_dump_percent,
+    _parse_xbox_unpack_progress_line,
     XDVDFS_MAGIC,
 )
 
@@ -417,6 +421,44 @@ class TestExtractors(unittest.TestCase):
             self.assertNotIn("Game (USA).zip", excluded_names)
             self.assertIn("other.7z", excluded_names)
 
+    def test_library_status_queued_and_downloaded(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base = pathlib.Path(tmpdir)
+            archive = base / "Chrono Trigger (USA).zip"
+            archive.write_bytes(b"PK\x03\x04")
+            extracted = base / "extracted" / "n3 - ninety-nine nights"
+            extracted.mkdir(parents=True)
+            (extracted / "N3 - Ninety-Nine Nights.iso").write_bytes(b"ISO")
+            keys = collect_library_match_keys(base)
+            self.assertEqual(
+                library_status_for_name("Chrono Trigger (USA).zip", set(), keys),
+                "downloaded",
+            )
+            self.assertEqual(
+                library_status_for_name("N3 - Ninety-Nine Nights.zip", set(), keys),
+                "downloaded",
+            )
+            self.assertEqual(
+                library_status_for_name(
+                    "EarthBound (USA).zip",
+                    {"EarthBound (USA).zip"},
+                    keys,
+                ),
+                "queued",
+            )
+            self.assertEqual(
+                library_status_for_name("Missing Game.zip", set(), keys),
+                "",
+            )
+            self.assertEqual(
+                library_status_for_name(
+                    "Chrono Trigger (USA).zip",
+                    {"Chrono Trigger (USA).zip"},
+                    keys,
+                ),
+                "downloaded",
+            )
+
     def test_extract_passthrough(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             base = pathlib.Path(tmpdir)
@@ -498,7 +540,15 @@ class TestExtractors(unittest.TestCase):
             "xbox360",
         )
         self.assertEqual(
+            classify_xbox_iso_from_reads(0xFDA0000 + 32, reader({0xFDA0000: magic})),
+            "xbox360",
+        )
+        self.assertEqual(
             classify_xbox_iso_from_reads(0x18300000 + 32, reader({0x18300000: magic})),
+            "xbox",
+        )
+        self.assertEqual(
+            classify_xbox_iso_from_reads(0x18310000 + 32, reader({0x18310000: magic})),
             "xbox",
         )
         self.assertIsNone(classify_xbox_iso_from_reads(100, reader({})))
@@ -514,6 +564,20 @@ class TestExtractors(unittest.TestCase):
             self.assertEqual(classify_disc_image(iso), "xbox")
             self.assertTrue(should_unpack_xbox_iso(iso))
             self.assertFalse(should_convert_to_chd(iso))
+
+    def test_classify_xbox_iso_redump_xgd2_magic_at_partition_plus_sector32(self):
+        """Redump Xbox 360 XGD2 stores XDVDFS at 0xFD90000 + 0x10000."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            iso = pathlib.Path(tmpdir) / "N3 - Ninety-Nine Nights.iso"
+            offset = 0xFDA0000
+            with iso.open("wb") as handle:
+                handle.truncate(offset + len(XDVDFS_MAGIC))
+                handle.seek(offset)
+                handle.write(XDVDFS_MAGIC)
+            self.assertEqual(classify_xbox_iso(iso), "xbox360")
+            self.assertTrue(should_unpack_xbox_iso(iso))
+            folder = pathlib.Path(tmpdir)
+            self.assertEqual(collect_xbox_iso_sources(folder), [iso])
 
     def test_xbox_system_from_hints(self):
         self.assertEqual(
@@ -594,28 +658,49 @@ class TestExtractors(unittest.TestCase):
             self.assertFalse(nested.exists())
             self.assertTrue((out / "default.xex").exists())
 
+    def test_xbox_dump_percent_and_progress_line(self):
+        self.assertEqual(xbox_dump_percent(0, 1000), 0)
+        self.assertEqual(xbox_dump_percent(500, 1000), 49)
+        self.assertEqual(xbox_dump_percent(1000, 1000), 99)
+        self.assertEqual(xbox_dump_percent(5000, 1000), 99)
+        self.assertEqual(_parse_xbox_unpack_progress_line("Extracting 45%"), 45)
+        self.assertEqual(_parse_xbox_unpack_progress_line("100%"), 99)
+        self.assertIsNone(_parse_xbox_unpack_progress_line("ok"))
+
     def test_unpack_xbox_iso_runs_xdvdfs_and_cleans(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             iso = pathlib.Path(tmpdir) / "Halo.iso"
             iso.write_bytes(b"iso")
             out = pathlib.Path(tmpdir) / "out"
             out.mkdir()
+            seen = []
 
-            def fake_run(cmd, **kwargs):
+            class FakeProc:
+                def __init__(self):
+                    self.returncode = 0
+                    self.stdout = mock.Mock()
+                    self.stdout.__iter__ = lambda _self: iter(["ok\n"])
+                    self.stdout.close = lambda: None
+
+                def wait(self):
+                    nested = out / "Halo"
+                    nested.mkdir()
+                    (nested / "default.xex").write_bytes(b"xex")
+                    su = nested / "$SystemUpdate"
+                    su.mkdir()
+                    (su / "dash").write_bytes(b"upd")
+                    return 0
+
+            def fake_popen(cmd, **kwargs):
                 self.assertEqual(cmd[:2], ["xdvdfs", "unpack"])
-                nested = out / "Halo"
-                nested.mkdir()
-                (nested / "default.xex").write_bytes(b"xex")
-                su = nested / "$SystemUpdate"
-                su.mkdir()
-                (su / "dash").write_bytes(b"upd")
-                return mock.Mock(returncode=0, stdout="ok")
+                return FakeProc()
 
-            with mock.patch("minerva.core.extractors.subprocess.run", side_effect=fake_run):
+            with mock.patch("minerva.core.extractors.subprocess.Popen", side_effect=fake_popen):
                 ok = unpack_xbox_iso(
                     iso,
                     out,
                     {"kind": "xdvdfs", "exe": "xdvdfs"},
+                    progress_cb=lambda pct, status: seen.append((pct, status)),
                     delete_iso=True,
                 )
             self.assertTrue(ok)
@@ -623,6 +708,7 @@ class TestExtractors(unittest.TestCase):
             self.assertFalse((out / "$SystemUpdate").exists())
             self.assertFalse((out / "Halo" / "$SystemUpdate").exists())
             self.assertFalse(iso.exists())
+            self.assertTrue(any(pct == 100 for pct, _ in seen))
 
     def test_unpack_xbox_isos_in_dir_skips_when_empty(self):
         with tempfile.TemporaryDirectory() as tmpdir:
