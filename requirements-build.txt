@@ -1,2 +1,4 @@
 pyinstaller
 libtorrent
+pillow
+pystray
