@@ -54,10 +54,19 @@ from minerva.ui.theme import (
 )
 from minerva.ui.components.filter_bar import FilterBar
 from minerva.ui.components.tools_dialog import ToolsMenu, ToolsDialog
+from minerva.ui.components.companion_dialog import prompt_companions
 from minerva.core.sqlite_http import fetch_entries, fetch_rom_info, extract_rom_id
+from minerva.core.companions import find_companions, classify_release, KIND_BASE
 from minerva.core.ps3_dkeys import (
+    DKEY_ZIP_MAX_BYTES,
     PS3_DISC_KEYS_TXT_PATH,
+    collect_local_ps3_rom_names,
     find_dkey_entry,
+    find_dkey_entry_for_path,
+    find_local_dkey,
+    find_local_dkey_zip,
+    get_dkey_save_dir,
+    is_dkey_save_path,
     is_ps3_iso_browse_path,
 )
 from minerva.core.torrent_engine import (
@@ -67,18 +76,35 @@ from minerva.core.torrent_engine import (
 )
 from minerva.core.extractors import (
     IS_WINDOWS,
-    _windows_startupinfo,
+    _hidden_subprocess_kwargs,
     find_archive_extractors,
     format_extractor_status,
     find_chdman_executable,
+    find_xbox_unpack_tool,
+    pick_xdvdfs_release_asset,
+    collect_xbox_iso_sources,
+    unpack_xbox_iso,
+    unpack_xbox_isos_in_dir,
+    should_unpack_xbox_iso,
+    XDVDFS_GITHUB_REPO,
     normalize_chd_stem,
     clean_chd_names_in_base,
-    is_likely_rom_file,
     verify_extracted_output,
+    is_archive_path,
+    collect_downloaded_archives,
+    verify_archive,
+    ArchiveVerificationError,
     chd_source_mode,
     collect_chd_sources,
     compress_ps1_to_chd,
     extract_archive,
+    migrate_app_root_roms,
+    format_bytes,
+    display_filename,
+    collect_incorrect_chds,
+    repair_incorrect_chds,
+    names_refer_to_same_rom,
+    chd_companions_safe_to_delete,
 )
 
 
@@ -166,7 +192,19 @@ class MinervaApp(tk.Tk):
         saved_download_dir = self._settings.get("download_dir")
         if not isinstance(saved_download_dir, str) or not saved_download_dir.strip():
             saved_download_dir = get_default_download_dir()
-        self._download_dir = tk.StringVar(value=saved_download_dir)
+        else:
+            try:
+                saved_resolved = pathlib.Path(saved_download_dir).resolve()
+                if saved_resolved == get_runtime_base_dir().resolve():
+                    saved_download_dir = get_default_download_dir()
+            except Exception:
+                saved_download_dir = get_default_download_dir()
+        try:
+            pathlib.Path(saved_download_dir).mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            log_error("MinervaApp could not create download directory", e)
+            saved_download_dir = get_default_download_dir()
+        self._download_dir = tk.StringVar(value=str(pathlib.Path(saved_download_dir).resolve()))
         self._auto_extract_default_var = tk.BooleanVar(
             value=bool(self._settings.get("auto_extract_default", False))
         )
@@ -176,12 +214,27 @@ class MinervaApp(tk.Tk):
         self._compress_ps1_chd_var = tk.BooleanVar(
             value=bool(self._settings.get("compress_ps1_chd", True))
         )
+        self._unpack_xbox_iso_var = tk.BooleanVar(
+            value=bool(self._settings.get("unpack_xbox_iso", True))
+        )
         self._autostart_var = tk.BooleanVar(
             value=bool(self._settings.get("autostart_with_windows", False))
         )
         self._start_minimized_var = tk.BooleanVar(
             value=bool(self._settings.get("start_minimized", False))
         )
+        self._offer_companions_var = tk.BooleanVar(
+            value=bool(self._settings.get("offer_companions", True))
+        )
+        self._companion_dialog_open = False
+        self._companion_prompt_queue: queue.Queue = queue.Queue()
+        self._launch_in_tray = bool(self._start_minimized_var.get()) or "--minimized" in sys.argv
+        if self._launch_in_tray:
+            # Hide before the window maps so it never appears on the taskbar.
+            try:
+                self.withdraw()
+            except tk.TclError:
+                pass
         self._show_tag_specs = [
             ("demo", "Demo"),
             ("beta", "Beta"),
@@ -231,6 +284,7 @@ class MinervaApp(tk.Tk):
         }
         self._extractors = find_archive_extractors()
         self._chdman_path = find_chdman_executable()
+        self._xbox_unpack_tool = find_xbox_unpack_tool()
         self._extract_tool_var = tk.StringVar(value=format_extractor_status(self._extractors))
         self._extract_status_var = tk.StringVar(value="")
         self._chd_progress_var = tk.DoubleVar(value=0.0)
@@ -238,12 +292,19 @@ class MinervaApp(tk.Tk):
         self._extract_request_queue: queue.Queue[str | None] = queue.Queue()
         self._extract_pending_ids: set[str] = set()
         self._extract_pending_lock = threading.Lock()
+        self._verify_archives_in_progress = False
+        self._verify_extracted_in_progress = False
+        self._ensure_dkeys_in_progress = False
+        self._download_history: dict[str, dict] = self._load_download_history()
         self._queued_selected_ids: set[str] = set()
         self._left_loaded_nodes: set[str] = set()
         self._left_loading_nodes: set[str] = set()
         self._dl_speed_samples: dict[str, tuple[int, float]] = {}
         self._chd_download_in_progress = False
         self._chd_compress_in_progress = False
+        self._chd_repair_in_progress = False
+        self._xbox_tool_download_in_progress = False
+        self._xbox_unpack_in_progress = False
         self._dl_active_widgets: dict[str, dict] = {}
         self._dl_queued_widgets: dict[str, dict] = {}
         self._dl_done_widgets: dict[str, dict] = {}
@@ -255,13 +316,17 @@ class MinervaApp(tk.Tk):
         self._build_ui()
         self._setup_global_shortcuts()
         self._setup_system_tray()
+        self._migrate_root_roms_on_launch()
         self._download_dir.trace_add("write", self._on_download_dir_change)
         if self._compress_ps1_chd_var.get() and not self._chdman_path:
             self._ensure_chdman_available_async()
+        if self._unpack_xbox_iso_var.get() and not self._xbox_unpack_tool:
+            self._ensure_xbox_unpack_tool_async()
         self._restore_persisted_queue()
         self._extract_worker_thread = threading.Thread(target=self._extract_worker_loop, daemon=True)
         self._extract_worker_thread.start()
-        self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.protocol("WM_DELETE_WINDOW", self._on_close_request)
+        self.bind("<Unmap>", self._on_window_unmap)
         saved_last_path = self._settings.get("last_path")
         if not isinstance(saved_last_path, str) or not saved_last_path.strip():
             saved_last_path = BROWSE_ROOT
@@ -272,8 +337,8 @@ class MinervaApp(tk.Tk):
             on_done=lambda: self._restore_left_tree_selection(saved_last_path)
         )
         self._navigate(saved_last_path, preserve_search=True, restore_query=saved_last_query)
-        if self._start_minimized_var.get() or "--minimized" in sys.argv:
-            self.after(100, self.iconify)
+        if getattr(self, "_launch_in_tray", False):
+            self._minimize_to_tray()
         self.after(100, self._run_startup_cleanup)
         self.after(2500, self._check_for_updates_async)
 
@@ -295,6 +360,15 @@ class MinervaApp(tk.Tk):
                                               style="Toolbar.TButton", command=self._open_current_downloads_folder)
         self._open_dl_folder_btn.pack(side="left", padx=3)
         HoverTooltip(self._open_dl_folder_btn, "Open target download folder on disk (Ctrl+O)")
+
+        self._verify_archives_btn = ttk.Button(
+            toolbar,
+            text="🔍 Verify Archives",
+            style="Toolbar.TButton",
+            command=self._verify_downloaded_archives_button_click,
+        )
+        self._verify_archives_btn.pack(side="left", padx=3)
+        HoverTooltip(self._verify_archives_btn, "CRC-test already downloaded zip/7z/rar archives")
 
         self._update_btn = ttk.Button(toolbar, text="🔄 Check Updates",
                                       style="Toolbar.TButton", command=self._check_for_update_button_click)
@@ -431,8 +505,17 @@ class MinervaApp(tk.Tk):
 
         btn_open_hdr = ttk.Button(dir_row, text="Open Folder", style="Header.TButton",
                                   command=self._open_current_downloads_folder)
-        btn_open_hdr.pack(side="left", padx=(0, 0))
+        btn_open_hdr.pack(side="left", padx=(0, 4))
         HoverTooltip(btn_open_hdr, "Open download folder on disk (Ctrl+O)")
+
+        btn_verify_hdr = ttk.Button(
+            dir_row,
+            text="Verify Archives",
+            style="Header.TButton",
+            command=self._verify_downloaded_archives_button_click,
+        )
+        btn_verify_hdr.pack(side="left", padx=(0, 0))
+        HoverTooltip(btn_verify_hdr, "CRC-test archives already in the download folder")
 
         # Row 2: Concurrency & options toggles (responsive wrapping)
         opts_row = tk.Frame(self._downloads_frame, bg=PANEL)
@@ -456,10 +539,12 @@ class MinervaApp(tk.Tk):
 
         for text, var, cmd in [
             ("Compress to CHD", self._compress_ps1_chd_var, self._on_extract_defaults_change),
+            ("Unpack Xbox ISOs", self._unpack_xbox_iso_var, self._on_extract_defaults_change),
             ("Decompress archives", self._auto_extract_default_var, self._on_extract_defaults_change),
             ("Delete archive", self._delete_archive_default_var, self._on_extract_defaults_change),
             ("Autostart", self._autostart_var, self._on_startup_settings_change),
-            ("Start minimized", self._start_minimized_var, self._on_startup_settings_change),
+            ("Start minimized to tray", self._start_minimized_var, self._on_startup_settings_change),
+            ("Offer DLC / updates", self._offer_companions_var, self._on_extract_defaults_change),
         ]:
             cb = tk.Checkbutton(
                 self._dl_opts_container,
@@ -483,6 +568,8 @@ class MinervaApp(tk.Tk):
             ("▶ Start All Queued", self._start_all_queued, "Start downloading all queued items"),
             ("Start Selected", self._start_selected_queued, "Start downloading checked items in queue"),
             ("✕ Clear Finished", self._clear_completed, "Clear finished and errored items from panel"),
+            ("🔍 Verify Archives", self._verify_downloaded_archives_button_click, "CRC-test already downloaded archives"),
+            ("🔑 PS3 Dkeys", self._ensure_ps3_dkeys_button_click, "Find, verify, and redownload missing PS3 disc keys"),
             ("🛠 ROM Tools ▾", self._show_rom_tools_menu, "ROM compression, verification, and disc utilities"),
             ("Open Downloads", self._open_current_downloads_folder, "Open target download folder on disk (Ctrl+O)"),
             ("Open Extracted", self._open_current_extracted_folder, "Open folder containing extracted ROMs"),
@@ -490,8 +577,8 @@ class MinervaApp(tk.Tk):
             b = ttk.Button(self._dl_actions_frame, text=text, style="Header.TButton", command=cmd)
             HoverTooltip(b, tip)
             self._dl_action_buttons.append(b)
-
-        self._rom_tools_btn = self._dl_action_buttons[4]
+            if text.startswith("🛠"):
+                self._rom_tools_btn = b
 
         self._downloads_frame.bind("<Configure>", self._on_downloads_frame_configure)
 
@@ -598,7 +685,6 @@ class MinervaApp(tk.Tk):
             except Exception as e:
                 entries = []
                 log_error("MinervaApp._load_left_tree failed", e)
-                self.after(0, lambda err=e: self._show_error(str(err)))
             self.after(0, lambda: self._populate_left_tree(entries, on_done))
 
         threading.Thread(target=worker, daemon=True).start()
@@ -1018,9 +1104,132 @@ class MinervaApp(tk.Tk):
             return
         if self._download_queue is not None:
             self._download_queue.enqueue(download_id, name, source, so_id, save_path)
+            self._remember_download(name, source, so_id, save_path)
             self._save_settings()
         if not self._downloads_visible:
             self._toggle_downloads()
+
+    def _load_download_history(self) -> dict[str, dict]:
+        raw = self._settings.get("download_history", [])
+        history: dict[str, dict] = {}
+        if not isinstance(raw, list):
+            return history
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            name = item.get("name")
+            source = item.get("source")
+            save_path = item.get("save_path")
+            if not isinstance(name, str) or not name.strip():
+                continue
+            if not isinstance(source, str) or not source.strip():
+                continue
+            if not isinstance(save_path, str) or not save_path.strip():
+                continue
+            try:
+                so_id = int(item.get("so_id"))
+            except (TypeError, ValueError):
+                continue
+            history[name] = {
+                "name": name,
+                "source": source,
+                "so_id": so_id,
+                "save_path": save_path,
+            }
+        return history
+
+    def _remember_download(self, name: str, source: str, so_id: int, save_path: str):
+        self._download_history[name] = {
+            "name": name,
+            "source": source,
+            "so_id": int(so_id),
+            "save_path": str(pathlib.Path(save_path).resolve()),
+        }
+
+    def _lookup_download_meta(self, name: str) -> dict | None:
+        if self._download_queue is not None:
+            found = self._download_queue.find_by_name(name)
+            if found and found.get("source"):
+                return found
+        return self._download_history.get(name)
+
+    def _delete_bad_archive(self, save_path: str, file_name: str) -> bool:
+        path = pathlib.Path(save_path) / file_name
+        removed = False
+        for candidate in (path, *list(path.parent.glob(file_name + ".parts")), *list(path.parent.glob(file_name + ".*!ut"))):
+            if candidate.is_file():
+                try:
+                    candidate.unlink()
+                    removed = True
+                    log_activity(f"redownload.delete file='{candidate}'")
+                except OSError as e:
+                    log_activity(f"redownload.delete_failed file='{candidate}' err={e}")
+        found = self._find_downloaded_file(pathlib.Path(save_path), file_name)
+        if found is not None and found.is_file() and found != path:
+            try:
+                found.unlink()
+                removed = True
+                log_activity(f"redownload.delete nested='{found}'")
+            except OSError as e:
+                log_activity(f"redownload.delete_nested_failed file='{found}' err={e}")
+        return removed
+
+    def _redownload_item(self, *, download_id: str | None = None, name: str | None = None, confirm: bool = True) -> bool:
+        meta = None
+        if download_id and self._download_queue is not None:
+            snap = self._download_queue.snapshot()
+            meta = next((item for item in snap["done"] if item.get("id") == download_id), None)
+        if meta is None and name:
+            meta = self._lookup_download_meta(name)
+        if meta is None:
+            messagebox.showwarning(
+                "Redownload",
+                f"No torrent info is saved for {name or 'this file'}. Queue it again from the browser.",
+            )
+            return False
+        file_name = meta.get("name") or name or ""
+        source = meta.get("source") or ""
+        save_path = meta.get("save_path") or self.get_download_dir()
+        try:
+            so_id = int(meta.get("so_id") or 0)
+        except (TypeError, ValueError):
+            so_id = 0
+        if not file_name or not source:
+            messagebox.showwarning("Redownload", f"Missing torrent source for {file_name}.")
+            return False
+        if confirm:
+            if not messagebox.askyesno(
+                "Redownload",
+                f"{file_name} looks corrupt or incomplete.\n\nDelete it and download again?",
+            ):
+                return False
+        engine = self.get_torrent_engine()
+        if engine is None or self._download_queue is None:
+            return False
+        if download_id:
+            self._download_queue.pop_done(download_id)
+        else:
+            existing = self._download_queue.find_by_name(file_name)
+            if existing and existing.get("id"):
+                if existing["id"] in self._download_queue.snapshot()["active"]:
+                    self._download_queue.cancel(existing["id"])
+                else:
+                    self._download_queue.pop_done(existing["id"])
+                    self._download_queue.cancel(existing["id"])
+        self._delete_bad_archive(save_path, file_name)
+        new_id = str(uuid.uuid4())
+        self._download_queue.enqueue(new_id, file_name, source, so_id, save_path)
+        self._remember_download(file_name, source, so_id, save_path)
+        self._download_queue.start_selected([new_id])
+        self._save_settings()
+        if not self._downloads_visible:
+            self._toggle_downloads()
+        self._extract_status_var.set(f"Redownloading {file_name}…")
+        log_activity(f"redownload.start file='{file_name}' id={new_id}")
+        snap = self._download_queue.snapshot()
+        self._rebuild_dl_panel(snap)
+        self._refresh_toggle_label()
+        return True
 
     def _toggle_downloads(self):
         self._downloads_visible = not self._downloads_visible
@@ -1218,9 +1427,13 @@ class MinervaApp(tk.Tk):
     def _show_rom_tools_menu(self):
         callbacks = {
             "compress_chd": self._compress_ps1_button_click,
+            "unpack_xbox": self._unpack_xbox_button_click,
+            "repair_chd": self._repair_incorrect_chd_button_click,
             "clean_bin_cue": self._clean_bin_cue_button_click,
             "clean_names": self._clean_chd_names_button_click,
             "verify_extracted": self._verify_extracted_button_click,
+            "verify_archives": self._verify_downloaded_archives_button_click,
+            "ensure_dkeys": self._ensure_ps3_dkeys_button_click,
             "open_extracted": self._open_current_extracted_folder,
             "force_delete_bins": self._force_delete_bins_button_click,
         }
@@ -1390,13 +1603,24 @@ class MinervaApp(tk.Tk):
         row = tk.Frame(parent, bg=PANEL)
         row.pack(fill="x")
 
+        redownload_btn = ttk.Button(
+            row,
+            text="Redownload",
+            width=11,
+            command=lambda d=did, n=item.get("name", ""): self._redownload_item(
+                download_id=d, name=n, confirm=True
+            ),
+        )
+        redownload_btn.pack(side="right", padx=(0, 6))
+        HoverTooltip(redownload_btn, "Delete this file and download it again")
+
         open_extracted_btn = ttk.Button(
             row,
             text="Extracted",
             width=9,
             command=lambda p=item.get("save_path", ""): self._open_folder(pathlib.Path(p) / "extracted")
         )
-        open_extracted_btn.pack(side="right", padx=(0, 6))
+        open_extracted_btn.pack(side="right", padx=(0, 4))
         HoverTooltip(open_extracted_btn, "Open folder containing extracted ROMs")
 
         open_btn = ttk.Button(
@@ -1409,7 +1633,7 @@ class MinervaApp(tk.Tk):
         HoverTooltip(open_btn, "Open download folder on disk (Ctrl+O)")
 
         ext_lbl = tk.Label(row, text="", bg=PANEL, fg=ACCENT,
-                           font=("TkDefaultFont", 8), width=18, anchor="e")
+                           font=("TkDefaultFont", 8), width=42, anchor="e")
         ext_lbl.pack(side="right", padx=(0, 6))
 
         ext_pv = tk.DoubleVar(value=0)
@@ -1502,9 +1726,12 @@ class MinervaApp(tk.Tk):
             "auto_extract_default": bool(self._auto_extract_default_var.get()),
             "delete_archive_default": bool(self._delete_archive_default_var.get()),
             "compress_ps1_chd": bool(self._compress_ps1_chd_var.get()),
+            "unpack_xbox_iso": bool(self._unpack_xbox_iso_var.get()),
             "autostart_with_windows": bool(self._autostart_var.get()),
             "start_minimized": bool(self._start_minimized_var.get()),
+            "offer_companions": bool(self._offer_companions_var.get()),
             "download_queue": self._get_persisted_queue_for_settings(),
+            "download_history": list(self._download_history.values())[-400:],
             "last_path": self._current_path,
             "last_search_query": self._search_var.get(),
         }
@@ -1588,8 +1815,19 @@ class MinervaApp(tk.Tk):
                 item["save_path"],
             )
             restored_any = True
-            if item["start_requested"]:
+            source = item["source"]
+            local_source = pathlib.Path(source)
+            source_missing = (
+                not source.startswith(("magnet:", "http://", "https://"))
+                and not local_source.exists()
+            )
+            if item["start_requested"] and not source_missing:
                 requested_ids.append(did)
+            elif source_missing:
+                log_activity(
+                    f"queue.restore.skip_start name='{item['name']}' "
+                    f"missing_source='{source}'"
+                )
 
         if requested_ids:
             self._download_queue.start_selected(requested_ids)
@@ -1604,6 +1842,11 @@ class MinervaApp(tk.Tk):
         if self._compress_ps1_chd_var.get() and not self._chdman_path:
             self._extract_status_var.set("PS1/PS2→CHD enabled but chdman.exe not found")
             self._ensure_chdman_available_async()
+        elif self._unpack_xbox_iso_var.get() and not self._xbox_unpack_tool:
+            self._extract_status_var.set("Xbox unpack enabled but xdvdfs/extract-xiso not found")
+            self._ensure_xbox_unpack_tool_async()
+        elif self._xbox_unpack_tool:
+            self._extract_status_var.set(f"Xbox tool: {self._xbox_unpack_tool['exe']}")
         elif self._chdman_path:
             self._extract_status_var.set(f"CHD tool: {self._chdman_path}")
         else:
@@ -1688,10 +1931,9 @@ class MinervaApp(tk.Tk):
             if not pkg_path.exists() or pkg_path.stat().st_size <= 0:
                 raise RuntimeError("Downloaded MAME package is empty")
 
-            startupinfo = _windows_startupinfo()
-
             extracted_ok = False
             last_err = ""
+            hidden_kwargs = _hidden_subprocess_kwargs()
             for tool in self._extractors:
                 if tool["kind"] in ("7zip", "peazip"):
                     cmd = [tool["exe"], "x", "-y", "-aoa", f"-o{extract_dir}", str(pkg_path)]
@@ -1707,7 +1949,7 @@ class MinervaApp(tk.Tk):
                     text=True,
                     encoding="utf-8",
                     errors="replace",
-                    startupinfo=startupinfo,
+                    **hidden_kwargs,
                 )
                 if proc.returncode == 0:
                     extracted_ok = True
@@ -1726,7 +1968,7 @@ class MinervaApp(tk.Tk):
                         text=True,
                         encoding="utf-8",
                         errors="replace",
-                        startupinfo=startupinfo,
+                        **hidden_kwargs,
                     )
                     if proc.returncode == 0:
                         extracted_ok = True
@@ -1754,6 +1996,102 @@ class MinervaApp(tk.Tk):
                     shutil.rmtree(tmp_root, ignore_errors=True)
             except Exception:
                 pass
+
+    def _ensure_xbox_unpack_tool_async(self):
+        if self._xbox_tool_download_in_progress or self._xbox_unpack_tool:
+            return
+        self._xbox_tool_download_in_progress = True
+        self._extract_status_var.set("Installing Xbox unpack tool (xdvdfs)…")
+
+        def worker():
+            tool = self._auto_install_xdvdfs()
+            self.after(0, lambda t=tool: self._finish_xbox_unpack_install(t))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _auto_install_xdvdfs(self) -> dict | None:
+        found = find_xbox_unpack_tool()
+        if found:
+            return found
+
+        base = get_runtime_base_dir()
+        tmp_root = base / "_xdvdfs_install_tmp"
+        zip_path = tmp_root / "xdvdfs.zip"
+        extract_dir = tmp_root / "extracted"
+        out_dir = base / "tools" / "xdvdfs"
+        out_name = "xdvdfs.exe" if IS_WINDOWS else "xdvdfs"
+        out_path = out_dir / out_name
+
+        try:
+            if tmp_root.exists():
+                shutil.rmtree(tmp_root, ignore_errors=True)
+            tmp_root.mkdir(parents=True, exist_ok=True)
+            extract_dir.mkdir(parents=True, exist_ok=True)
+            out_dir.mkdir(parents=True, exist_ok=True)
+
+            api_url = f"https://api.github.com/repos/{XDVDFS_GITHUB_REPO}/releases/latest"
+            req = urllib.request.Request(api_url, headers={"User-Agent": "MiNERVA-Browser/1.0"})
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                data = json.loads(resp.read().decode("utf-8", errors="replace"))
+            asset = pick_xdvdfs_release_asset(data.get("assets") or [], windows=IS_WINDOWS)
+            dl_url = (asset or {}).get("browser_download_url")
+            if not dl_url:
+                raise RuntimeError("Could not find an xdvdfs CLI zip for this platform")
+            log_activity(f"xbox.install.download url='{dl_url}'")
+
+            dl_req = urllib.request.Request(dl_url, headers={"User-Agent": "MiNERVA-Browser/1.0"})
+            with urllib.request.urlopen(dl_req, timeout=120) as resp, zip_path.open("wb") as handle:
+                while True:
+                    chunk = resp.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    handle.write(chunk)
+            if not zip_path.exists() or zip_path.stat().st_size <= 0:
+                raise RuntimeError("Downloaded xdvdfs package is empty")
+
+            with zipfile.ZipFile(zip_path, "r") as zf:
+                zf.extractall(extract_dir)
+
+            found_bin = next(
+                (
+                    p for p in extract_dir.rglob("*")
+                    if p.is_file() and p.name.lower() in {"xdvdfs.exe", "xdvdfs"}
+                ),
+                None,
+            )
+            if found_bin is None:
+                raise RuntimeError("xdvdfs binary was not found in the release zip")
+            shutil.copy2(found_bin, out_path)
+            if not IS_WINDOWS:
+                try:
+                    os.chmod(out_path, 0o755)
+                except OSError:
+                    pass
+            if not out_path.exists() or out_path.stat().st_size <= 0:
+                raise RuntimeError("Failed to place xdvdfs in tools folder")
+            log_activity(f"xbox.install.ok copied='{out_path}'")
+            return {"kind": "xdvdfs", "label": "xdvdfs", "exe": str(out_path)}
+        except Exception as e:
+            log_error("MinervaApp._auto_install_xdvdfs failed", e)
+            return find_xbox_unpack_tool()
+        finally:
+            try:
+                if tmp_root.exists():
+                    shutil.rmtree(tmp_root, ignore_errors=True)
+            except Exception:
+                pass
+
+    def _finish_xbox_unpack_install(self, tool: dict | None):
+        self._xbox_tool_download_in_progress = False
+        self._xbox_unpack_tool = tool
+        if tool:
+            self._extract_status_var.set(f"Xbox tool ready: {tool['exe']}")
+            log_activity(f"xbox.install.ready exe='{tool['exe']}' kind={tool.get('kind')}")
+        else:
+            self._extract_status_var.set(
+                "Could not install xdvdfs. Place xdvdfs or extract-xiso in tools/ and retry."
+            )
+            log_activity("xbox.install.fail")
 
     def _finish_chdman_install(self, path: str | None):
         self._chd_download_in_progress = False
@@ -1848,15 +2186,13 @@ class MinervaApp(tk.Tk):
             return
 
         compress_chd = bool(self._compress_ps1_chd_var.get())
+        unpack_xbox = bool(self._unpack_xbox_iso_var.get())
         decompress = bool(self._auto_extract_default_var.get())
-
-        if not compress_chd and not decompress:
-            return
-
         delete_archive = bool(self._delete_archive_default_var.get())
         for did, meta in valid_items:
             meta["auto_extract"] = bool(decompress)
             meta["compress_chd"] = bool(compress_chd)
+            meta["unpack_xbox_iso"] = bool(unpack_xbox)
             meta["delete_archive"] = bool(delete_archive)
             self._extract_download(did)
 
@@ -1866,41 +2202,323 @@ class MinervaApp(tk.Tk):
     def _open_current_extracted_folder(self):
         self._open_folder(pathlib.Path(self.get_download_dir()) / "extracted")
 
+    def _in_progress_download_names(self) -> set[str]:
+        if self._download_queue is None:
+            return set()
+        return self._download_queue.in_progress_names()
+
+    def _verify_downloaded_archives_button_click(self):
+        TITLE = "Verify Archives"
+        if self._verify_archives_in_progress:
+            messagebox.showinfo(TITLE, "Archive verification is already running.")
+            return
+        download_dir = pathlib.Path(self.get_download_dir())
+        in_progress = self._in_progress_download_names()
+        archives = collect_downloaded_archives(download_dir, exclude_names=in_progress)
+        skipped = 0
+        if in_progress:
+            all_found = collect_downloaded_archives(download_dir)
+            skipped = sum(1 for p in all_found if p.name in in_progress or p.name.lower() in {n.lower() for n in in_progress})
+        if not archives:
+            if skipped:
+                messagebox.showinfo(
+                    TITLE,
+                    f"No completed archives to verify.\n{skipped} archive(s) are still downloading and were skipped.",
+                )
+            else:
+                messagebox.showinfo(TITLE, "No downloaded archives found in the save folder.")
+            return
+        extractors = list(self._extractors)
+        self._verify_archives_in_progress = True
+        self._extract_status_var.set(f"Verifying 0/{len(archives)} archives…")
+        if not self._downloads_visible:
+            self._toggle_downloads()
+
+        def worker():
+            ok = 0
+            failed: list[str] = []
+            skipped_live = skipped
+            total = len(archives)
+            for i, archive in enumerate(archives, start=1):
+                live_names = {n.lower() for n in self._in_progress_download_names()}
+                if archive.name.lower() in live_names:
+                    skipped_live += 1
+                    log_activity(f"archive.verify.skip_in_progress file='{archive.name}'")
+                    continue
+                self.after(
+                    0,
+                    lambda n=i, t=total, name=archive.name:
+                        self._extract_status_var.set(f"Verifying {n}/{t}: {name}"),
+                )
+                try:
+                    verify_archive(archive, extractors=extractors)
+                    ok += 1
+                    log_activity(f"archive.verify.manual.ok file='{archive}'")
+                except Exception as e:
+                    failed.append(f"{archive.name}: {e}")
+                    log_activity(f"archive.verify.manual.fail file='{archive}' err={e}")
+            self.after(
+                0,
+                lambda o=ok, f=failed, t=total, s=skipped_live: self._finish_archive_verify(o, f, t, s),
+            )
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _finish_archive_verify(self, ok: int, failed: list[str], total: int, skipped: int = 0):
+        self._verify_archives_in_progress = False
+        TITLE = "Verify Archives"
+        skip_note = f" Skipped {skipped} still downloading." if skipped else ""
+        if not failed:
+            msg = f"All {ok}/{total} completed archive(s) passed integrity checks.{skip_note}"
+            self._extract_status_var.set(msg)
+            messagebox.showinfo(TITLE, msg)
+            return
+        preview = "\n".join(failed[:8])
+        more = f"\n...and {len(failed) - 8} more" if len(failed) > 8 else ""
+        msg = (
+            f"Passed: {ok}/{total}. Failed: {len(failed)}.{skip_note}\n\n{preview}{more}"
+        )
+        self._extract_status_var.set(f"Archive verify failed: {len(failed)}/{total}")
+        messagebox.showwarning(TITLE, msg)
+        failed_names = [line.split(":", 1)[0].strip() for line in failed if ":" in line]
+        redownloadable = [n for n in failed_names if self._lookup_download_meta(n)]
+        if not redownloadable:
+            return
+        listed = "\n".join(redownloadable[:8])
+        extra = f"\n...and {len(redownloadable) - 8} more" if len(redownloadable) > 8 else ""
+        if messagebox.askyesno(
+            "Redownload failed archives?",
+            f"Redownload {len(redownloadable)} archive(s) that failed verification?\n\n{listed}{extra}",
+        ):
+            for name in redownloadable:
+                self._redownload_item(name=name, confirm=False)
+
     def _verify_extracted_button_click(self):
+        TITLE = "Verify Extracted"
+        if getattr(self, "_verify_extracted_in_progress", False):
+            messagebox.showinfo(TITLE, "Extracted-folder verification is already running.")
+            return
         base = pathlib.Path(self.get_download_dir()) / "extracted"
         if not base.exists():
-            messagebox.showinfo("Verify Extracted", "No extracted folder found yet.")
+            messagebox.showinfo(TITLE, "No extracted folder found yet.")
             return
         if not base.is_dir():
-            messagebox.showerror("Verify Extracted", "Extracted path exists but is not a folder.")
+            messagebox.showerror(TITLE, "Extracted path exists but is not a folder.")
             return
 
         targets = [d for d in base.iterdir() if d.is_dir()]
         if not targets:
-            messagebox.showinfo("Verify Extracted", "No extracted game folders found.")
+            messagebox.showinfo(TITLE, "No extracted game folders found.")
             return
 
-        ok = 0
-        failed: list[str] = []
-        for d in targets:
-            try:
-                verify_extracted_output(d, d.name)
-                ok += 1
-            except Exception as e:
-                failed.append(f"{d.name}: {e}")
+        self._verify_extracted_in_progress = True
+        self._extract_status_var.set(f"Verifying 0/{len(targets)} extracted folders…")
+        download_dir = pathlib.Path(self.get_download_dir())
 
-        total = len(targets)
+        def worker():
+            ok = 0
+            failed: list[str] = []
+            total = len(targets)
+            for i, d in enumerate(targets, start=1):
+                self.after(
+                    0,
+                    lambda n=i, t=total, name=d.name:
+                        self._extract_status_var.set(f"Verifying extracted {n}/{t}: {name}"),
+                )
+                try:
+                    verify_extracted_output(d, d.name)
+                    ok += 1
+                except Exception as e:
+                    failed.append(f"{d.name}: {e}")
+            try:
+                incorrect = collect_incorrect_chds(base, context=str(base), download_dir=download_dir)
+            except Exception as e:
+                log_error("verify extracted collect_incorrect_chds failed", e)
+                incorrect = []
+            self.after(
+                0,
+                lambda o=ok, f=failed, t=total, inc=incorrect:
+                    self._finish_verify_extracted(o, f, t, inc),
+            )
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _finish_verify_extracted(self, ok: int, failed: list[str], total: int, incorrect: list):
+        TITLE = "Verify Extracted"
+        self._verify_extracted_in_progress = False
+        extra = ""
+        if incorrect:
+            extra = (
+                f"\n\n{len(incorrect)} CHD file(s) look like they were converted "
+                "for a system that does not use CHD."
+            )
         if not failed:
-            msg = f"Verified {ok}/{total} extracted folders successfully."
-            self._extract_status_var.set(msg)
-            messagebox.showinfo("Verify Extracted", msg)
+            msg = f"Verified {ok}/{total} extracted folders successfully.{extra}"
+            self._extract_status_var.set(msg if not incorrect else f"Found {len(incorrect)} incorrect CHD(s)")
+            if incorrect:
+                if messagebox.askyesno(
+                    TITLE,
+                    msg + "\n\nRestore those discs to ISO/CUE (or redownload if needed)?",
+                ):
+                    self._repair_incorrect_chd_button_click(already_confirmed=True)
+                return
+            messagebox.showinfo(TITLE, msg)
             return
 
         preview = "\n".join(failed[:8])
         more = f"\n...and {len(failed) - 8} more" if len(failed) > 8 else ""
-        msg = f"Verified {ok}/{total}. Failed: {len(failed)}.\n\n{preview}{more}"
+        msg = f"Verified {ok}/{total}. Failed: {len(failed)}.{extra}\n\n{preview}{more}"
         self._extract_status_var.set(f"Verify failed: {len(failed)} folder(s)")
-        messagebox.showwarning("Verify Extracted", msg)
+        messagebox.showwarning(TITLE, msg)
+        if incorrect and messagebox.askyesno(TITLE, "Also restore incorrect CHD conversions now?"):
+            self._repair_incorrect_chd_button_click(already_confirmed=True)
+
+    def _history_name_for_rom(self, chd_path: pathlib.Path, suggested: str | None = None) -> str | None:
+        guesses: list[str] = []
+        if suggested:
+            guesses.append(suggested)
+        guesses.extend(
+            [
+                chd_path.name,
+                chd_path.stem + ".zip",
+                chd_path.stem + ".7z",
+                chd_path.parent.name + ".zip",
+            ]
+        )
+        for name in guesses:
+            if self._lookup_download_meta(name):
+                return name
+        for hist_name in self._download_history:
+            if names_refer_to_same_rom(hist_name, chd_path.stem) or names_refer_to_same_rom(
+                hist_name, chd_path.parent.name
+            ):
+                return hist_name
+        return None
+
+    def _repair_incorrect_chd_button_click(self, *, already_confirmed: bool = False):
+        TITLE = "Fix incorrect CHD"
+        if self._chd_repair_in_progress:
+            messagebox.showinfo(TITLE, "CHD repair is already running.")
+            return
+        base = pathlib.Path(self.get_download_dir()) / "extracted"
+        download_dir = pathlib.Path(self.get_download_dir())
+        if not base.exists() or not base.is_dir():
+            messagebox.showinfo(TITLE, "No extracted folder found yet.")
+            return
+        found = collect_incorrect_chds(base, context=str(base), download_dir=download_dir)
+        if not found:
+            messagebox.showinfo(
+                TITLE,
+                "No CHD files look incorrectly converted (PSP, PS3, GameCube, Wii, Xbox, etc.).",
+            )
+            return
+        preview = "\n".join(p.name for p in found[:10])
+        more = f"\n...and {len(found) - 10} more" if len(found) > 10 else ""
+        if not already_confirmed:
+            if not messagebox.askyesno(
+                TITLE,
+                f"Found {len(found)} CHD file(s) that probably should not be CHD.\n\n"
+                f"{preview}{more}\n\n"
+                "Restore the original ISO/CUE when possible, otherwise redownload?",
+            ):
+                return
+        self._chd_repair_in_progress = True
+        self._chd_progress_var.set(0.0)
+        self._extract_status_var.set(f"Repairing {len(found)} incorrect CHD file(s)…")
+
+        def worker():
+            def _progress(pct: int, status: str):
+                self.after(0, lambda p=pct, s=status: (
+                    self._chd_progress_var.set(p),
+                    self._extract_status_var.set(s),
+                ))
+
+            try:
+                results = repair_incorrect_chds(
+                    base,
+                    chdman_path=self._chdman_path,
+                    download_dir=download_dir,
+                    extractors=list(self._extractors),
+                    progress_cb=_progress,
+                )
+            except Exception as e:
+                log_error("repair_incorrect_chds failed", e)
+                results = []
+                self.after(0, lambda err=e: self._finish_chd_repair([], str(err)))
+                return
+            self.after(0, lambda r=results: self._finish_chd_repair(r, None))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _finish_chd_repair(self, results: list, error: str | None):
+        self._chd_repair_in_progress = False
+        self._chd_progress_var.set(100.0)
+        TITLE = "Fix incorrect CHD"
+        if error:
+            self._extract_status_var.set(f"CHD repair failed: {error[:80]}")
+            messagebox.showerror(TITLE, f"CHD repair failed:\n{error}")
+            return
+        reversed_n = [r for r in results if r.get("action") == "reversed"]
+        kept = [r for r in results if r.get("action") == "kept"]
+        need = [r for r in results if r.get("action") == "needs_redownload"]
+        errors = [r for r in results if r.get("action") == "error"]
+        lines = [
+            f"Restored {len(reversed_n)} disc(s) from CHD.",
+            f"Left {len(kept)} CHD(s) that are valid for their system.",
+        ]
+        if errors:
+            lines.append(f"{len(errors)} error(s).")
+        redownload_names: list[str] = []
+        for item in need:
+            path = item.get("path")
+            suggested = item.get("redownload_name")
+            hist = None
+            if isinstance(path, pathlib.Path):
+                hist = self._history_name_for_rom(path, suggested)
+            elif suggested:
+                hist = self._lookup_download_meta(suggested) and suggested
+            if hist:
+                redownload_names.append(hist)
+        if redownload_names:
+            listed = "\n".join(redownload_names[:8])
+            extra = f"\n...and {len(redownload_names) - 8} more" if len(redownload_names) > 8 else ""
+            lines.append(f"{len(redownload_names)} need a redownload.")
+            msg = "\n".join(lines) + f"\n\nRedownload now?\n\n{listed}{extra}"
+            self._extract_status_var.set(f"Restored {len(reversed_n)}; {len(redownload_names)} need redownload")
+            if messagebox.askyesno(TITLE, msg):
+                for name in redownload_names:
+                    self._redownload_item(name=name, confirm=False)
+            return
+        msg = "\n".join(lines)
+        if not results:
+            msg = "No incorrect CHD files were repaired."
+        self._extract_status_var.set(
+            f"CHD repair: restored {len(reversed_n)}, kept {len(kept)}"
+        )
+        messagebox.showinfo(TITLE, msg)
+
+    def _prompt_repair_redownloads(self, items: list):
+        names: list[str] = []
+        for item in items:
+            path = item.get("path")
+            suggested = item.get("redownload_name")
+            hist = None
+            if isinstance(path, pathlib.Path):
+                hist = self._history_name_for_rom(path, suggested)
+            elif suggested and self._lookup_download_meta(suggested):
+                hist = suggested
+            if hist:
+                names.append(hist)
+        if not names:
+            return
+        listed = "\n".join(names[:8])
+        extra = f"\n...and {len(names) - 8} more" if len(names) > 8 else ""
+        if messagebox.askyesno(
+            "Redownload original ROM?",
+            f"{len(names)} CHD file(s) could not be reversed. Redownload the original ROM(s)?\n\n{listed}{extra}",
+        ):
+            for name in names:
+                self._redownload_item(name=name, confirm=False)
 
     def _compress_ps1_button_click(self):
         if self._chd_compress_in_progress:
@@ -1945,7 +2563,12 @@ class MinervaApp(tk.Tk):
                                 self._update_chd_progress(dd, dt, cn)
                         )
 
-                    made = compress_ps1_to_chd(d, self._chdman_path, progress_cb=_manual_progress)
+                    made = compress_ps1_to_chd(
+                        d,
+                        self._chdman_path,
+                        progress_cb=_manual_progress,
+                        context=str(d),
+                    )
                     converted += made
                     total_done += made
                 except Exception as e:
@@ -1961,6 +2584,87 @@ class MinervaApp(tk.Tk):
             self.after(0, lambda c=converted, f=failed, t=len(targets): self._finish_manual_chd_batch(c, f, t))
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def _unpack_xbox_button_click(self):
+        if self._xbox_unpack_in_progress:
+            messagebox.showinfo("Unpack Xbox ISOs", "Xbox ISO unpack is already running.")
+            return
+        base = pathlib.Path(self.get_download_dir()) / "extracted"
+        if not base.exists() or not base.is_dir():
+            messagebox.showinfo("Unpack Xbox ISOs", "No extracted folder found yet.")
+            return
+        tool = self._xbox_unpack_tool or find_xbox_unpack_tool()
+        if tool is None:
+            self._ensure_xbox_unpack_tool_async()
+            messagebox.showinfo(
+                "Unpack Xbox ISOs",
+                "xdvdfs is not installed yet. Installation has started in the background.",
+            )
+            return
+        targets = [d for d in base.iterdir() if d.is_dir()]
+        if not targets:
+            messagebox.showinfo("Unpack Xbox ISOs", "No extracted game folders found.")
+            return
+        self._xbox_unpack_in_progress = True
+        self._extract_status_var.set("Xbox ISO unpack running…")
+
+        def worker():
+            unpacked = 0
+            failed: list[str] = []
+            planned = 0
+            done_total = 0
+            for d in targets:
+                planned += len(collect_xbox_iso_sources(d, context=str(d)))
+            for d in targets:
+                try:
+                    def _manual_progress(done: int, total: int, iso_name: str):
+                        display_done = done_total + done
+                        display_total = max(planned, display_done)
+                        self.after(
+                            0,
+                            lambda dd=display_done, dt=display_total, n=iso_name:
+                                self._extract_status_var.set(
+                                    f"Xbox unpack {dd}/{dt}: {display_filename(n)}"
+                                ),
+                        )
+
+                    made = unpack_xbox_isos_in_dir(
+                        d,
+                        tool,
+                        progress_cb=_manual_progress,
+                        context=str(d),
+                        delete_iso=True,
+                    )
+                    unpacked += made
+                    done_total += made
+                except Exception as e:
+                    failed.append(f"{d.name}: {e}")
+            self.after(
+                0,
+                lambda u=unpacked, f=failed, t=len(targets): self._finish_manual_xbox_unpack(u, f, t),
+            )
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _finish_manual_xbox_unpack(self, unpacked: int, failed: list[str], total_folders: int):
+        self._xbox_unpack_in_progress = False
+        if not failed:
+            msg = (
+                f"Xbox unpack finished: {unpacked} ISO(s) dumped across {total_folders} folder(s). "
+                "Copy the game folder (with default.xex) to your modded Xbox 360."
+            )
+            self._extract_status_var.set(msg)
+            messagebox.showinfo("Unpack Xbox ISOs", msg)
+            return
+        preview = "\n".join(failed[:8])
+        more = f"\n...and {len(failed) - 8} more" if len(failed) > 8 else ""
+        msg = (
+            f"Xbox unpack completed with issues.\n"
+            f"Unpacked: {unpacked} ISO(s), Failed folders: {len(failed)}.\n\n"
+            f"{preview}{more}"
+        )
+        self._extract_status_var.set(f"Xbox unpack issues: {len(failed)} folder(s)")
+        messagebox.showwarning("Unpack Xbox ISOs", msg)
 
     def _clean_bin_cue_button_click(self):
         base = pathlib.Path(self.get_download_dir()) / "extracted"
@@ -2013,7 +2717,10 @@ class MinervaApp(tk.Tk):
 
     def _clean_chd_names_button_click(self):
         TITLE = "Clean Names"
-        FILE_EXTS = {".chd", ".bin", ".cue", ".iso", ".img", ".mdf", ".mds"}
+        FILE_EXTS = {
+            ".chd", ".bin", ".cue", ".iso", ".img", ".mdf", ".mds",
+            ".gdi", ".dkey", ".key", ".zip", ".7z", ".rar",
+        }
         base = pathlib.Path(self.get_download_dir()) / "extracted"
         if not base.exists():
             messagebox.showinfo(TITLE, "No extracted folder found yet.")
@@ -2039,6 +2746,36 @@ class MinervaApp(tk.Tk):
         self._extract_status_var.set(f"Name cleanup issues: {len(failed)} file(s)")
         messagebox.showwarning(TITLE, msg)
 
+    def _migrate_root_roms_on_launch(self):
+        app_root = get_runtime_base_dir()
+        dest = pathlib.Path(self.get_download_dir())
+        old_root = str(app_root.resolve())
+        new_dest = str(dest.resolve())
+        moved, failed = migrate_app_root_roms(app_root, dest)
+        if moved:
+            log_activity(f"migrate.startup moved={moved} dest='{dest}'")
+            self._extract_status_var.set(f"Moved {moved} leftover ROM(s) into downloads/")
+        if failed:
+            log_activity(f"migrate.startup.failed {len(failed)}: {failed[:3]}")
+        rewritten = 0
+        for item in self._download_history.values():
+            sp = item.get("save_path")
+            if isinstance(sp, str) and str(pathlib.Path(sp).resolve()) == old_root:
+                item["save_path"] = new_dest
+                rewritten += 1
+        saved_queue = self._settings.get("download_queue", [])
+        if isinstance(saved_queue, list):
+            for raw in saved_queue:
+                if isinstance(raw, dict) and isinstance(raw.get("save_path"), str):
+                    try:
+                        if str(pathlib.Path(raw["save_path"]).resolve()) == old_root:
+                            raw["save_path"] = new_dest
+                            rewritten += 1
+                    except Exception:
+                        pass
+        if rewritten:
+            self._save_settings()
+
     def _run_startup_cleanup(self):
         try:
             download_dir = self.get_download_dir()
@@ -2047,21 +2784,22 @@ class MinervaApp(tk.Tk):
                 return
 
             chd_files = list(base.rglob("*.chd"))
+            log_activity(f"startup.cleanup detected {len(chd_files)} CHD files")
+
+            renamed, unchanged, cleanup_failed = clean_chd_names_in_base(base)
+            log_activity(
+                f"startup.cleanup names renamed={renamed} unchanged={unchanged} failed={len(cleanup_failed)}"
+            )
+            chd_files = list(base.rglob("*.chd"))
             if not chd_files:
                 return
-
-            log_activity(f"startup.cleanup detected {len(chd_files)} CHD files")
 
             bin_files = list(base.rglob("*.bin"))
             cue_files = list(base.rglob("*.cue"))
             iso_files = list(base.rglob("*.iso"))
             source_count = len(bin_files) + len(cue_files) + len(iso_files)
-
-            if source_count > 0:
-                renamed, unchanged, cleanup_failed = clean_chd_names_in_base(base)
-                log_activity(
-                    f"startup.cleanup names renamed={renamed} unchanged={unchanged} failed={len(cleanup_failed)}"
-                )
+            if source_count <= 0:
+                return
 
             removed_bins = 0
             removed_cues = 0
@@ -2069,6 +2807,9 @@ class MinervaApp(tk.Tk):
             delete_failed: list[str] = []
 
             for chd in chd_files:
+                if not chd_companions_safe_to_delete(chd, context=str(base)):
+                    log_activity(f"startup.cleanup.skip_incorrect_chd file='{chd}'")
+                    continue
                 cue = chd.with_suffix(".cue")
                 bin_file = chd.with_suffix(".bin")
                 iso_file = chd.with_suffix(".iso")
@@ -2411,6 +3152,7 @@ class MinervaApp(tk.Tk):
         *,
         skip_name_dedupe: bool = False,
         fetch_ps3_dkey: bool = True,
+        skip_companions: bool = False,
     ):
         if not skip_name_dedupe and self._download_queue and self._download_queue.has_name(file_name):
             if fetch_ps3_dkey and is_ps3_iso_browse_path(browse_path):
@@ -2485,6 +3227,66 @@ class MinervaApp(tk.Tk):
         ))
         if fetch_ps3_dkey and is_ps3_iso_browse_path(browse_path):
             self._enqueue_matching_ps3_dkey(file_name, save_path)
+        if not skip_companions:
+            self._maybe_prompt_companions(file_name, browse_path, save_path)
+
+    def _maybe_prompt_companions(self, file_name: str, browse_path: str, save_path: str):
+        if not bool(self._offer_companions_var.get()):
+            return
+        if classify_release(file_name, browse_path) != KIND_BASE:
+            return
+        try:
+            self.after(0, lambda: self._status_var.set(f"Looking for DLC/updates: {file_name}…"))
+            current = list(self._all_entries) if browse_path == self._current_path else None
+            items = find_companions(
+                file_name,
+                browse_path,
+                current_entries=current,
+                fetch_fn=fetch_entries,
+                latest_update_only=True,
+            )
+        except Exception as e:
+            log_error(f"companion search failed for {file_name}", e)
+            return
+        if not items:
+            return
+        self.after(0, lambda: self._show_companion_prompt(file_name, items, browse_path, save_path))
+
+    def _show_companion_prompt(self, file_name: str, items, browse_path: str, save_path: str):
+        if self._companion_dialog_open:
+            self._companion_prompt_queue.put((file_name, items, browse_path, save_path))
+            return
+        self._companion_dialog_open = True
+        picked = prompt_companions(self, file_name, items, precheck_dlc=False)
+        self._companion_dialog_open = False
+        if picked:
+            self._enqueue_companion_items(picked, browse_path, save_path)
+        try:
+            nxt = self._companion_prompt_queue.get_nowait()
+        except queue.Empty:
+            nxt = None
+        if nxt:
+            self.after(0, lambda n=nxt: self._show_companion_prompt(*n))
+
+    def _enqueue_companion_items(self, items, browse_path: str, save_path: str):
+        for item in items:
+            rom_id = item.rom_id
+            if not rom_id:
+                continue
+            if self._download_queue and self._download_queue.has_name(item.name):
+                continue
+            download_id = str(uuid.uuid4())
+            threading.Thread(
+                target=self._lookup_and_enqueue,
+                args=(download_id, rom_id, item.name, save_path, browse_path),
+                kwargs={"skip_companions": True, "fetch_ps3_dkey": False},
+                daemon=True,
+            ).start()
+        if items and not self._downloads_visible:
+            self._toggle_downloads()
+        n = len(items)
+        self._status_var.set(f"Queued {n} DLC/update file(s)")
+        log_activity(f"companions.queued count={n} base_folder='{browse_path}'")
 
     def _enqueue_matching_ps3_dkey(self, iso_file_name: str, save_path: str):
         try:
@@ -2498,12 +3300,22 @@ class MinervaApp(tk.Tk):
             if not rom_id:
                 return
             dkey_name = entry.get("name") or iso_file_name
+            rom_save = pathlib.Path(save_path)
+            if is_dkey_save_path(rom_save):
+                dkey_dir = rom_save
+            else:
+                dkey_dir = get_dkey_save_dir(rom_save)
+            if find_local_dkey(rom_save if not is_dkey_save_path(rom_save) else rom_save.parent, iso_file_name):
+                log_activity(f"ps3_dkeys.already_present file='{iso_file_name}'")
+                return
+            if self._dkey_download_in_progress(dkey_name):
+                return
             log_activity(f"ps3_dkeys.match iso='{iso_file_name}' dkey='{dkey_name}' id={rom_id}")
             self._lookup_and_enqueue(
                 str(uuid.uuid4()),
                 rom_id,
                 dkey_name,
-                save_path,
+                str(dkey_dir),
                 PS3_DISC_KEYS_TXT_PATH,
                 skip_name_dedupe=True,
                 fetch_ps3_dkey=False,
@@ -2512,35 +3324,166 @@ class MinervaApp(tk.Tk):
             log_error(f"MinervaApp._enqueue_matching_ps3_dkey failed for {iso_file_name}", e)
             log_activity(f"ps3_dkeys.error file='{iso_file_name}' err={repr(e)}")
 
+    def _resolve_dkey_catalog_entry(self, name: str, save_path: str = "") -> dict | None:
+        entry = find_dkey_entry(name)
+        if entry:
+            return entry
+        candidates: list[pathlib.Path] = []
+        if save_path:
+            candidates.append(pathlib.Path(save_path) / name)
+        candidates.append(pathlib.Path(self.get_download_dir()) / name)
+        for path in candidates:
+            if path.is_file():
+                found = find_dkey_entry_for_path(path)
+                if found:
+                    return found
+        return None
+
+    def _dkey_download_in_progress(self, dkey_name: str) -> bool:
+        if self._download_queue is None:
+            return False
+        target = dkey_name.lower()
+        for item in self._download_queue.in_progress_items():
+            if (item.get("name") or "").lower() != target:
+                continue
+            if is_dkey_save_path(item.get("save_path")):
+                return True
+        return False
+
+    def _ensure_ps3_dkeys_button_click(self):
+        TITLE = "PS3 Disc Keys"
+        if self._ensure_dkeys_in_progress:
+            messagebox.showinfo(TITLE, "PS3 dkey check is already running.")
+            return
+        if not _LT_AVAILABLE:
+            messagebox.showinfo(TITLE, "Install libtorrent to download missing dkeys.")
+            return
+        self.get_torrent_engine()
+        download_dir = pathlib.Path(self.get_download_dir())
+        self._ensure_dkeys_in_progress = True
+        self._extract_status_var.set("Checking PS3 dkeys…")
+        if not self._downloads_visible:
+            self._toggle_downloads()
+        extractors = list(self._extractors)
+
+        def worker():
+            queued = 0
+            ok = 0
+            repaired = 0
+            skipped = 0
+            missing_catalog = 0
+            errors: list[str] = []
+            try:
+                rom_names = set(collect_local_ps3_rom_names(download_dir))
+                if self._download_queue is not None:
+                    snap = self._download_queue.snapshot()
+                    for item in (*snap["pending"], *snap["done"]):
+                        name = item.get("name") or ""
+                        if is_dkey_save_path(item.get("save_path")):
+                            continue
+                        entry = self._resolve_dkey_catalog_entry(name, item.get("save_path") or "")
+                        if entry:
+                            rom_names.add(entry.get("name") or name)
+                    for item in self._download_queue.in_progress_items():
+                        name = item.get("name") or ""
+                        if is_dkey_save_path(item.get("save_path")):
+                            continue
+                        entry = self._resolve_dkey_catalog_entry(name, item.get("save_path") or "")
+                        if entry:
+                            rom_names.add(entry.get("name") or name)
+                for hist in self._download_history.values():
+                    if is_dkey_save_path(hist.get("save_path")):
+                        continue
+                    name = hist.get("name") or ""
+                    entry = self._resolve_dkey_catalog_entry(name, hist.get("save_path") or "")
+                    if entry:
+                        rom_names.add(entry.get("name") or name)
+
+                total = len(rom_names)
+                for i, rom_name in enumerate(sorted(rom_names), start=1):
+                    self.after(
+                        0,
+                        lambda n=i, t=total, name=rom_name:
+                            self._extract_status_var.set(f"PS3 dkeys {n}/{t}: {name}"),
+                    )
+                    entry = find_dkey_entry(rom_name)
+                    if entry is None:
+                        missing_catalog += 1
+                        continue
+                    dkey_name = entry.get("name") or rom_name
+                    if find_local_dkey(download_dir, rom_name):
+                        ok += 1
+                        continue
+                    if self._dkey_download_in_progress(dkey_name):
+                        skipped += 1
+                        continue
+                    zip_path = find_local_dkey_zip(download_dir, rom_name)
+                    if zip_path is not None and zip_path.is_file():
+                        try:
+                            zip_size = zip_path.stat().st_size
+                            if zip_size <= 0 or zip_size > DKEY_ZIP_MAX_BYTES:
+                                raise ArchiveVerificationError("dkey zip size looks wrong")
+                            verify_archive(zip_path, extractors=extractors)
+                            if find_local_dkey(download_dir, rom_name):
+                                ok += 1
+                                continue
+                            out = zip_path.parent / zip_path.stem
+                            extract_archive(zip_path, out, extractors=extractors)
+                            if find_local_dkey(download_dir, rom_name):
+                                ok += 1
+                                continue
+                            raise ArchiveVerificationError("dkey zip did not contain a valid .dkey")
+                        except Exception as e:
+                            log_activity(f"ps3_dkeys.bad_zip file='{zip_path}' err={e}")
+                            try:
+                                zip_path.unlink()
+                            except OSError:
+                                pass
+                            repaired += 1
+                    self._enqueue_matching_ps3_dkey(rom_name, str(download_dir))
+                    queued += 1
+            except Exception as e:
+                log_error("MinervaApp._ensure_ps3_dkeys_button_click failed", e)
+                errors.append(str(e))
+            self.after(
+                0,
+                lambda q=queued, o=ok, r=repaired, s=skipped, e=errors:
+                    self._finish_ensure_ps3_dkeys(q, o, r, s, e),
+            )
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _finish_ensure_ps3_dkeys(self, queued: int, ok: int, repaired: int, skipped: int, errors: list[str]):
+        self._ensure_dkeys_in_progress = False
+        TITLE = "PS3 Disc Keys"
+        if self._download_queue is not None:
+            self._rebuild_dl_panel(self._download_queue.snapshot())
+        parts = [
+            f"{ok} already present",
+            f"{queued} queued",
+            f"{repaired} bad zips replaced",
+            f"{skipped} still downloading",
+        ]
+        msg = "PS3 dkey check complete. " + "; ".join(parts) + "."
+        if errors:
+            msg += "\n\n" + errors[0]
+            self._extract_status_var.set("PS3 dkey check failed")
+            messagebox.showwarning(TITLE, msg)
+            return
+        self._extract_status_var.set(msg)
+        messagebox.showinfo(TITLE, msg)
+
     def _find_downloaded_file(self, save_path: pathlib.Path, file_name: str) -> pathlib.Path | None:
+        if not file_name:
+            return None
         direct = save_path / file_name
-        if direct.exists():
+        if direct.is_file():
             return direct
         for depth in range(1, 4):
             pattern = "/".join(["*"] * depth) + f"/{file_name}"
-            matches = list(save_path.glob(pattern))
+            matches = [p for p in save_path.glob(pattern) if p.is_file()]
             if matches:
                 return matches[0]
-        archive_exts = {".zip", ".7z", ".rar", ".tar", ".gz", ".bz2", ".xz", ".iso", ".chd"}
-        candidates: list[tuple[int, pathlib.Path]] = []
-        for depth in range(0, 4):
-            pattern = "*"
-            if depth > 0:
-                pattern = "/".join(["*"] * depth) + "/*"
-            for p in save_path.glob(pattern):
-                if not p.is_file() or p.suffix.lower() not in archive_exts:
-                    continue
-                try:
-                    size = p.stat().st_size
-                except OSError:
-                    continue
-                if size > 0:
-                    candidates.append((size, p))
-        if candidates:
-            candidates.sort(key=lambda t: t[0], reverse=True)
-            chosen = candidates[0][1]
-            log_activity(f"extract.lookup fallback picked '{chosen}' for requested '{file_name}'")
-            return chosen
         return None
 
     def _extract_worker_loop(self):
@@ -2582,6 +3525,8 @@ class MinervaApp(tk.Tk):
 
         def _set_progress(pct: int, status: str):
             self._extract_progress[download_id] = {"pct": pct, "status": status}
+            shown = f"{display_filename(file_name, 28)} — {status}"
+            self.after(0, lambda s=shown: self._extract_status_var.set(s))
             self.after(0, self._refresh_extract_rows)
 
         self.after(0, lambda: self._chd_progress_var.set(0.0))
@@ -2593,14 +3538,20 @@ class MinervaApp(tk.Tk):
                 if src is not None:
                     break
 
-                _set_progress(0, "Waiting for downloaded file…")
+                _set_progress(0, f"Waiting for {display_filename(file_name)}…")
                 time.sleep(1)
 
             if src is None:
                 log_activity(f"extract.missing id={download_id} file='{file_name}'")
-                _set_progress(0, f"Missing downloaded file: {file_name}")
+                _set_progress(0, f"Missing downloaded file: {display_filename(file_name)}")
                 return
-            log_activity(f"extract.source id={download_id} src='{src}' size={src.stat().st_size if src.exists() else -1}")
+            try:
+                src_size = src.stat().st_size
+            except OSError:
+                src_size = -1
+            log_activity(f"extract.source id={download_id} src='{src}' size={src_size}")
+            size_label = format_bytes(src_size) if src_size >= 0 else "unknown size"
+            _set_progress(0, f"Found {display_filename(src.name)} ({size_label})")
 
             stable_count = 0
             last_size = -1
@@ -2615,34 +3566,217 @@ class MinervaApp(tk.Tk):
                         break
                 else:
                     stable_count = 0
+                    if current_size > 0:
+                        _set_progress(
+                            0,
+                            f"Waiting for write to finish: {display_filename(src.name)} "
+                            f"({format_bytes(current_size)})",
+                        )
                 last_size = current_size
                 time.sleep(1)
 
-            out_dir = torrent_dir / src.stem
+            auto_extract = bool(meta.get("auto_extract"))
+            compress_chd = bool(meta.get("compress_chd"))
+            unpack_xbox = bool(meta.get("unpack_xbox_iso"))
+            if is_dkey_save_path(save_path) and is_archive_path(src):
+                auto_extract = True
+            if not auto_extract and not compress_chd and not unpack_xbox:
+                if is_archive_path(src):
+                    try:
+                        verify_archive(
+                            src,
+                            extractors=extractors,
+                            progress_cb=lambda pct, status: _set_progress(pct, status),
+                        )
+                        log_activity(f"archive.verify.ok id={download_id} file='{src.name}'")
+                        _set_progress(100, "Archive verified ✓")
+                    except ArchiveVerificationError as e:
+                        log_activity(f"archive.verify.fail id={download_id} file='{src.name}' err={e}")
+                        _set_progress(0, f"Bad archive: {str(e)[:48]}")
+                        if self._download_queue is not None:
+                            self._download_queue.mark_error(download_id, str(e))
+                        self.after(
+                            0,
+                            lambda did=download_id, name=file_name: self._redownload_item(
+                                download_id=did, name=name, confirm=True
+                            ),
+                        )
+                    return
+                _set_progress(100, "Download complete")
+                return
+
+            cleaned_stem = normalize_chd_stem(src.stem) or src.stem
+            out_dir = torrent_dir / cleaned_stem
             out_dir.mkdir(parents=True, exist_ok=True)
-            extracted_ok = extract_archive(
-                src,
-                out_dir,
-                extractors=extractors,
-                progress_cb=lambda pct, status: _set_progress(pct, status)
+            process_context = " ".join(
+                str(p)
+                for p in (
+                    out_dir,
+                    src,
+                    file_name,
+                    save_path,
+                    meta.get("browse_path") or "",
+                )
+                if p
             )
-            extracted_dir = out_dir if extracted_ok else None
+            extracted_ok = False
+            extracted_dir = None
+            raw_xbox_iso = (
+                unpack_xbox
+                and not is_archive_path(src)
+                and should_unpack_xbox_iso(src, process_context)
+            )
+            if raw_xbox_iso:
+                tool = self._xbox_unpack_tool or find_xbox_unpack_tool()
+                if tool is None:
+                    tool = self._auto_install_xdvdfs()
+                    self._xbox_unpack_tool = tool
+                if tool is None:
+                    raise RuntimeError("Xbox unpack is enabled but xdvdfs/extract-xiso is not available")
+                _set_progress(10, f"Unpacking Xbox ISO {display_filename(src.name)}…")
+                unpack_xbox_iso(
+                    src,
+                    out_dir,
+                    tool,
+                    progress_cb=lambda pct, status: _set_progress(max(10, min(89, pct)), status),
+                    delete_iso=False,
+                )
+                extracted_ok = True
+                extracted_dir = out_dir
+            elif auto_extract or compress_chd or unpack_xbox:
+                extracted_ok = extract_archive(
+                    src,
+                    out_dir,
+                    extractors=extractors,
+                    progress_cb=lambda pct, status: _set_progress(pct, status)
+                )
+                extracted_dir = out_dir if extracted_ok else None
 
             if extracted_ok and extracted_dir is not None:
+                _set_progress(90, "Checking extracted files for ROM content…")
                 verify_extracted_output(extracted_dir, src.name)
-                def _chd_progress(done: int, total: int, cue_name: str):
-                    if total <= 0:
-                        return
-                    pct = 90 + int((done / total) * 9)
-                    pct = max(90, min(99, pct))
-                    self.after(0, lambda d=done, t=total: self._chd_progress_var.set(d * 100.0 / t))
-                    _set_progress(pct, f"Converting to CHD ({done}/{total}): {cue_name}")
-
-                compress_ps1_to_chd(
-                    extracted_dir,
-                    self._chdman_path,
-                    progress_cb=_chd_progress
+                extracted_files = [p for p in extracted_dir.rglob("*") if p.is_file()]
+                _set_progress(
+                    92,
+                    f"Extracted {len(extracted_files)} file(s) into {display_filename(out_dir.name)}",
                 )
+                if compress_chd:
+                    def _chd_progress(done: int, total: int, cue_name: str):
+                        if total <= 0:
+                            return
+                        pct = 90 + int((done / total) * 9)
+                        pct = max(90, min(99, pct))
+                        self.after(0, lambda d=done, t=total: self._chd_progress_var.set(d * 100.0 / t))
+                        _set_progress(
+                            pct,
+                            f"CHD {done}/{total}: {display_filename(cue_name)}",
+                        )
+
+                    chd_context = " ".join(
+                        str(p)
+                        for p in (
+                            extracted_dir,
+                            src,
+                            file_name,
+                            save_path,
+                            meta.get("browse_path") or "",
+                        )
+                        if p
+                    )
+                    converted = compress_ps1_to_chd(
+                        extracted_dir,
+                        self._chdman_path,
+                        progress_cb=_chd_progress,
+                        context=chd_context,
+                    )
+                    if converted:
+                        _set_progress(
+                            99,
+                            f"Converted {converted} disc image(s) to CHD",
+                        )
+                    else:
+                        disc_exts = {".cue", ".gdi", ".toc", ".ccd", ".iso", ".mds", ".mdf", ".nrg"}
+                        leftover = [
+                            p.name
+                            for p in extracted_dir.rglob("*")
+                            if p.is_file() and p.suffix.lower() in disc_exts
+                        ]
+                        if leftover:
+                            _set_progress(
+                                95,
+                                "Kept original disc image (this system does not use CHD)",
+                            )
+                if unpack_xbox and not raw_xbox_iso:
+                    xbox_sources = collect_xbox_iso_sources(extracted_dir, context=process_context)
+                    if xbox_sources:
+                        tool = self._xbox_unpack_tool or find_xbox_unpack_tool()
+                        if tool is None:
+                            tool = self._auto_install_xdvdfs()
+                            self._xbox_unpack_tool = tool
+                        if tool is None:
+                            raise RuntimeError(
+                                "Xbox unpack is enabled but xdvdfs/extract-xiso is not available"
+                            )
+
+                        def _xbox_progress(done: int, total: int, iso_name: str):
+                            if total <= 0:
+                                return
+                            pct = 92 + int((done / total) * 6)
+                            pct = max(92, min(99, pct))
+                            _set_progress(
+                                pct,
+                                f"Xbox ISO {done}/{total}: {display_filename(iso_name)}",
+                            )
+
+                        unpacked = unpack_xbox_isos_in_dir(
+                            extracted_dir,
+                            tool,
+                            progress_cb=_xbox_progress,
+                            context=process_context,
+                            delete_iso=True,
+                        )
+                        if unpacked:
+                            _set_progress(
+                                99,
+                                f"Unpacked {unpacked} Xbox ISO(s) for a modded console",
+                            )
+                repair_context = " ".join(
+                    str(p)
+                    for p in (
+                        extracted_dir,
+                        src,
+                        file_name,
+                        save_path,
+                        meta.get("browse_path") or "",
+                    )
+                    if p
+                )
+                incorrect = collect_incorrect_chds(
+                    extracted_dir,
+                    context=repair_context,
+                    download_dir=save_path,
+                )
+                if incorrect:
+                    _set_progress(
+                        96,
+                        f"Fixing {len(incorrect)} incorrect CHD file(s)…",
+                    )
+                    repair_results = repair_incorrect_chds(
+                        extracted_dir,
+                        chdman_path=self._chdman_path,
+                        download_dir=save_path,
+                        extractors=extractors,
+                        progress_cb=lambda pct, status: _set_progress(pct, status),
+                    )
+                    need = [r for r in repair_results if r.get("action") == "needs_redownload"]
+                    restored_n = sum(1 for r in repair_results if r.get("action") == "reversed")
+                    if restored_n:
+                        _set_progress(98, f"Restored {restored_n} disc(s) that should not be CHD")
+                    if need:
+                        self.after(
+                            0,
+                            lambda items=need: self._prompt_repair_redownloads(items),
+                        )
                 renamed, unchanged, failed = clean_chd_names_in_base(extracted_dir)
                 if failed:
                     log_activity(
@@ -2661,12 +3795,30 @@ class MinervaApp(tk.Tk):
 
             status_text = "Extracted ✓"
             if extracted_ok and extracted_dir is not None:
-                if any(extracted_dir.rglob("*.chd")):
-                    status_text = "Compressed to CHD ✓"
+                file_count = len([p for p in extracted_dir.rglob("*") if p.is_file()])
+                chd_count = len(list(extracted_dir.rglob("*.chd")))
+                xbox_exec = [
+                    p for p in extracted_dir.rglob("*")
+                    if p.is_file() and p.name.lower() in {"default.xex", "default.xbe"}
+                ]
+                if xbox_exec:
+                    status_text = f"Xbox dump {len(xbox_exec)} xex/xbe ✓ ({file_count} files)"
+                elif chd_count:
+                    status_text = f"Compressed {chd_count} CHD ✓ ({file_count} files)"
+                else:
+                    status_text = f"Extracted {file_count} file(s) ✓"
             elif not extracted_ok:
-                status_text = "Failed"
+                status_text = "Extract failed (archive may be corrupt)"
+                if self._download_queue is not None:
+                    self._download_queue.mark_error(download_id, status_text)
+                self.after(
+                    0,
+                    lambda did=download_id, name=file_name: self._redownload_item(
+                        download_id=did, name=name, confirm=True
+                    ),
+                )
 
-            _set_progress(100, status_text)
+            _set_progress(100 if extracted_ok else 0, status_text)
             self.after(0, lambda: self._chd_progress_var.set(100.0 if extracted_ok else 0.0))
             log_activity(f"extract.done id={download_id} ok={extracted_ok}")
 
@@ -2674,6 +3826,15 @@ class MinervaApp(tk.Tk):
             log_error(f"MinervaApp._extract_download_sync failed for {file_name}", e)
             log_activity(f"extract.error id={download_id} file='{file_name}' err={repr(e)}")
             _set_progress(0, f"Error: {str(e)[:40]}")
+            if self._download_queue is not None:
+                self._download_queue.mark_error(download_id, str(e))
+            if isinstance(e, ArchiveVerificationError) or is_archive_path(pathlib.Path(file_name)):
+                self.after(
+                    0,
+                    lambda did=download_id, name=file_name: self._redownload_item(
+                        download_id=did, name=name, confirm=True
+                    ),
+                )
             self.after(0, lambda: self._chd_progress_var.set(0.0))
 
     @staticmethod
@@ -2826,7 +3987,7 @@ class MinervaApp(tk.Tk):
         subprocess.Popen(
             ["powershell", "-WindowStyle", "Hidden", "-ExecutionPolicy", "Bypass",
              "-File", str(script_path)],
-            creationflags=subprocess.CREATE_NO_WINDOW if IS_WINDOWS else 0,
+            **_hidden_subprocess_kwargs(),
         )
         self._on_close()
 
@@ -2858,6 +4019,7 @@ class MinervaApp(tk.Tk):
     def _setup_system_tray(self):
         """Set up the system tray icon using pystray."""
         self._tray_icon = None
+        self._quitting = False
         try:
             import pystray
             from PIL import Image
@@ -2872,7 +4034,7 @@ class MinervaApp(tk.Tk):
 
             menu = pystray.Menu(
                 pystray.MenuItem("Show MiNERVA", lambda icon, item: self.after(0, self._restore_from_tray), default=True),
-                pystray.MenuItem("Minimize to Tray", lambda icon, item: self.after(0, self.withdraw)),
+                pystray.MenuItem("Minimize to Tray", lambda icon, item: self.after(0, self._minimize_to_tray)),
                 pystray.Menu.SEPARATOR,
                 pystray.MenuItem("Open Download Folder", lambda icon, item: self.after(0, self._open_current_downloads_folder)),
                 pystray.MenuItem("Pause / Resume All", lambda icon, item: self.after(0, self._toggle_pause_all_active)),
@@ -2890,10 +4052,43 @@ class MinervaApp(tk.Tk):
         except Exception as e:
             log_error("System tray initialization skipped or failed", e)
 
+    def _tray_available(self) -> bool:
+        return bool(getattr(self, "_tray_icon", None)) and not getattr(self, "_quitting", False)
+
+    def _minimize_to_tray(self):
+        if not self._tray_available():
+            self.iconify()
+            return
+        try:
+            self.withdraw()
+        except tk.TclError:
+            pass
+
+    def _on_window_unmap(self, event):
+        """Send the taskbar minimize button to the tray instead of the taskbar."""
+        if event.widget is not self or not self._tray_available():
+            return
+        try:
+            if self.state() == "iconic":
+                self.after(0, self._minimize_to_tray)
+        except tk.TclError:
+            pass
+
+    def _on_close_request(self):
+        """Titlebar close hides to the tray; use Exit on the tray menu to quit."""
+        if self._tray_available():
+            self._minimize_to_tray()
+            return
+        self._on_close()
+
     def _restore_from_tray(self):
-        self.deiconify()
-        self.lift()
-        self.focus_force()
+        try:
+            self.deiconify()
+            self.state("normal")
+            self.lift()
+            self.focus_force()
+        except tk.TclError:
+            pass
 
     def _quit_from_tray(self):
         self._on_close()
@@ -2907,6 +4102,7 @@ class MinervaApp(tk.Tk):
             self._tray_icon = None
 
     def _on_close(self):
+        self._quitting = True
         self._shutdown_tray()
         self._save_settings()
         if self._torrent_engine is not None:
