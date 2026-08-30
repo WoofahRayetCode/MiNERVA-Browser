@@ -92,6 +92,8 @@ from minerva.core.extractors import (
     verify_extracted_output,
     is_archive_path,
     collect_downloaded_archives,
+    collect_library_match_keys,
+    library_status_for_name,
     verify_archive,
     ArchiveVerificationError,
     chd_source_mode,
@@ -307,6 +309,10 @@ class MinervaApp(tk.Tk):
         self._xbox_unpack_in_progress = False
         self._dl_active_widgets: dict[str, dict] = {}
         self._dl_queued_widgets: dict[str, dict] = {}
+        self._library_keys_cache: set[str] | None = None
+        self._library_keys_cache_dir: str | None = None
+        self._dlstat_tip_window = None
+        self._dlstat_tip_text = ""
         self._dl_done_widgets: dict[str, dict] = {}
         self._checked_hrefs: set[str] = set()
         self._sort_column = "name"
@@ -423,7 +429,7 @@ class MinervaApp(tk.Tk):
 
         right_frame.bind("<Configure>", self._on_right_frame_configure)
 
-        cols = ("check", "name", "size")
+        cols = ("check", "dlstat", "name", "size")
         right_scroll_y = ttk.Scrollbar(
             right_frame, orient="vertical", style="Visible.Vertical.TScrollbar"
         )
@@ -439,6 +445,8 @@ class MinervaApp(tk.Tk):
         right_scroll_x.config(command=self._right_tree.xview)
         self._right_tree.heading("check", text="☐", command=self._toggle_check_all_visible)
         self._right_tree.column("check", width=28, stretch=False, anchor="center", minwidth=28)
+        self._right_tree.heading("dlstat", text="")
+        self._right_tree.column("dlstat", width=28, stretch=False, anchor="center", minwidth=28)
         self._right_tree.heading("name", text="Name ▲", command=lambda: self._sort_by_column("name"))
         self._right_tree.column("name", stretch=True, minwidth=200)
         self._right_tree.heading("size", text="Size", command=lambda: self._sort_by_column("size"))
@@ -446,9 +454,13 @@ class MinervaApp(tk.Tk):
         right_scroll_y.pack(side="right", fill="y", padx=(0, 8))
         right_scroll_x.pack(side="bottom", fill="x", padx=(10, 8))
         self._right_tree.pack(fill="both", expand=True, padx=(10, 0), pady=(4, 0))
+        self._right_tree.tag_configure("queued", foreground=WARNING)
+        self._right_tree.tag_configure("downloaded", foreground=SUCCESS)
         self._right_tree.bind("<Double-1>", self._on_right_double_click)
         self._right_tree.bind("<Button-1>", self._on_right_click)
         self._right_tree.bind("<Button-3>", self._show_tree_context_menu)
+        self._right_tree.bind("<Motion>", self._on_right_motion)
+        self._right_tree.bind("<Leave>", lambda e: self._hide_dlstat_tip())
         if sys.platform == "darwin":
             self._right_tree.bind("<Button-2>", self._show_tree_context_menu)
 
@@ -865,9 +877,12 @@ class MinervaApp(tk.Tk):
                 continue
             seen_hrefs.add(e["href"])
             icon = "📄 "
+            status = self._library_status_for_name(e["name"])
+            status_icon = {"downloaded": "✓", "queued": "⬇"}.get(status, "")
+            tags = ("file", status) if status else ("file",)
             self._right_tree.insert("", "end", iid=e["href"],
-                                    values=("", icon + e["name"], e["size"]),
-                                    tags=("file",))
+                                    values=("", status_icon, icon + e["name"], e["size"]),
+                                    tags=tags)
             if e["href"] in self._checked_hrefs:
                 self._right_tree.set(e["href"], "check", "✓")
 
@@ -880,7 +895,7 @@ class MinervaApp(tk.Tk):
             if has_filter and self._all_entries:
                 self._right_tree.insert(
                     "", "end", iid="__empty_state__",
-                    values=("", "🔍 No matching items. Click here to reset search and filters.", ""),
+                    values=("", "", "🔍 No matching items. Click here to reset search and filters.", ""),
                     tags=("empty_state",)
                 )
 
@@ -1106,6 +1121,7 @@ class MinervaApp(tk.Tk):
             self._download_queue.enqueue(download_id, name, source, so_id, save_path)
             self._remember_download(name, source, so_id, save_path)
             self._save_settings()
+            self.after(0, self._refresh_library_status_icons)
         if not self._downloads_visible:
             self._toggle_downloads()
 
@@ -1301,6 +1317,7 @@ class MinervaApp(tk.Tk):
                     self._download_queue.on_finished(did, error=event.get("msg", "Unknown error"))
                     queue_changed = True
             if finished_ids:
+                self._invalidate_library_keys_cache()
                 self._prompt_post_download_actions_batch(finished_ids)
             if queue_changed:
                 self._save_settings()
@@ -1354,6 +1371,87 @@ class MinervaApp(tk.Tk):
                 f"MinervaApp._normalize_downloaded_file_location failed for {file_name}",
                 e
             )
+
+    def _invalidate_library_keys_cache(self):
+        self._library_keys_cache = None
+        self._library_keys_cache_dir = None
+
+    def _on_disk_library_keys(self) -> set[str]:
+        download_dir = self.get_download_dir()
+        if (
+            self._library_keys_cache is not None
+            and self._library_keys_cache_dir == download_dir
+        ):
+            return self._library_keys_cache
+        keys = collect_library_match_keys(pathlib.Path(download_dir))
+        self._library_keys_cache = keys
+        self._library_keys_cache_dir = download_dir
+        return keys
+
+    def _library_status_for_name(self, name: str) -> str:
+        queued = self._in_progress_download_names()
+        return library_status_for_name(name, queued, self._on_disk_library_keys())
+
+    def _refresh_library_status_icons(self):
+        if not hasattr(self, "_right_tree"):
+            return
+        for iid in self._right_tree.get_children():
+            if iid == "__empty_state__":
+                continue
+            tags = set(self._right_tree.item(iid, "tags") or ())
+            if "file" not in tags:
+                continue
+            values = self._right_tree.item(iid, "values")
+            if len(values) < 4:
+                continue
+            raw_name = str(values[2]).removeprefix("📄 ").strip()
+            status = self._library_status_for_name(raw_name)
+            status_icon = {"downloaded": "✓", "queued": "⬇"}.get(status, "")
+            self._right_tree.set(iid, "dlstat", status_icon)
+            tags.discard("queued")
+            tags.discard("downloaded")
+            if status:
+                tags.add(status)
+            self._right_tree.item(iid, tags=tuple(tags))
+
+    def _hide_dlstat_tip(self):
+        tw = getattr(self, "_dlstat_tip_window", None)
+        self._dlstat_tip_window = None
+        self._dlstat_tip_text = ""
+        if tw:
+            try:
+                tw.destroy()
+            except Exception:
+                pass
+
+    def _on_right_motion(self, event):
+        row = self._right_tree.identify_row(event.y)
+        col = self._right_tree.identify_column(event.x)
+        if not row or row == "__empty_state__" or col != "#2":
+            self._hide_dlstat_tip()
+            return
+        icon = self._right_tree.set(row, "dlstat")
+        text = ""
+        if icon == "✓":
+            text = "Already downloaded"
+        elif icon == "⬇":
+            text = "Already in the download queue"
+        if not text:
+            self._hide_dlstat_tip()
+            return
+        if self._dlstat_tip_window and self._dlstat_tip_text == text:
+            return
+        self._hide_dlstat_tip()
+        tw = tk.Toplevel(self._right_tree)
+        tw.wm_overrideredirect(True)
+        tw.wm_geometry(f"+{event.x_root + 12}+{event.y_root + 16}")
+        tk.Label(
+            tw, text=text, justify="left",
+            background=PANEL, foreground=FG, relief="solid", borderwidth=1,
+            font=("TkDefaultFont", 8), padx=6, pady=3,
+        ).pack()
+        self._dlstat_tip_window = tw
+        self._dlstat_tip_text = text
 
     def _rebuild_dl_panel(self, snap: dict):
         active_ids = set(snap["active"])
@@ -1423,6 +1521,7 @@ class MinervaApp(tk.Tk):
             if hasattr(self, "_dl_done_header") and self._dl_done_header.winfo_exists():
                 self._dl_done_header.destroy()
                 del self._dl_done_header
+        self._refresh_library_status_icons()
 
     def _show_rom_tools_menu(self):
         callbacks = {
@@ -1836,7 +1935,9 @@ class MinervaApp(tk.Tk):
             self._save_settings()
 
     def _on_download_dir_change(self, *_):
+        self._invalidate_library_keys_cache()
         self._save_settings()
+        self._refresh_library_status_icons()
 
     def _on_extract_defaults_change(self):
         if self._compress_ps1_chd_var.get() and not self._chdman_path:
@@ -2607,6 +2708,7 @@ class MinervaApp(tk.Tk):
             return
         self._xbox_unpack_in_progress = True
         self._extract_status_var.set("Xbox ISO unpack running…")
+        self._chd_progress_var.set(0.0)
 
         def worker():
             unpacked = 0
@@ -2615,16 +2717,21 @@ class MinervaApp(tk.Tk):
             done_total = 0
             for d in targets:
                 planned += len(collect_xbox_iso_sources(d, context=str(d)))
+            if planned <= 0:
+                self.after(0, lambda: self._chd_progress_var.set(0.0))
             for d in targets:
                 try:
-                    def _manual_progress(done: int, total: int, iso_name: str):
-                        display_done = done_total + done
-                        display_total = max(planned, display_done)
+                    def _manual_progress(done, total, iso_name: str):
+                        display_total = max(planned, 1)
+                        frac = (done_total + max(0.0, float(done))) / display_total
+                        pct = max(0, min(99, int(frac * 100)))
+                        self.after(0, lambda p=pct: self._chd_progress_var.set(float(p)))
                         self.after(
                             0,
-                            lambda dd=display_done, dt=display_total, n=iso_name:
+                            lambda p=pct, n=iso_name, t=display_total:
                                 self._extract_status_var.set(
-                                    f"Xbox unpack {dd}/{dt}: {display_filename(n)}"
+                                    f"Dumping Xbox ISO {display_filename(n)} ({p}%)"
+                                    + (f"  [{t} disc(s)]" if t > 1 else "")
                                 ),
                         )
 
@@ -2648,6 +2755,7 @@ class MinervaApp(tk.Tk):
 
     def _finish_manual_xbox_unpack(self, unpacked: int, failed: list[str], total_folders: int):
         self._xbox_unpack_in_progress = False
+        self._chd_progress_var.set(0.0 if failed and unpacked <= 0 else 100.0)
         if not failed:
             msg = (
                 f"Xbox unpack finished: {unpacked} ISO(s) dumped across {total_folders} folder(s). "
@@ -3633,12 +3741,18 @@ class MinervaApp(tk.Tk):
                     self._xbox_unpack_tool = tool
                 if tool is None:
                     raise RuntimeError("Xbox unpack is enabled but xdvdfs/extract-xiso is not available")
-                _set_progress(10, f"Unpacking Xbox ISO {display_filename(src.name)}…")
+                _set_progress(1, f"Dumping Xbox ISO {display_filename(src.name)}…")
+
+                def _raw_dump_progress(pct: int, status: str):
+                    shown = max(1, min(99, int(pct)))
+                    self.after(0, lambda p=shown: self._chd_progress_var.set(float(p)))
+                    _set_progress(shown, status)
+
                 unpack_xbox_iso(
                     src,
                     out_dir,
                     tool,
-                    progress_cb=lambda pct, status: _set_progress(max(10, min(89, pct)), status),
+                    progress_cb=_raw_dump_progress,
                     delete_iso=False,
                 )
                 extracted_ok = True
@@ -3718,14 +3832,15 @@ class MinervaApp(tk.Tk):
                                 "Xbox unpack is enabled but xdvdfs/extract-xiso is not available"
                             )
 
-                        def _xbox_progress(done: int, total: int, iso_name: str):
+                        def _xbox_progress(done, total: int, iso_name: str):
                             if total <= 0:
                                 return
-                            pct = 92 + int((done / total) * 6)
-                            pct = max(92, min(99, pct))
+                            frac = max(0.0, min(1.0, float(done) / float(total)))
+                            pct = max(1, min(99, int(frac * 100)))
+                            self.after(0, lambda p=pct: self._chd_progress_var.set(float(p)))
                             _set_progress(
                                 pct,
-                                f"Xbox ISO {done}/{total}: {display_filename(iso_name)}",
+                                f"Dumping Xbox ISO {display_filename(iso_name)} ({pct}%)",
                             )
 
                         unpacked = unpack_xbox_isos_in_dir(
