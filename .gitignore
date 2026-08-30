@@ -21,21 +21,38 @@ __pycache__/
 .pytest_cache/
 .coverage
 htmlcov/
+.mypy_cache/
+.ruff_cache/
 
 # Runtime data and caches (generated locally by the app)
 torrentfiles/
 downloads/
 extracted/
+dkeys/
 *.log
 minerva_settings.json
 minerva_error.log
 activity_log*.txt
 startup_cleanup_debug.txt
 _chdman_install_tmp/
+_xdvdfs_install_tmp/
 _minerva_update.ps1
 MiNERVA-Browser-update*
+/MiNERVA-Browser.exe
 
-# Runtime tools (auto-installed at runtime)
+# Local dump leftovers (never commit ROMs or probe scripts)
+_probe_*.py
+*.iso
+*.xiso
+*.chd
+*.cue
+*.bin
+*.gdi
+*.nrg
+*.mds
+*.mdf
+
+# Runtime tools (auto-installed: chdman, xdvdfs, extract-xiso)
 tools/
 
 # PyInstaller
@@ -46,9 +63,10 @@ tools/
 Thumbs.db
 desktop.ini
 
-# IDE & editors
+# IDE, editors, local agent state
 .vscode/
 .idea/
+.grok/
+.agents/
 *.suo
 *.user
-.agents/
