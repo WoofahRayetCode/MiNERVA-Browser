@@ -102,10 +102,10 @@ _LOG_LOCK = threading.Lock()
 
 
 def get_default_download_dir() -> str:
-    """Return the resolved folder next to the exe (frozen) or project root."""
-    if getattr(sys, "frozen", False):
-        return str(pathlib.Path(sys.executable).parent.resolve())
-    return str(pathlib.Path(__file__).resolve().parent.parent)
+    """Return (and create) the downloads/ folder next to the exe or project root."""
+    d = get_runtime_base_dir() / "downloads"
+    d.mkdir(exist_ok=True)
+    return str(d.resolve())
 
 
 def get_runtime_base_dir() -> pathlib.Path:
@@ -142,6 +142,9 @@ def get_icon_ico_path() -> pathlib.Path:
 
 
 def get_error_log_path() -> pathlib.Path:
+    override = os.environ.get("MINERVA_ERROR_LOG")
+    if override:
+        return pathlib.Path(override)
     return get_runtime_base_dir() / "minerva_error.log"
 
 
