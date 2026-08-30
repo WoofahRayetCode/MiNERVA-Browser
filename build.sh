@@ -93,7 +93,8 @@ VENV_PYINSTALLER="${VENV_DIR}/bin/pyinstaller"
 # ── Install / Upgrade Dependencies ────────────────────────────────────────────
 write_step "Installing build dependencies"
 "${VENV_PIP}" install --quiet --upgrade pip
-"${VENV_PIP}" install --quiet pyinstaller
+"${VENV_PIP}" install --quiet pyinstaller pillow pystray
+write_ok "PyInstaller, pillow, and pystray ready"
 
 write_step "Installing libtorrent (optional — enables torrent downloading)"
 if "${VENV_PIP}" install --quiet libtorrent 2>/dev/null; then
