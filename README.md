@@ -21,20 +21,25 @@ A portable desktop GUI for browsing and downloading from [minerva-archive.org](h
 - ✅ **Inline checkboxes & multi-select** — select multiple games then click **Queue Downloads**
 - ⚡ **Double-click** any game to queue it instantly
 - 🔄 **Download queue** with configurable concurrency (1–10 simultaneous downloads)
-- 📂 **Custom save folder** via the Browse button
+- 📂 **Custom save folder** via the Browse button (defaults to `downloads/` next to the app)
 - 💾 **State persistence** — preferences, filters, and active/queued downloads persist across app launches
 - 🗂️ **Torrent caching** — `.torrent` files cached in `torrentfiles/` to eliminate redundant fetches
 - 🚫 **Deduplication** — automatically skips items already pending, active, or completed
+- 📦 **DLC / update matching** — after queueing a game, offers matching DLC and updates from the same folder or related digital/PSN/CDN collections (select, download all, or skip)
 - 📊 **Real-time metrics** — speed, ETA, progress bars, and state tracking without text clipping
 
 ### Extraction & CHD Compression
 - 📦 **Auto-extract** — extract archives automatically once download finishes
 - 🗜️ **Extractor detection** — auto-detects external extractors (**7-Zip**, **PeaZip**, **WinRAR**) with fallback to Python `zipfile`
-- 🎮 **PS1/PS2 BIN/CUE/ISO → CHD** — convert disc images to CHD directly from the app (using system or auto-installed `chdman`)
+- 🎮 **PS1/PS2 BIN/CUE/ISO → CHD** — convert supported disc images to CHD (`chdman`); skips PSP/PS3/GameCube/Wii/Xbox
+- 🎮 **Xbox / Xbox 360 ISO unpack** — dump XISO/XGD contents with **xdvdfs** (falls back to **extract-xiso**) into a folder with `default.xex` / `default.xbe` for a modded 360; skips `$SystemUpdate`
+- ↩️ **Fix incorrect CHD conversions** — restore PSP/PS3/GC discs that were turned into CHD, or redownload if needed
+- 🔍 **Verify downloaded archives** — CRC-test zip/7z/rar files in the save folder and offer redownload on failure
+- 🔑 **PS3 disc keys** — auto-queue matching Redump `.dkey` zips into `downloads/dkeys/`, plus a tools action to repair missing keys
 - 🛠️ **Unified ROM Tools menu** — grouped utilities for CHD conversion, BIN/CUE cleaning, verification, and name standardization
 - 🧹 **Automatic name cleaning** — cleans region tags and disc descriptors while preserving disc numbering
 - 🗑️ **Optional source deletion** — automatically deletes source archives and BIN/CUE/ISO files post-conversion
-- 🚀 **Startup cleanup** — scans the extracted folder on launch to clean names and remove leftover BIN/CUE files
+- 🚀 **Startup cleanup** — scans the extracted folder on launch to clean names and remove leftover BIN/CUE files next to valid CHDs only
 
 ---
 
@@ -85,7 +90,7 @@ python -m unittest discover -s tests -v
 python minerva_browser.py
 ```
 
-> **Note:** `libtorrent` is required for downloading. Without it, the browser still works for navigating and searching, but downloads will be disabled.
+> **Note:** `libtorrent` is required for downloading. Without it, the browser still works for navigating and searching, but downloads will be disabled. `pillow` and `pystray` enable the system tray icon.
 
 ---
 
@@ -101,7 +106,8 @@ python minerva_browser.py
 │   ├── core/
 │   │   ├── sqlite_http.py     # HTTP range SQLite reader & web parser
 │   │   ├── torrent_engine.py  # libtorrent session engine & DownloadQueue
-│   │   └── extractors.py      # Archive extraction & CHD compression tools
+│   │   ├── extractors.py      # Archive extraction & CHD compression tools
+│   │   └── ps3_dkeys.py       # Redump PS3 disc-key catalog matching
 │   └── ui/
 │       ├── theme.py           # Catppuccin palette & modern TTK style configurations
 │       ├── app.py             # Main Tkinter desktop application window
@@ -127,4 +133,6 @@ MiNERVA distributes all files via BitTorrent:
 2. Downloads the collection `.torrent` file into `torrentfiles/`
 3. Instructs libtorrent to download only the selected file within that torrent (`so_id` file priority)
 4. Optionally extracts the file using detected extractors (7-Zip / PeaZip / WinRAR / zipfile)
-5. Optionally converts disc images to CHD and cleans up input files
+5. Optionally converts supported disc images to CHD and cleans up input files
+6. Optionally unpacks Xbox / Xbox 360 ISOs with xdvdfs (or extract-xiso) into a folder with `default.xex` for a modded console
+7. For Redump PS3 ISOs, queues the matching disc-key zip into `dkeys/` when one exists
