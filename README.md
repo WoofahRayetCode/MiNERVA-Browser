@@ -74,10 +74,11 @@ Options:
 .\build.ps1 -Clean            # Wipe build/, dist/, and .venv/ first
 .\build.ps1 -SkipPythonCheck  # Skip Scoop Python auto-install check
 .\build.ps1 -SkipTests        # Skip the unit test suite
-.\build.ps1 -DeployDir "$env:USERPROFILE\Desktop\MiNERVA Browser"  # Copy the exe after build
+.\build.ps1 -SkipDeploy       # Do not copy the exe after build
+.\build.ps1 -DeployDir "$env:USERPROFILE\Desktop\MiNERVA Browser"  # Copy somewhere else
 ```
 
-`-DeployDir` copies only `MiNERVA-Browser.exe`. Keep `downloads/`, `tools/`, and `torrentfiles/` in that folder if you already use a portable desktop copy.
+A successful build copies `MiNERVA-Browser.exe` to `OneDrive\Desktop\MiNERVA Browser` by default. Keep `downloads/`, `tools/`, and `torrentfiles/` in that folder if you already use a portable desktop copy.
 
 ### Linux (Bash)
 ```bash
