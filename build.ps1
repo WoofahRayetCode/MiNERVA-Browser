@@ -5,18 +5,21 @@
 .DESCRIPTION
     Checks for Python 3, installs it via Scoop if missing, creates a virtual
     environment, installs PyInstaller, and produces dist\MiNERVA-Browser.exe.
-    Pass -DeployDir to copy the exe somewhere else after the build.
+    After a successful build the exe is copied to OneDrive Desktop\MiNERVA Browser
+    unless -SkipDeploy is set. Pass -DeployDir to copy somewhere else.
 
 .EXAMPLE
     .\build.ps1
     .\build.ps1 -SkipPythonCheck   # skip the Python install check
     .\build.ps1 -Clean             # delete build/ and dist/ first
+    .\build.ps1 -SkipDeploy        # do not copy the exe after build
     .\build.ps1 -DeployDir "$env:USERPROFILE\Desktop\MiNERVA Browser"
 #>
 param(
     [switch]$Clean,
     [switch]$SkipPythonCheck,
     [switch]$SkipTests,
+    [switch]$SkipDeploy,
     [string]$DeployDir = ""
 )
 
@@ -29,6 +32,17 @@ $DistDir   = Join-Path $ScriptDir "dist"
 $BuildDir  = Join-Path $ScriptDir "build"
 $SpecFile  = Join-Path $ScriptDir "minerva_browser.spec"
 $OutExe    = Join-Path $DistDir "MiNERVA-Browser.exe"
+
+if (-not $SkipDeploy -and -not $DeployDir) {
+    $oneDriveRoot = $env:OneDrive
+    if (-not $oneDriveRoot) {
+        $oneDriveRoot = Join-Path $env:USERPROFILE "OneDrive"
+    }
+    $DeployDir = Join-Path $oneDriveRoot "Desktop\MiNERVA Browser"
+}
+if ($SkipDeploy) {
+    $DeployDir = ""
+}
 
 # --- helpers -----------------------------------------------------------------
 
