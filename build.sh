@@ -98,7 +98,17 @@ write_ok "PyInstaller, pillow, and pystray ready"
 
 write_step "Installing libtorrent (optional — enables torrent downloading)"
 if "${VENV_PIP}" install --quiet libtorrent 2>/dev/null; then
-    write_ok "libtorrent installed — torrent engine functional"
+    write_ok "libtorrent installed from pip — torrent engine functional"
+elif "${VENV_PYTHON}" -c 'import libtorrent' 2>/dev/null; then
+    write_ok "libtorrent already importable in the venv"
+elif [[ -x "${SCRIPT_DIR}/scripts/build_libtorrent_py314.sh" ]]; then
+    write_warn "No pip wheel for this Python; building bindings for 3.14 from source..."
+    if "${SCRIPT_DIR}/scripts/build_libtorrent_py314.sh"; then
+        write_ok "libtorrent built for Python 3.14 — torrent engine functional"
+    else
+        write_warn "Could not build python-libtorrent. Install libtorrent-rasterbar + boost, then retry."
+        write_warn "Browsing still works; downloads will be disabled."
+    fi
 else
     write_warn "No libtorrent binary wheel available directly from pip."
     write_warn "You can install system packages (e.g. python3-libtorrent) or continue."
