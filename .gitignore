@@ -15,8 +15,12 @@ ENV/
 # Local libtorrent source/build scratch (Python 3.14 bindings)
 vendor/libtorrent-rasterbar-*/
 vendor/ltpy-obj/
+vendor/lt-py-build/
+vendor/lt-smoke/
 vendor/lt-*.log
 vendor/*.tar.gz
+vendor/*.so
+vendor/*.so.*
 
 # Python cache & compiled bytecode
 __pycache__/
