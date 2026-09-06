@@ -11,6 +11,7 @@ A portable desktop GUI for browsing and downloading from [minerva-archive.org](h
 ### Browsing & Modern UI
 - 📁 **Two-panel layout** — category tree on the left, file listing on the right
 - 🔍 **Integrated search** — instant client-side filtering with live results and `Escape` shortcut
+- 🧾 **Filter summary & reset** — always-visible active filters plus a one-click reset
 - ⬇ / ✓ **Library status icons** — search rows show if a title is already in the download queue or already on disk (archive or extracted ISO/CHD)
 - 💊 **Interactive region pills** — click-to-filter region chips (USA, Europe, Japan, World, etc.) with active glow
 - 🏷️ **Dynamic tag filter dropdown** — compact popover menu to hide Demos, Betas, Prototypes, Unlicensed, or Hacks without consuming screen space
@@ -22,6 +23,7 @@ A portable desktop GUI for browsing and downloading from [minerva-archive.org](h
 - ✅ **Inline checkboxes & multi-select** — select multiple games then click **Queue Downloads**
 - ⚡ **Double-click** any game to queue it instantly
 - 🔄 **Download queue** with configurable concurrency (1–10 simultaneous downloads)
+- ⚙️ **Advanced downloads panel** — save folder, extract/CHD/Xbox toggles, and ROM tools (collapsed by default)
 - 📂 **Custom save folder** via the Browse button (defaults to `downloads/` next to the app)
 - 💾 **State persistence** — preferences, filters, and active/queued downloads persist across app launches
 - 🗂️ **Torrent caching** — `.torrent` files cached in `torrentfiles/` to eliminate redundant fetches
@@ -51,6 +53,7 @@ A portable desktop GUI for browsing and downloading from [minerva-archive.org](h
 - **Windows 10/11** or **Linux** (x86_64)
 - **Standalone binary:** No installation required — download from [Releases](../../releases) and run
 - **From source:** Python 3.10+ and `libtorrent` (optional, for inline downloads)
+- **Linux + Python 3.14:** there is often no PyPI wheel. `build.sh` can compile bindings if you have `g++`, `pkg-config`, **libtorrent-rasterbar**, and **Boost.Python for 3.14** (`libboost_python314`)
 
 Runtime tools are downloaded next to the app when needed (not stored in git):
 
@@ -91,6 +94,14 @@ Options:
 ./build.sh --skip-tests       # Skip running the test suite
 ```
 
+If pip has no `libtorrent` wheel (typical on CPython 3.14), the script runs `scripts/build_libtorrent_py314.sh`. That fetches libtorrent-rasterbar 2.1.1 into `vendor/` (gitignored), builds the Python extension into `.venv`, and `minerva_browser.spec` bundles the `.so` plus system `libtorrent-rasterbar` / `libboost_python314`. Browsing still works if the build fails.
+
+Smoke-test a frozen binary:
+
+```bash
+python scripts/smoke_libtorrent_bundle.py dist/MiNERVA-Browser
+```
+
 ---
 
 ## Running from Source
@@ -119,6 +130,9 @@ Local settings (`minerva_settings.json`), logs, torrents, downloads, extracted d
 ├── minerva_browser.spec       # PyInstaller standalone build configuration
 ├── build.ps1                  # Windows build automation script
 ├── build.sh                   # Linux build automation script
+├── scripts/
+│   ├── build_libtorrent_py314.sh    # Source-build python-libtorrent for 3.14
+│   └── smoke_libtorrent_bundle.py   # Check a PyInstaller binary loads libtorrent
 ├── minerva/
 │   ├── constants.py           # Paths, theme tokens, trackers, and logging
 │   ├── core/
@@ -131,7 +145,7 @@ Local settings (`minerva_settings.json`), logs, torrents, downloads, extracted d
 │       ├── theme.py           # Catppuccin palette & modern TTK style configurations
 │       ├── app.py             # Main Tkinter desktop application window
 │       └── components/
-│           ├── filter_bar.py  # Search entry, Region pills, and Tag popover
+│           ├── filter_bar.py  # Search, region pills, tags, summary, reset
 │           ├── companion_dialog.py
 │           └── tools_dialog.py# ROM tools menu & utilities modal dialog
 └── tests/
