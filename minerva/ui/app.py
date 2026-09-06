@@ -423,6 +423,7 @@ class MinervaApp(tk.Tk):
             tag_specs=self._show_tag_specs,
             tag_vars=self._show_tag_vars,
             on_filter_change=self._on_filter_change,
+            on_reset_filters=self._reset_all_filters,
         )
         self._filter_bar.pack(fill="x")
         self._search_entry = self._filter_bar.search_entry
@@ -498,11 +499,62 @@ class MinervaApp(tk.Tk):
         ).pack(side="left", padx=4)
 
         self._downloads_visible = bool(self._settings.get("downloads_panel_open", False))
-        self._downloads_frame = tk.Frame(self, bg=PANEL)
+        self._downloads_advanced = bool(self._settings.get("downloads_advanced_open", False))
+        self._max_concurrent_var = tk.IntVar(value=self._get_saved_max_concurrent())
 
-        # Row 1: Save folder path & browse
-        dir_row = tk.Frame(self._downloads_frame, bg=PANEL)
-        dir_row.pack(fill="x", padx=10, pady=(6, 2))
+        # Bottom downloads drawer (Focus layout): browse stays primary.
+        self._downloads_drawer = tk.Frame(self, bg=PANEL, highlightbackground=BORDER, highlightthickness=1)
+        self._downloads_handle = tk.Frame(self._downloads_drawer, bg=PANEL_ALT)
+        self._downloads_handle.pack(fill="x")
+
+        self._downloads_toggle_btn = ttk.Button(
+            self._downloads_handle,
+            text="📥 Downloads",
+            style="Toolbar.TButton",
+            command=self._toggle_downloads,
+        )
+        self._downloads_toggle_btn.pack(side="left", padx=(8, 4), pady=4)
+        HoverTooltip(self._downloads_toggle_btn, "Show or hide the downloads drawer (Ctrl+D)")
+
+        self._dl_summary_lbl = tk.Label(
+            self._downloads_handle,
+            text="Idle",
+            bg=PANEL_ALT,
+            fg=FG_DIM,
+            font=("TkDefaultFont", 9),
+            anchor="w",
+        )
+        self._dl_summary_lbl.pack(side="left", fill="x", expand=True, padx=(4, 8))
+
+        self._dl_advanced_btn = ttk.Button(
+            self._downloads_handle,
+            text="Advanced ▾",
+            style="Header.TButton",
+            command=self._toggle_downloads_advanced,
+        )
+        self._dl_advanced_btn.pack(side="right", padx=(0, 8), pady=4)
+        HoverTooltip(self._dl_advanced_btn, "Show CHD/Xbox/extract options and ROM tools")
+
+        self._downloads_frame = tk.Frame(self._downloads_drawer, bg=PANEL)
+
+        # Compact primary actions (always visible when drawer body is open)
+        compact_row = tk.Frame(self._downloads_frame, bg=PANEL)
+        compact_row.pack(fill="x", padx=10, pady=(6, 2))
+        for text, cmd, tip in [
+            ("▶ Start All", self._start_all_queued, "Start downloading all queued items"),
+            ("⏸ Pause / Resume", self._toggle_pause_all_active, "Toggle pause/resume on all active downloads"),
+            ("✕ Clear Finished", self._clear_completed, "Clear finished and errored items from panel"),
+            ("Open Folder", self._open_current_downloads_folder, "Open target download folder on disk (Ctrl+O)"),
+        ]:
+            b = ttk.Button(compact_row, text=text, style="Header.TButton", command=cmd)
+            b.pack(side="left", padx=(0, 4))
+            HoverTooltip(b, tip)
+
+        # Advanced section: path, options, secondary tools (collapsed by default)
+        self._dl_advanced_frame = tk.Frame(self._downloads_frame, bg=PANEL)
+
+        dir_row = tk.Frame(self._dl_advanced_frame, bg=PANEL)
+        dir_row.pack(fill="x", padx=10, pady=(4, 2))
 
         tk.Label(dir_row, text="Save to:", bg=PANEL, fg=FG_DIM,
                  font=("TkDefaultFont", 9)).pack(side="left", padx=(0, 4))
@@ -529,15 +581,13 @@ class MinervaApp(tk.Tk):
         btn_verify_hdr.pack(side="left", padx=(0, 0))
         HoverTooltip(btn_verify_hdr, "CRC-test archives already in the download folder")
 
-        # Row 2: Concurrency & options toggles (responsive wrapping)
-        opts_row = tk.Frame(self._downloads_frame, bg=PANEL)
+        opts_row = tk.Frame(self._dl_advanced_frame, bg=PANEL)
         opts_row.pack(fill="x", padx=10, pady=(2, 2))
 
         spin_frame = tk.Frame(opts_row, bg=PANEL)
         spin_frame.pack(side="left", padx=(0, 8), anchor="w")
         tk.Label(spin_frame, text="Max concurrent:", bg=PANEL, fg=FG_DIM,
                  font=("TkDefaultFont", 9)).pack(side="left", padx=(0, 4))
-        self._max_concurrent_var = tk.IntVar(value=self._get_saved_max_concurrent())
         max_spin = tk.Spinbox(spin_frame, from_=1, to=10, width=3,
                               textvariable=self._max_concurrent_var,
                               command=self._on_max_concurrent_change,
@@ -570,20 +620,15 @@ class MinervaApp(tk.Tk):
             )
             self._dl_opt_widgets.append(cb)
 
-        # Row 3: Streamlined Primary Action Buttons & ROM Tools Dropdown
-        self._dl_actions_frame = tk.Frame(self._downloads_frame, bg=PANEL)
+        self._dl_actions_frame = tk.Frame(self._dl_advanced_frame, bg=PANEL)
         self._dl_actions_frame.pack(fill="x", padx=10, pady=(2, 4))
         self._dl_action_buttons = []
 
         for text, cmd, tip in [
-            ("⏸ Pause / Resume All", self._toggle_pause_all_active, "Toggle pause/resume on all active downloads"),
-            ("▶ Start All Queued", self._start_all_queued, "Start downloading all queued items"),
             ("Start Selected", self._start_selected_queued, "Start downloading checked items in queue"),
-            ("✕ Clear Finished", self._clear_completed, "Clear finished and errored items from panel"),
             ("🔍 Verify Archives", self._verify_downloaded_archives_button_click, "CRC-test already downloaded archives"),
             ("🔑 PS3 Dkeys", self._ensure_ps3_dkeys_button_click, "Find, verify, and redownload missing PS3 disc keys"),
             ("🛠 ROM Tools ▾", self._show_rom_tools_menu, "ROM compression, verification, and disc utilities"),
-            ("Open Downloads", self._open_current_downloads_folder, "Open target download folder on disk (Ctrl+O)"),
             ("Open Extracted", self._open_current_extracted_folder, "Open folder containing extracted ROMs"),
         ]:
             b = ttk.Button(self._dl_actions_frame, text=text, style="Header.TButton", command=cmd)
@@ -592,9 +637,7 @@ class MinervaApp(tk.Tk):
             if text.startswith("🛠"):
                 self._rom_tools_btn = b
 
-        self._downloads_frame.bind("<Configure>", self._on_downloads_frame_configure)
-
-        info_row = tk.Frame(self._downloads_frame, bg=PANEL)
+        info_row = tk.Frame(self._dl_advanced_frame, bg=PANEL)
         info_row.pack(fill="x", padx=10, pady=(0, 4))
         tk.Label(
             info_row,
@@ -620,12 +663,14 @@ class MinervaApp(tk.Tk):
             length=180,
         ).pack(side="right", padx=(0, 8))
 
+        self._downloads_frame.bind("<Configure>", self._on_downloads_frame_configure)
+
         tk.Frame(self._downloads_frame, bg=SEL_BG, height=1).pack(fill="x", padx=8)
 
         dl_canvas_frame = tk.Frame(self._downloads_frame, bg=PANEL)
         dl_canvas_frame.pack(fill="both", expand=True)
         dl_canvas = tk.Canvas(dl_canvas_frame, bg=PANEL, bd=0,
-                              highlightthickness=0, height=180)
+                              highlightthickness=0, height=160)
         dl_scrollbar = ttk.Scrollbar(
             dl_canvas_frame,
             orient="vertical",
@@ -645,18 +690,6 @@ class MinervaApp(tk.Tk):
         dl_canvas.bind("<Configure>",
             lambda e: dl_canvas.itemconfig(self._dl_canvas_window, width=e.width))
 
-        self._downloads_toggle_btn = ttk.Button(
-            self,
-            text="📥 Downloads",
-            style="Toolbar.TButton",
-            command=self._toggle_downloads,
-        )
-        self._downloads_toggle_btn.pack(side="top", fill="x", padx=8, pady=(6, 0), before=self._main_paned)
-        if self._downloads_visible:
-            self._downloads_frame.pack(side="top", fill="x", pady=(6, 0), before=self._main_paned)
-
-        self._poll_downloads()
-
         self._status_var = tk.StringVar(value="")
         status_bar = ttk.Label(
             self,
@@ -666,6 +699,13 @@ class MinervaApp(tk.Tk):
             padding=(10, 5),
         )
         status_bar.pack(fill="x", side="bottom", pady=(0, 4))
+
+        # Drawer sits above the status bar so browse keeps the center of the window.
+        self._downloads_drawer.pack(fill="x", side="bottom", before=status_bar)
+        self._apply_downloads_drawer_visibility()
+        self._apply_downloads_advanced_visibility()
+
+        self._poll_downloads()
 
     def _update_breadcrumb(self):
         for w in self._breadcrumb_frame.winfo_children():
@@ -842,12 +882,16 @@ class MinervaApp(tk.Tk):
         self._status_var.set(f"{', '.join(parts)} ({total} items total)  |  {self._current_path}")
 
     def _on_search_change(self, *_):
+        if hasattr(self, "_filter_bar"):
+            self._filter_bar.refresh_summary()
         self._render_right_list()
         if getattr(self, "_search_save_after_id", None):
             self.after_cancel(self._search_save_after_id)
         self._search_save_after_id = self.after(500, self._save_settings)
 
     def _on_filter_change(self):
+        if hasattr(self, "_filter_bar"):
+            self._filter_bar.refresh_summary()
         self._render_right_list()
         self._save_settings()
 
@@ -1247,17 +1291,48 @@ class MinervaApp(tk.Tk):
         self._refresh_toggle_label()
         return True
 
-    def _toggle_downloads(self):
-        self._downloads_visible = not self._downloads_visible
+    def _apply_downloads_drawer_visibility(self):
         if self._downloads_visible:
-            self._downloads_frame.pack(side="top", fill="x", pady=(6, 0), before=self._main_paned)
+            if not self._downloads_frame.winfo_ismapped():
+                self._downloads_frame.pack(fill="both", expand=False, after=self._downloads_handle)
         else:
             self._downloads_frame.pack_forget()
+
+    def _apply_downloads_advanced_visibility(self):
+        if not hasattr(self, "_dl_advanced_frame"):
+            return
+        if self._downloads_advanced:
+            if not self._dl_advanced_frame.winfo_ismapped():
+                children = list(self._downloads_frame.pack_slaves())
+                after_widget = children[0] if children else None
+                if after_widget is not None:
+                    self._dl_advanced_frame.pack(fill="x", after=after_widget)
+                else:
+                    self._dl_advanced_frame.pack(fill="x")
+            self._dl_advanced_btn.config(text="Advanced ▴")
+        else:
+            self._dl_advanced_frame.pack_forget()
+            self._dl_advanced_btn.config(text="Advanced ▾")
+
+    def _toggle_downloads(self):
+        self._downloads_visible = not self._downloads_visible
+        self._apply_downloads_drawer_visibility()
+        self._refresh_toggle_label()
+        self._save_settings()
+
+    def _toggle_downloads_advanced(self):
+        self._downloads_advanced = not self._downloads_advanced
+        self._apply_downloads_advanced_visibility()
         self._save_settings()
 
     def _refresh_toggle_label(self):
+        if not hasattr(self, "_downloads_toggle_btn"):
+            return
+        chevron = "▴" if self._downloads_visible else "▾"
         if self._download_queue is None:
-            self._downloads_toggle_btn.config(text="📥 Downloads")
+            self._downloads_toggle_btn.config(text=f"📥 Downloads {chevron}")
+            if hasattr(self, "_dl_summary_lbl"):
+                self._dl_summary_lbl.config(text="Idle", fg=FG_DIM)
             self.title(f"MiNERVA Archive Browser v{APP_VERSION}")
             return
         snap = self._download_queue.snapshot()
@@ -1285,10 +1360,17 @@ class MinervaApp(tk.Tk):
             parts.append(f"{n_pending} queued")
         if n_done:
             parts.append(f"{n_done} done")
-        label = "📥 Downloads"
+
+        label = f"📥 Downloads {chevron}"
         if parts:
             label += "  (" + "  •  ".join(parts) + ")"
         self._downloads_toggle_btn.config(text=label)
+
+        if hasattr(self, "_dl_summary_lbl"):
+            if parts:
+                self._dl_summary_lbl.config(text=" · ".join(parts), fg=ACCENT if n_active else FG_DIM)
+            else:
+                self._dl_summary_lbl.config(text="Idle", fg=FG_DIM)
 
         if n_active > 0:
             pct = int(avg_progress * 100)
@@ -1822,6 +1904,7 @@ class MinervaApp(tk.Tk):
             "hidden_tags": hidden_tags,
             "show_regions": show_regions,
             "downloads_panel_open": bool(self._downloads_visible),
+            "downloads_advanced_open": bool(getattr(self, "_downloads_advanced", False)),
             "auto_extract_default": bool(self._auto_extract_default_var.get()),
             "delete_archive_default": bool(self._delete_archive_default_var.get()),
             "compress_ps1_chd": bool(self._compress_ps1_chd_var.get()),
@@ -3170,6 +3253,7 @@ class MinervaApp(tk.Tk):
         if hasattr(self, "_filter_bar"):
             self._filter_bar.refresh_pills()
             self._filter_bar._update_tag_btn_label()
+            self._filter_bar.refresh_summary()
         self._on_filter_change()
 
     def _focus_search(self):
