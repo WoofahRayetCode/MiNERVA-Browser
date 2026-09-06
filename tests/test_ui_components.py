@@ -68,6 +68,7 @@ class TestUIComponents(unittest.TestCase):
         tag_vars = {k: tk.BooleanVar(value=False) for k, _ in tag_specs}
         changes = []
 
+        resets = []
         fb = FilterBar(
             self.root,
             search_var=search_var,
@@ -78,12 +79,15 @@ class TestUIComponents(unittest.TestCase):
             tag_specs=tag_specs,
             tag_vars=tag_vars,
             on_filter_change=lambda: changes.append("filter"),
+            on_reset_filters=lambda: resets.append(True),
         )
 
         self.assertIsNotNone(fb.search_entry)
         self.assertIsNotNone(fb.tags_btn)
         self.assertEqual(len(fb._pills), 2)
         self.assertEqual(len(fb._wrap_pills), 3)  # All + 2 regions
+        self.assertTrue(hasattr(fb, "_summary_lbl"))
+        self.assertIn("Filters: none", fb._summary_lbl.cget("text"))
         fb.update_idletasks()
         fb._reflow_region_pills()
         placed = [p for p in fb._wrap_pills if p.winfo_manager() == "place"]
@@ -93,6 +97,7 @@ class TestUIComponents(unittest.TestCase):
         fb._hide_all_tags()
         self.assertTrue(all(v.get() for v in tag_vars.values()))
         self.assertIn("🏷 Hide Tags (2) ▾", fb.tags_btn.cget("text"))
+        self.assertIn("Hide:", fb._summary_lbl.cget("text"))
 
         fb._clear_tag_filters()
         self.assertFalse(any(v.get() for v in tag_vars.values()))
@@ -101,6 +106,15 @@ class TestUIComponents(unittest.TestCase):
         # Test region toggle
         fb._on_all_regions_click()
         self.assertFalse(all(v.get() for v in region_vars.values()))
+
+        search_var.set("zelda")
+        region_vars["usa"].set(True)
+        fb.refresh_summary()
+        self.assertIn("Search:", fb._summary_lbl.cget("text"))
+        self.assertIn("USA", fb._summary_lbl.cget("text"))
+        self.assertTrue(fb.has_active_filters())
+        fb._emit_reset_filters()
+        self.assertEqual(resets, [True])
 
         fb.destroy()
 
