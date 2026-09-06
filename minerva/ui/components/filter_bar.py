@@ -97,6 +97,7 @@ class FilterBar(tk.Frame):
         tag_specs: list[tuple[str, str]],
         tag_vars: dict[str, tk.BooleanVar],
         on_filter_change: Callable[[], None],
+        on_reset_filters: Callable[[], None] | None = None,
     ):
         super().__init__(parent, bg=BG)
         self.search_var = search_var
@@ -107,11 +108,13 @@ class FilterBar(tk.Frame):
         self.tag_specs = tag_specs
         self.tag_vars = tag_vars
         self.on_filter_change = on_filter_change
+        self.on_reset_filters = on_reset_filters
 
         self._pills: list[RegionPill] = []
         self._tag_menu: tk.Menu | None = None
 
         self._build_ui()
+        self.refresh_summary()
 
     def _build_ui(self):
         # Top Row: Integrated Search + Tag Menu Button
@@ -198,6 +201,27 @@ class FilterBar(tk.Frame):
         self._pill_wrap.bind("<Configure>", self._reflow_region_pills)
         self.after_idle(self._reflow_region_pills)
 
+        # Always-visible active filter summary (Calm density)
+        self._summary_row = tk.Frame(self, bg=PANEL_ALT, highlightbackground=BORDER, highlightthickness=1)
+        self._summary_row.pack(fill="x", padx=10, pady=(0, 6))
+        self._summary_lbl = tk.Label(
+            self._summary_row,
+            text="Filters: none",
+            bg=PANEL_ALT,
+            fg=FG_DIM,
+            font=("TkDefaultFont", 9),
+            anchor="w",
+            justify="left",
+        )
+        self._summary_lbl.pack(side="left", fill="x", expand=True, padx=(10, 8), pady=4)
+        self._reset_btn = ttk.Button(
+            self._summary_row,
+            text="Reset filters",
+            style="Toolbar.TButton",
+            command=self._emit_reset_filters,
+        )
+        self._reset_btn.pack(side="right", padx=(0, 8), pady=3)
+
     def _reflow_region_pills(self, event=None):
         wrap = getattr(self, "_pill_wrap", None)
         if wrap is None:
@@ -231,6 +255,7 @@ class FilterBar(tk.Frame):
         for var in self.region_vars.values():
             var.set(new_val)
         self.refresh_pills()
+        self.refresh_summary()
         if self.on_filter_change:
             self.on_filter_change()
 
@@ -242,6 +267,7 @@ class FilterBar(tk.Frame):
             fg=PILL_ACTIVE_FG if all_active else PILL_INACTIVE_FG,
             font=("TkDefaultFont", 9, "bold" if all_active else "normal"),
         )
+        self.refresh_summary()
         if self.on_filter_change:
             self.on_filter_change()
 
@@ -255,6 +281,7 @@ class FilterBar(tk.Frame):
         )
         for pill in self._pills:
             pill.update_style()
+        self.refresh_summary()
 
     def _update_tag_btn_label(self):
         hidden_count = sum(1 for v in self.tag_vars.values() if v.get())
@@ -262,6 +289,55 @@ class FilterBar(tk.Frame):
             self.tags_btn.configure(text=f"🏷 Hide Tags ({hidden_count}) ▾")
         else:
             self.tags_btn.configure(text="🏷 Hide Tags ▾")
+        self.refresh_summary()
+
+    def _active_filter_parts(self) -> list[str]:
+        parts: list[str] = []
+        query = (self.search_var.get() or "").strip()
+        if query:
+            parts.append(f'Search: "{query}"')
+
+        region_labels = [label for key, label in self.region_specs if self.region_vars[key].get()]
+        if region_labels and len(region_labels) < len(self.region_specs):
+            parts.append("Regions: " + ", ".join(region_labels))
+
+        hidden_labels = [label for key, label in self.tag_specs if self.tag_vars[key].get()]
+        if hidden_labels:
+            parts.append("Hide: " + ", ".join(hidden_labels))
+        return parts
+
+    def has_active_filters(self) -> bool:
+        return bool(self._active_filter_parts())
+
+    def refresh_summary(self):
+        if not hasattr(self, "_summary_lbl"):
+            return
+        parts = self._active_filter_parts()
+        if parts:
+            self._summary_lbl.configure(text=" · ".join(parts), fg=ACCENT)
+            try:
+                self._reset_btn.state(["!disabled"])
+            except tk.TclError:
+                pass
+        else:
+            self._summary_lbl.configure(text="Filters: none",
+                                       fg=FG_DIM)
+            try:
+                self._reset_btn.state(["disabled"])
+            except tk.TclError:
+                pass
+
+    def _emit_reset_filters(self):
+        if self.on_reset_filters:
+            self.on_reset_filters()
+        else:
+            self.on_clear_search()
+            self._clear_tag_filters()
+            for var in self.region_vars.values():
+                var.set(False)
+            self.refresh_pills()
+            if self.on_filter_change:
+                self.on_filter_change()
 
     def _show_tag_menu(self):
         menu = tk.Menu(self, tearoff=0, bg=PANEL_ALT, fg=FG, activebackground=SEL_BG, activeforeground=FG)
