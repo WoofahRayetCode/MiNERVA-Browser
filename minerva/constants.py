@@ -3,8 +3,11 @@ import os
 import pathlib
 import threading
 import json
+import shutil
+import time
 import traceback
 import urllib.parse
+from dataclasses import dataclass, field
 from datetime import datetime
 
 try:
@@ -17,7 +20,6 @@ GITHUB_REPO = "WoofahRayetCode/MiNERVA-Browser"
 
 BASE_URL = "https://minerva-archive.org"
 BROWSE_ROOT = "/browse/"
-HASHES_DB_URL = "https://minerva-archive.org/assets/hashes.db"
 TRACKERS = (
     "&tr=udp%3A%2F%2Ftracker.opentrackr.org%3A1337%2Fannounce"
     "&tr=udp%3A%2F%2F9.rarbg.com%3A2810%2Fannounce"
@@ -152,6 +154,22 @@ def get_settings_path() -> pathlib.Path:
     return get_runtime_base_dir() / "minerva_settings.json"
 
 
+MAX_LOG_BYTES = 5 * 1024 * 1024
+
+
+def _append_log(line: str) -> None:
+    """Append to the log, rotating to ``<log>.1`` once it passes ``MAX_LOG_BYTES``."""
+    log_path = get_error_log_path()
+    with _LOG_LOCK:
+        try:
+            if log_path.exists() and log_path.stat().st_size > MAX_LOG_BYTES:
+                os.replace(log_path, log_path.with_name(log_path.name + ".1"))
+        except OSError:
+            pass  # rotation is best effort; keep logging
+        with log_path.open("a", encoding="utf-8") as f:
+            f.write(line)
+
+
 def log_error(context: str, exc: Exception | None = None):
     try:
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -159,11 +177,7 @@ def log_error(context: str, exc: Exception | None = None):
         if exc is not None:
             lines.append(f"Exception: {repr(exc)}")
             lines.append(traceback.format_exc().rstrip())
-        line = "\n".join(lines) + "\n\n"
-        log_path = get_error_log_path()
-        with _LOG_LOCK:
-            with log_path.open("a", encoding="utf-8") as f:
-                f.write(line)
+        _append_log("\n".join(lines) + "\n\n")
     except Exception:
         pass
 
@@ -171,36 +185,116 @@ def log_error(context: str, exc: Exception | None = None):
 def log_activity(message: str):
     try:
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        line = f"[{ts}] {message}\n"
-        log_path = get_error_log_path()
-        with _LOG_LOCK:
-            with log_path.open("a", encoding="utf-8") as f:
-                f.write(line)
+        _append_log(f"[{ts}] {message}\n")
     except Exception:
         pass
 
 
-def load_app_settings() -> dict:
-    path = get_settings_path()
-    if not path.exists():
-        return {}
-    try:
-        with path.open("r", encoding="utf-8") as f:
-            data = json.load(f)
-        if isinstance(data, dict):
-            return data
+_SAVE_LOCK = threading.Lock()
+_BAK_REFRESH_SECONDS = 60.0
+_last_bak_refresh = float("-inf")  # monotonic() can be tiny right after boot
+
+
+@dataclass
+class SettingsLoadResult:
+    """Outcome of loading the settings file.
+
+    ``source`` is ``"primary"``, ``"backup"`` (primary was corrupt, ``.bak`` was used) or
+    ``"defaults"`` (nothing usable).  A corrupt primary is never deleted: it is moved to
+    ``quarantined`` so a later save cannot destroy the only copy of the user's data.
+    """
+
+    data: dict = field(default_factory=dict)
+    source: str = "defaults"
+    error: str = ""
+    quarantined: pathlib.Path | None = None
+
+
+def _backup_path(path: pathlib.Path) -> pathlib.Path:
+    return path.with_name(path.name + ".bak")
+
+
+def _read_json_object(path: pathlib.Path) -> dict:
+    with path.open("r", encoding="utf-8") as f:
+        data = json.load(f)
+    if not isinstance(data, dict):
         raise ValueError("Settings file must contain a JSON object")
+    return data
+
+
+def replace_with_retry(src: pathlib.Path, dst: pathlib.Path, attempts: int = 4):
+    """``os.replace`` with short retries: on Windows AV/indexers briefly lock the target."""
+    for attempt in range(attempts):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if attempt == attempts - 1:
+                raise
+            time.sleep(0.05 * (attempt + 1))
+
+
+def load_app_settings_ex(path: pathlib.Path | None = None) -> SettingsLoadResult:
+    path = path or get_settings_path()
+    if not path.exists():
+        return SettingsLoadResult()
+    try:
+        return SettingsLoadResult(data=_read_json_object(path), source="primary")
     except Exception as e:
         log_error(f"load_app_settings failed for {path}", e)
-        return {}
-
-
-def save_app_settings(settings: dict):
-    path = get_settings_path()
-    tmp_path = path.with_suffix(".tmp")
+        result = SettingsLoadResult(error=repr(e))
+    quarantine = path.with_name(f"{path.stem}.corrupt-{datetime.now():%Y%m%d-%H%M%S}{path.suffix}")
     try:
-        with tmp_path.open("w", encoding="utf-8") as f:
-            json.dump(settings, f, indent=2, ensure_ascii=False)
-        tmp_path.replace(path)
+        replace_with_retry(path, quarantine)
+        result.quarantined = quarantine
+        log_activity(f"settings: corrupt file moved to {quarantine}")
     except Exception as e:
-        log_error(f"save_app_settings failed for {path}", e)
+        log_error(f"load_app_settings could not quarantine {path}", e)
+    bak = _backup_path(path)
+    if bak.exists():
+        try:
+            result.data = _read_json_object(bak)
+            result.source = "backup"
+            log_activity(f"settings: restored from {bak}")
+        except Exception as e:
+            log_error(f"load_app_settings backup unreadable: {bak}", e)
+    return result
+
+
+def load_app_settings() -> dict:
+    return load_app_settings_ex().data
+
+
+def save_app_settings(settings: dict, path: pathlib.Path | None = None) -> bool:
+    """Atomically write ``settings``; returns False (and logs) on failure.
+
+    Unique temp file + fsync + ``os.replace`` so a crash or power loss leaves either the
+    old or the new file intact.  The previous valid file is copied to ``.bak`` at most once
+    a minute (and on the first save of a session) so a corrupted primary can be recovered.
+    """
+    global _last_bak_refresh
+    path = path or get_settings_path()
+    tmp_path = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    with _SAVE_LOCK:
+        try:
+            with tmp_path.open("w", encoding="utf-8") as f:
+                json.dump(settings, f, indent=2, ensure_ascii=False)
+                f.flush()
+                os.fsync(f.fileno())
+            now = time.monotonic()
+            if path.exists() and (now - _last_bak_refresh >= _BAK_REFRESH_SECONDS):
+                try:
+                    _read_json_object(path)  # only back up a file that actually parses
+                    shutil.copy2(path, _backup_path(path))
+                    _last_bak_refresh = now
+                except Exception as e:
+                    log_error(f"save_app_settings backup skipped for {path}", e)
+            replace_with_retry(tmp_path, path)
+            return True
+        except Exception as e:
+            log_error(f"save_app_settings failed for {path}", e)
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+            return False

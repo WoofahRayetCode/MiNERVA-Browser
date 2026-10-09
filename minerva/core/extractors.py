@@ -1,4 +1,5 @@
 import bz2
+import functools
 import gzip
 import lzma
 import os
@@ -1204,12 +1205,19 @@ _BLOCKED_COMPANION_NAMES = {
 _DISC_RESTORE_SUFFIXES = {".iso", ".cue", ".gdi", ".toc", ".ccd", ".mds", ".mdf", ".nrg", ".img"}
 
 
-def _match_keys_for_name(name: str) -> set[str]:
+@functools.lru_cache(maxsize=32768)
+def _match_keys_for_name(name: str) -> frozenset[str]:
+    """Lowercased stem + cleaned stem used to match a release across file names.
+
+    Cached (and returned as a frozenset so the cached value can't be mutated): the
+    regex-heavy normalisation used to be re-run for every browse row on every
+    download-panel tick.
+    """
     stem = pathlib.Path(name).stem
     cleaned = normalize_chd_stem(stem) or stem
     keys = {stem.lower().strip(), cleaned.lower().strip()}
     keys.discard("")
-    return keys
+    return frozenset(keys)
 
 
 def names_refer_to_same_rom(left: str, right: str) -> bool:
@@ -1642,28 +1650,53 @@ def collect_library_match_keys(root: pathlib.Path) -> set[str]:
     return keys
 
 
+@functools.lru_cache(maxsize=32768)
+def library_keys_for_name(name: str) -> frozenset[str]:
+    """All keys under which a browse/queue row name can match the library."""
+    if not name:
+        return frozenset()
+    keys = {name.lower()} | _match_keys_for_name(name)
+    keys.discard("")
+    return frozenset(keys)
+
+
+def queued_match_keys(queued_names) -> frozenset[str]:
+    """Union of :func:`library_keys_for_name` over the queued names (compute once per refresh)."""
+    keys: set[str] = set()
+    for qn in queued_names:
+        if qn:
+            keys |= library_keys_for_name(qn)
+    return frozenset(keys)
+
+
+def status_from_keys(
+    keys: frozenset[str],
+    queued_keys,
+    library_keys,
+) -> str:
+    """Return 'downloaded', 'queued', or '' for precomputed row keys (two set intersections)."""
+    if not keys:
+        return ""
+    if not keys.isdisjoint(library_keys):
+        return "downloaded"
+    if not keys.isdisjoint(queued_keys):
+        return "queued"
+    return ""
+
+
 def library_status_for_name(
     name: str,
     queued_names: set[str],
     library_keys: set[str],
 ) -> str:
-    """Return 'downloaded', 'queued', or '' for a browse/search row name."""
-    if not name:
-        return ""
-    keys = {name.lower()} | _match_keys_for_name(name)
-    keys.discard("")
-    if keys & library_keys:
-        return "downloaded"
-    queued_keys: set[str] = set()
-    for qn in queued_names:
-        if not qn:
-            continue
-        queued_keys.add(qn.lower())
-        queued_keys |= _match_keys_for_name(qn)
-    queued_keys.discard("")
-    if keys & queued_keys:
-        return "queued"
-    return ""
+    """Return 'downloaded', 'queued', or '' for a browse/search row name.
+
+    Convenience wrapper; hot paths should precompute :func:`queued_match_keys` once and
+    call :func:`status_from_keys` per row.
+    """
+    return status_from_keys(
+        library_keys_for_name(name), queued_match_keys(queued_names), library_keys
+    )
 
 
 def collect_downloaded_archives(
