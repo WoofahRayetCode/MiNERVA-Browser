@@ -36,11 +36,13 @@ htmlcov/
 
 # Runtime data and caches (generated locally by the app)
 torrentfiles/
+resume/
 downloads/
 extracted/
 dkeys/
 *.log
 minerva_settings.json
+minerva_settings.corrupt-*.json
 minerva_error.log
 activity_log*.txt
 startup_cleanup_debug.txt

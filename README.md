@@ -22,14 +22,20 @@ A portable desktop GUI for browsing and downloading from [minerva-archive.org](h
 ### Downloading
 - ✅ **Inline checkboxes & multi-select** — select multiple games then click **Queue Downloads**
 - ⚡ **Double-click** any game to queue it instantly
-- 🔄 **Download queue** with configurable concurrency (1–10 simultaneous downloads)
+- 🔄 **Download queue** with configurable concurrency (1–10 simultaneous downloads), tested with 10,000 queued items
+- 📋 **Downloads list** — one scalable table (name, size, progress, speed, ETA, peers, status) with **All / Active / Queued / Done / Errors** filters, multi-select, right-click menu, and keyboard control (`Space` pause/resume, `Del` cancel/remove, `R` retry, `Alt+↑/↓` reorder, `Ctrl+A`, `Enter` open folder)
+- 🔁 **Automatic retry** — stalled or failed downloads wait out a backoff (30 s, 2 min, 10 min) and retry before being reported as errors; failed items show the real reason and a **Retry** action
+- 🔌 **Resumes after a crash or restart** — libtorrent resume data and DHT state are saved periodically and on exit, so partial downloads continue without a full re-check
+- 🌱 **Optional seeding** — "Seed finished files" (off by default) keeps finished torrents alive until ratio 1.0 or 24 hours
 - ⚙️ **Advanced downloads panel** — save folder, extract/CHD/Xbox toggles, and ROM tools (collapsed by default)
 - 📂 **Custom save folder** via the Browse button (defaults to `downloads/` next to the app)
 - 💾 **State persistence** — preferences, filters, and active/queued downloads persist across app launches
-- 🗂️ **Torrent caching** — `.torrent` files cached in `torrentfiles/` to eliminate redundant fetches
-- 🚫 **Deduplication** — automatically skips items already pending, active, or completed
+- 🗂️ **Torrent caching** — each *collection* `.torrent` is fetched once (not once per file), validated, and cached in `torrentfiles/`
+- 🚫 **Deduplication** — automatically skips items already pending, active, completed, or being looked up
+- 🛡️ **Hardened I/O** — HTTP requests retry with backoff and honour `Retry-After`; settings are written atomically with a `.bak` and a corrupt file is quarantined, never overwritten
+- 💽 **Disk-space check** — a download that cannot fit is refused up front; a full disk mid-download pauses it with a clear "Disk full" state
 - 📦 **DLC / update matching** — after queueing a game, offers matching DLC and updates from the same folder or related digital/PSN/CDN collections (select, download all, or skip)
-- 📊 **Real-time metrics** — speed, ETA, progress bars, and state tracking without text clipping
+- 📊 **Real-time metrics** — speed, ETA, peers, progress, and state for every download
 
 ### Extraction, CHD, and Xbox dumps
 - 📦 **Auto-extract** — extract archives automatically once download finishes
@@ -134,29 +140,41 @@ Local settings (`minerva_settings.json`), logs, torrents, downloads, extracted d
 │   ├── build_libtorrent_py314.sh    # Source-build python-libtorrent for 3.14
 │   └── smoke_libtorrent_bundle.py   # Check a PyInstaller binary loads libtorrent
 ├── minerva/
-│   ├── constants.py           # Paths, theme tokens, trackers, and logging
+│   ├── constants.py           # Paths, theme tokens, trackers, logging, atomic settings I/O
 │   ├── core/
-│   │   ├── sqlite_http.py     # HTTP range SQLite reader & web parser
-│   │   ├── torrent_engine.py  # libtorrent session engine & DownloadQueue
+│   │   ├── torrent_engine.py  # libtorrent engine: one torrent per collection, many downloads per torrent
+│   │   ├── lt_settings.py     # Validated libtorrent session settings + alert mask
+│   │   ├── download_queue.py  # Pending/active/retry/done queue (O(1) lookups, backoff, reorder)
+│   │   ├── resume_store.py    # Resume data + DHT state persistence
+│   │   ├── http.py            # Retrying HTTP client, rate gate, atomic file writes
+│   │   ├── torrent_cache.py   # Single-flight, validated collection .torrent cache
+│   │   ├── lookup.py          # ROM page → verified torrent source, aggregated errors
+│   │   ├── library_index.py   # Background "already downloaded" index
+│   │   ├── entries.py         # Per-listing precompute (regions, tags, sizes, match keys)
+│   │   ├── download_view.py   # Row formatting for the downloads list (Tk-free)
+│   │   ├── settings_writer.py # Background, latest-wins settings writer
+│   │   ├── pathsafe.py        # Safe file names for network-supplied names
+│   │   ├── sqlite_http.py     # Directory-listing and ROM-page parsers (HTTP)
 │   │   ├── extractors.py      # Archives, CHD, Xbox ISO classify/unpack
 │   │   ├── companions.py      # DLC / update matching
 │   │   └── ps3_dkeys.py       # Redump PS3 disc-key catalog matching
 │   └── ui/
 │       ├── theme.py           # Catppuccin palette & modern TTK style configurations
 │       ├── app.py             # Main Tkinter desktop application window
+│       ├── downloads_panel.py # Treeview-based downloads list
 │       └── components/
 │           ├── filter_bar.py  # Search, region pills, tags, summary, reset
 │           ├── companion_dialog.py
 │           └── tools_dialog.py# ROM tools menu & utilities modal dialog
-└── tests/
-    ├── test_sqlite_http.py
-    ├── test_parsers.py
-    ├── test_extractors.py     # ROM detection, CHD, Xbox ISO classify/unpack
-    ├── test_download_queue.py
-    ├── test_companions.py
-    ├── test_ps3_dkeys.py
-    ├── test_ui_components.py
-    └── test_assets.py
+└── tests/                     # stdlib unittest; engine tests run a real localhost libtorrent seeder
+    ├── test_engine_transfer.py        # shared torrents, cancel/pause, magnets, resume, seeding, stalls
+    ├── test_app_engine_integration.py # real window + real engine + real transfer
+    ├── test_app_smoke.py              # headless window: scale, debounce, bulk queue, polling
+    ├── test_downloads_panel.py        # 5k-row panel budgets, filters, key handling
+    ├── test_download_queue*.py        # queue behaviour incl. 10k-item scale tests
+    ├── test_http.py / test_torrent_cache.py / test_lookup.py
+    ├── test_extractors.py / test_companions.py / test_ps3_dkeys.py / test_parsers.py
+    └── …                              # settings, library index, entries, view model, assets
 ```
 
 ---
@@ -165,9 +183,9 @@ Local settings (`minerva_settings.json`), logs, torrents, downloads, extracted d
 
 MiNERVA distributes all files via BitTorrent:
 
-1. Looks up the selected file in `hashes.db` (fetched via HTTP range requests — no full DB download needed)
-2. Downloads the collection `.torrent` file into `torrentfiles/`
-3. Instructs libtorrent to download only the selected file within that torrent (`so_id` file priority)
+1. Looks up the selected file on its minerva-archive.org `/rom?id=…` page to find its collection torrent and file index (a bounded pool of workers, rate-limited and retried)
+2. Fetches the collection `.torrent` once into `torrentfiles/` and verifies that the file index really is the requested file
+3. Adds the collection to libtorrent **once** and downloads only the selected files within it; several queued files from one collection share one torrent, and cancelling one never disturbs the others. Files land directly in your save folder (no collection sub-folders)
 4. Optionally extracts the file using detected extractors (7-Zip / PeaZip / WinRAR / zipfile)
 5. Optionally converts supported disc images to CHD and cleans up input files
 6. Optionally unpacks Xbox / Xbox 360 ISOs with xdvdfs (or extract-xiso) into a folder with `default.xex` for a modded console, with a live dump progress bar

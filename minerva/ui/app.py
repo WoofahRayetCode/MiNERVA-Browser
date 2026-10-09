@@ -13,7 +13,6 @@ import subprocess
 import re
 import time
 import zipfile
-import hashlib
 import json
 import os
 
@@ -22,7 +21,6 @@ from minerva.constants import (
     GITHUB_REPO,
     BASE_URL,
     BROWSE_ROOT,
-    TRACKERS,
     BG,
     PANEL,
     ACCENT,
@@ -37,7 +35,6 @@ from minerva.constants import (
     get_icon_png_path,
     get_icon_ico_path,
     load_app_settings,
-    save_app_settings,
     log_error,
     log_activity,
     winreg,
@@ -53,6 +50,7 @@ from minerva.ui.theme import (
     BORDER,
 )
 from minerva.ui.components.filter_bar import FilterBar
+from minerva.ui.downloads_panel import DownloadsPanel, PanelActions
 from minerva.ui.components.tools_dialog import ToolsMenu, ToolsDialog
 from minerva.ui.components.companion_dialog import prompt_companions
 from minerva.core.sqlite_http import fetch_entries, fetch_rom_info, extract_rom_id
@@ -69,6 +67,19 @@ from minerva.core.ps3_dkeys import (
     is_dkey_save_path,
     is_ps3_iso_browse_path,
 )
+from minerva.core.entries import detect_regions, detect_release_tags, enrich_entries, parse_size_bytes
+from minerva.core.library_index import LibraryIndex
+from minerva.core.pathsafe import is_safe_leaf_name
+from minerva.core.settings_writer import AsyncSettingsWriter
+from minerva.core.workers import DaemonPool
+from minerva.core.lookup import (
+    LookupErrors,
+    LookupFailure,
+    QueuedDownload,
+    RomResolver,
+    strip_default_trackers,
+)
+from minerva.core.torrent_cache import TorrentCache
 from minerva.core.torrent_engine import (
     TorrentEngine,
     DownloadQueue,
@@ -92,8 +103,8 @@ from minerva.core.extractors import (
     verify_extracted_output,
     is_archive_path,
     collect_downloaded_archives,
-    collect_library_match_keys,
-    library_status_for_name,
+    library_keys_for_name,
+    status_from_keys,
     verify_archive,
     ArchiveVerificationError,
     chd_source_mode,
@@ -109,31 +120,6 @@ from minerva.core.extractors import (
     chd_companions_safe_to_delete,
 )
 
-
-def _parse_size_bytes(size_str: str) -> int:
-    """Convert human readable size string (e.g. '1.5 GB', '250 MB') to bytes."""
-    if not isinstance(size_str, str) or not size_str.strip():
-        return 0
-    s = size_str.strip().upper()
-    try:
-        parts = s.split()
-        if len(parts) == 2:
-            num = float(parts[0])
-            unit = parts[1]
-            multipliers = {
-                "B": 1,
-                "KB": 1024,
-                "MB": 1024**2,
-                "GB": 1024**3,
-                "TB": 1024**4,
-                "KIB": 1024,
-                "MIB": 1024**2,
-                "GIB": 1024**3,
-            }
-            return int(num * multipliers.get(unit, 1))
-        return int(float(s))
-    except Exception:
-        return 0
 
 
 def _format_speed(bps: float) -> str:
@@ -228,6 +214,7 @@ class MinervaApp(tk.Tk):
         self._offer_companions_var = tk.BooleanVar(
             value=bool(self._settings.get("offer_companions", True))
         )
+        self._seed_var = tk.BooleanVar(value=bool(self._settings.get("seed_after_download", False)))
         self._companion_dialog_open = False
         self._companion_prompt_queue: queue.Queue = queue.Queue()
         self._launch_in_tray = bool(self._start_minimized_var.get()) or "--minimized" in sys.argv
@@ -298,22 +285,37 @@ class MinervaApp(tk.Tk):
         self._verify_extracted_in_progress = False
         self._ensure_dkeys_in_progress = False
         self._download_history: dict[str, dict] = self._load_download_history()
-        self._queued_selected_ids: set[str] = set()
         self._left_loaded_nodes: set[str] = set()
         self._left_loading_nodes: set[str] = set()
-        self._dl_speed_samples: dict[str, tuple[int, float]] = {}
         self._chd_download_in_progress = False
         self._chd_compress_in_progress = False
         self._chd_repair_in_progress = False
         self._xbox_tool_download_in_progress = False
         self._xbox_unpack_in_progress = False
-        self._dl_active_widgets: dict[str, dict] = {}
-        self._dl_queued_widgets: dict[str, dict] = {}
-        self._library_keys_cache: set[str] | None = None
-        self._library_keys_cache_dir: str | None = None
+        self._quitting = False
+        self._extract_refresh_pending = False
+        self._nav_generation = 0
+        self._search_silenced = False
+        self._render_after_id = None
+        self._settings_writer = AsyncSettingsWriter()
+        self._library_index = LibraryIndex()
+        self._row_keys: dict[str, frozenset] = {}
+        self._row_status: dict[str, str] = {}
+        self._icon_state: tuple | None = None
+        self._icon_refresh_after_id = None
+        self._library_rescan_after_id = None
+        self._poll_error_logged_at = 0.0
+        self._poll_after_id = None
+        self._lookup_pool = DaemonPool(5, "lookup")
+        self._lookup_lock = threading.Lock()
+        self._lookup_pending = 0
+        self._lookup_results: queue.SimpleQueue = queue.SimpleQueue()
+        self._lookup_errors = LookupErrors()
+        self._lookup_pump_after_id = None
+        self._torrent_cache = TorrentCache(get_torrent_dir())
+        self._rom_resolver = RomResolver(self._torrent_cache, fetch_rom_info)
         self._dlstat_tip_window = None
         self._dlstat_tip_text = ""
-        self._dl_done_widgets: dict[str, dict] = {}
         self._checked_hrefs: set[str] = set()
         self._sort_column = "name"
         self._sort_reverse = False
@@ -345,7 +347,7 @@ class MinervaApp(tk.Tk):
         self._navigate(saved_last_path, preserve_search=True, restore_query=saved_last_query)
         if getattr(self, "_launch_in_tray", False):
             self._minimize_to_tray()
-        self.after(100, self._run_startup_cleanup)
+        self.after(100, self._start_startup_cleanup)
         self.after(2500, self._check_for_updates_async)
 
     def _setup_styles(self):
@@ -607,6 +609,7 @@ class MinervaApp(tk.Tk):
             ("Autostart", self._autostart_var, self._on_startup_settings_change),
             ("Start minimized to tray", self._start_minimized_var, self._on_startup_settings_change),
             ("Offer DLC / updates", self._offer_companions_var, self._on_extract_defaults_change),
+            ("Seed finished files", self._seed_var, self._on_seed_setting_change),
         ]:
             cb = tk.Checkbutton(
                 self._dl_opts_container,
@@ -667,28 +670,8 @@ class MinervaApp(tk.Tk):
 
         tk.Frame(self._downloads_frame, bg=SEL_BG, height=1).pack(fill="x", padx=8)
 
-        dl_canvas_frame = tk.Frame(self._downloads_frame, bg=PANEL)
-        dl_canvas_frame.pack(fill="both", expand=True)
-        dl_canvas = tk.Canvas(dl_canvas_frame, bg=PANEL, bd=0,
-                              highlightthickness=0, height=160)
-        dl_scrollbar = ttk.Scrollbar(
-            dl_canvas_frame,
-            orient="vertical",
-            style="Visible.Vertical.TScrollbar",
-            command=dl_canvas.yview
-        )
-        dl_scrollbar.pack(side="right", fill="y")
-        dl_canvas.pack(side="left", fill="both", expand=True)
-        dl_canvas.configure(yscrollcommand=dl_scrollbar.set)
-
-        self._dl_inner = tk.Frame(dl_canvas, bg=PANEL)
-        self._dl_canvas_window = dl_canvas.create_window(
-            (0, 0), window=self._dl_inner, anchor="nw"
-        )
-        self._dl_inner.bind("<Configure>",
-            lambda e: dl_canvas.configure(scrollregion=dl_canvas.bbox("all")))
-        dl_canvas.bind("<Configure>",
-            lambda e: dl_canvas.itemconfig(self._dl_canvas_window, width=e.width))
+        self._downloads_panel = DownloadsPanel(self._downloads_frame, self._build_panel_actions())
+        self._downloads_panel.pack(fill="both", expand=True)
 
         self._status_var = tk.StringVar(value="")
         status_bar = ttk.Label(
@@ -844,28 +827,38 @@ class MinervaApp(tk.Tk):
 
     def _navigate(self, path, preserve_search=False, restore_query=""):
         self._current_path = path
-        if preserve_search:
-            self._search_var.set(restore_query)
-        else:
-            self._search_var.set("")
+        self._nav_generation += 1
+        generation = self._nav_generation
+        self._cancel_pending_render()
+        # Clearing the box would otherwise render the *old* folder's entries once more.
+        self._search_silenced = True
+        try:
+            self._search_var.set(restore_query if preserve_search else "")
+        finally:
+            self._search_silenced = False
+        if hasattr(self, "_filter_bar"):
+            self._filter_bar.refresh_summary()
         self._update_breadcrumb()
         self._set_loading(True)
         self._right_tree.delete(*self._right_tree.get_children())
+        self._reset_row_status()
         self._checked_hrefs.clear()
         self._status_var.set("Loading\u2026")
 
         def worker():
             try:
-                entries = fetch_entries(path)
-                self.after(0, lambda: self._populate_right(entries))
+                entries = enrich_entries(fetch_entries(path))
+                self.after(0, lambda: self._populate_right(entries, generation))
             except Exception as e:
                 log_error(f"MinervaApp._navigate failed for path={path}", e)
-                self.after(0, lambda err=e: self._show_error(str(err)))
+                self.after(0, lambda err=e: self._show_error(str(err), generation))
 
         threading.Thread(target=worker, daemon=True).start()
         self._save_settings()
 
-    def _populate_right(self, entries):
+    def _populate_right(self, entries, generation: int | None = None):
+        if generation is not None and generation != self._nav_generation:
+            return  # a newer navigation superseded this response
         self._set_loading(False)
         self._all_entries = entries
         self._render_right_list()
@@ -881,10 +874,21 @@ class MinervaApp(tk.Tk):
         total = len(entries)
         self._status_var.set(f"{', '.join(parts)} ({total} items total)  |  {self._current_path}")
 
+    SEARCH_DEBOUNCE_MS = 150
+
+    def _cancel_pending_render(self):
+        if self._render_after_id is not None:
+            self.after_cancel(self._render_after_id)
+            self._render_after_id = None
+
     def _on_search_change(self, *_):
+        if self._search_silenced:
+            return
         if hasattr(self, "_filter_bar"):
             self._filter_bar.refresh_summary()
-        self._render_right_list()
+        # Re-filtering thousands of rows per keystroke made typing laggy; wait for a pause.
+        self._cancel_pending_render()
+        self._render_after_id = self.after(self.SEARCH_DEBOUNCE_MS, self._render_right_list)
         if getattr(self, "_search_save_after_id", None):
             self.after_cancel(self._search_save_after_id)
         self._search_save_after_id = self.after(500, self._save_settings)
@@ -896,23 +900,33 @@ class MinervaApp(tk.Tk):
         self._save_settings()
 
     def _render_right_list(self):
+        self._cancel_pending_render()
         query = self._search_var.get().lower()
-        filtered = [e for e in self._all_entries if self._entry_matches_filters(e, query)]
+        selected_tags, selected_regions = self._selected_filter_keys()
+        filtered = [
+            e for e in self._all_entries
+            if self._entry_matches_filters(e, query, selected_tags, selected_regions)
+        ]
         visible_files = [e for e in filtered if not e.get("is_folder", False)]
 
         # Apply column sorting
         if self._sort_column == "size":
             visible_files.sort(
-                key=lambda e: _parse_size_bytes(e.get("size", "")),
+                key=lambda e: e["size_bytes"] if "size_bytes" in e else parse_size_bytes(e.get("size", "")),
                 reverse=self._sort_reverse
             )
         else:
             visible_files.sort(
-                key=lambda e: e.get("name", "").lower(),
+                key=lambda e: e.get("lname") or e.get("name", "").lower(),
                 reverse=self._sort_reverse
             )
 
         self._right_tree.delete(*self._right_tree.get_children())
+        self._reset_row_status()
+        # Queue/disk keys are computed once per render, not once per row.
+        queued_keys = self._queued_keys()
+        disk_keys = self._on_disk_library_keys()
+        self._icon_state = (queued_keys, disk_keys)
         visible_hrefs = {e["href"] for e in visible_files}
         self._checked_hrefs.intersection_update(visible_hrefs)
         seen_hrefs = set()
@@ -921,7 +935,10 @@ class MinervaApp(tk.Tk):
                 continue
             seen_hrefs.add(e["href"])
             icon = "📄 "
-            status = self._library_status_for_name(e["name"])
+            row_keys = e.get("keys") or library_keys_for_name(e["name"])
+            status = status_from_keys(row_keys, queued_keys, disk_keys)
+            self._row_keys[e["href"]] = row_keys
+            self._row_status[e["href"]] = status
             status_icon = {"downloaded": "✓", "queued": "⬇"}.get(status, "")
             tags = ("file", status) if status else ("file",)
             self._right_tree.insert("", "end", iid=e["href"],
@@ -931,11 +948,7 @@ class MinervaApp(tk.Tk):
                 self._right_tree.set(e["href"], "check", "✓")
 
         if not visible_files:
-            has_filter = (
-                bool(query)
-                or any(v.get() for v in self._show_tag_vars.values())
-                or any(v.get() for v in self._show_region_vars.values())
-            )
+            has_filter = bool(query) or bool(selected_tags) or bool(selected_regions)
             if has_filter and self._all_entries:
                 self._right_tree.insert(
                     "", "end", iid="__empty_state__",
@@ -946,107 +959,41 @@ class MinervaApp(tk.Tk):
         self._update_sel_bar()
         self._update_status(visible_files)
 
-    def _entry_matches_filters(self, entry: dict, query: str) -> bool:
-        name = entry.get("name", "")
-        low = name.lower()
+    def _selected_filter_keys(self) -> tuple[set[str], set[str]]:
+        """Checked tag/region filters; read the Tk variables once per render, not once per row."""
+        tags = {key for key, var in self._show_tag_vars.items() if var.get()}
+        regions = {key for key, var in self._show_region_vars.items() if var.get()}
+        return tags, regions
+
+    def _entry_matches_filters(self, entry: dict, query: str,
+                               selected_tags: set[str] | None = None,
+                               selected_regions: set[str] | None = None) -> bool:
+        if selected_tags is None or selected_regions is None:
+            selected_tags, selected_regions = self._selected_filter_keys()
+        low = entry.get("lname")
+        if low is None:
+            low = entry.get("name", "").lower()
         if query and query not in low:
             return False
 
         if not entry.get("is_folder", False):
-            selected_tags = {key for key, var in self._show_tag_vars.items() if var.get()}
-            selected_regions = {key for key, var in self._show_region_vars.items() if var.get()}
-
             if selected_tags:
-                tags = self._detect_release_tags(low)
-                if tags.intersection(selected_tags):
+                tags = entry.get("tags")
+                if tags is None:
+                    tags = self._detect_release_tags(low)
+                if not tags.isdisjoint(selected_tags):
                     return False
             if selected_regions:
-                regions = self._detect_regions(low)
-                if not regions.intersection(selected_regions):
+                regions = entry.get("regions")
+                if regions is None:
+                    regions = self._detect_regions(low)
+                if regions.isdisjoint(selected_regions):
                     return False
 
         return True
 
-    @staticmethod
-    def _detect_release_tags(name_lower: str) -> set[str]:
-        tags = set()
-        if "(demo" in name_lower or " demo" in name_lower:
-            tags.add("demo")
-        if "(beta" in name_lower or " beta" in name_lower:
-            tags.add("beta")
-        if "(rev" in name_lower or "(revision" in name_lower:
-            tags.add("revision")
-        if "(proto" in name_lower or "prototype" in name_lower:
-            tags.add("proto")
-        if "(unl" in name_lower or "unlicensed" in name_lower:
-            tags.add("unlicensed")
-        if "(hack" in name_lower or "hack)" in name_lower:
-            tags.add("hack")
-        if "(translation" in name_lower or "(t+" in name_lower:
-            tags.add("translation")
-        return tags
-
-    @staticmethod
-    def _detect_regions(name_lower: str) -> set[str]:
-        regions = set()
-
-        def has_any(*needles: str) -> bool:
-            return any(n in name_lower for n in needles)
-
-        if has_any("(usa", "(us", "(u)", "usa/", "/usa", "usa,"):
-            regions.add("usa")
-        if has_any("(europe", "(eu", "(e)", "europe/", "/europe", "europe,"):
-            regions.add("europe")
-        if has_any("(japan", "(jp", "(j)", "japan/", "/japan", "japan,"):
-            regions.add("japan")
-        if has_any("(world", "(w)", "(global"):
-            regions.add("world")
-        if has_any("(asia", "(a)"):
-            regions.add("asia")
-        if has_any("(korea", "(kr", "(k)"):
-            regions.add("korea")
-        if has_any("(china", "(cn", "(c)"):
-            regions.add("china")
-        if has_any("(australia", "(au"):
-            regions.add("australia")
-        if has_any("(canada", "(ca"):
-            regions.add("canada")
-        if has_any("(brazil", "(br"):
-            regions.add("brazil")
-        if has_any("(france", "(fr", "(f)"):
-            regions.add("france")
-        if has_any("(germany", "(de", "(g)"):
-            regions.add("germany")
-        if has_any("(italy", "(it", "(i)"):
-            regions.add("italy")
-        if has_any("(spain", "(es", "(s)"):
-            regions.add("spain")
-        if has_any("(netherlands", "(nl"):
-            regions.add("netherlands")
-        if has_any("(sweden", "(se", "(sw)"):
-            regions.add("sweden")
-        if has_any("(russia", "(ru"):
-            regions.add("russia")
-        if has_any("(taiwan", "(tw"):
-            regions.add("taiwan")
-        if has_any("(hong kong", "(hk"):
-            regions.add("hong_kong")
-
-        for grp in re.findall(r"\(([^)]*)\)", name_lower):
-            compact = re.sub(r"[^a-z]", "", grp)
-            if compact in {"u", "e", "j", "w", "ue", "uj", "uw", "ej", "ew", "jw", "uej", "uew", "ujw", "ejw", "uejw"}:
-                if "u" in compact:
-                    regions.add("usa")
-                if "e" in compact:
-                    regions.add("europe")
-                if "j" in compact:
-                    regions.add("japan")
-                if "w" in compact:
-                    regions.add("world")
-
-        if not regions:
-            regions.add("other")
-        return regions
+    _detect_release_tags = staticmethod(detect_release_tags)
+    _detect_regions = staticmethod(detect_regions)
 
     def _download_single_entry(self, entry: dict):
         if not _LT_AVAILABLE:
@@ -1064,12 +1011,7 @@ class MinervaApp(tk.Tk):
         file_name = entry["name"]
         save_path = self.get_download_dir()
         browse_path = self._current_path
-        download_id = str(uuid.uuid4())
-        threading.Thread(
-            target=self._lookup_and_enqueue,
-            args=(download_id, rom_id, file_name, save_path, browse_path),
-            daemon=True,
-        ).start()
+        self._submit_lookup(str(uuid.uuid4()), rom_id, file_name, save_path, browse_path)
         if not self._downloads_visible:
             self._toggle_downloads()
 
@@ -1141,10 +1083,12 @@ class MinervaApp(tk.Tk):
             return None
         if self._torrent_engine is None:
             try:
-                self._torrent_engine = TorrentEngine()
+                self._torrent_engine = TorrentEngine(state_dir=get_runtime_base_dir() / "resume")
+                self._torrent_engine.set_seeding(bool(self._seed_var.get()))
                 self._download_queue = DownloadQueue(
                     self._torrent_engine,
-                    max_active=self._get_current_max_concurrent()
+                    max_active=self._get_current_max_concurrent(),
+                    key_fn=library_keys_for_name,
                 )
             except Exception as e:
                 log_error("MinervaApp.get_torrent_engine failed to start engine", e)
@@ -1165,7 +1109,7 @@ class MinervaApp(tk.Tk):
             self._download_queue.enqueue(download_id, name, source, so_id, save_path)
             self._remember_download(name, source, so_id, save_path)
             self._save_settings()
-            self.after(0, self._refresh_library_status_icons)
+            self._request_icon_refresh()
         if not self._downloads_visible:
             self._toggle_downloads()
 
@@ -1192,7 +1136,7 @@ class MinervaApp(tk.Tk):
                 continue
             history[name] = {
                 "name": name,
-                "source": source,
+                "source": strip_default_trackers(source),
                 "so_id": so_id,
                 "save_path": save_path,
             }
@@ -1317,6 +1261,8 @@ class MinervaApp(tk.Tk):
     def _toggle_downloads(self):
         self._downloads_visible = not self._downloads_visible
         self._apply_downloads_drawer_visibility()
+        if self._downloads_visible and self._download_queue is not None:
+            self._rebuild_dl_panel(self._download_queue.snapshot())  # skipped while collapsed
         self._refresh_toggle_label()
         self._save_settings()
 
@@ -1325,7 +1271,7 @@ class MinervaApp(tk.Tk):
         self._apply_downloads_advanced_visibility()
         self._save_settings()
 
-    def _refresh_toggle_label(self):
+    def _refresh_toggle_label(self, snap: dict | None = None, statuses: dict | None = None):
         if not hasattr(self, "_downloads_toggle_btn"):
             return
         chevron = "▴" if self._downloads_visible else "▾"
@@ -1335,15 +1281,17 @@ class MinervaApp(tk.Tk):
                 self._dl_summary_lbl.config(text="Idle", fg=FG_DIM)
             self.title(f"MiNERVA Archive Browser v{APP_VERSION}")
             return
-        snap = self._download_queue.snapshot()
+        if snap is None:
+            snap = self._download_queue.snapshot()
         n_active = len(snap["active"])
-        n_pending = len(snap["pending"])
+        n_pending = len(snap["pending"]) + len(snap.get("retry", []))
         n_done = len(snap["done"])
 
         total_speed = 0.0
         avg_progress = 0.0
         if self._torrent_engine:
-            statuses = self._torrent_engine.get_all_statuses()
+            if statuses is None:
+                statuses = self._torrent_engine.get_all_statuses()
             active_speeds = [statuses[did]["download_rate"] for did in snap["active"] if did in statuses]
             active_progs = [statuses[did]["progress"] for did in snap["active"] if did in statuses]
             total_speed = sum(active_speeds)
@@ -1379,41 +1327,81 @@ class MinervaApp(tk.Tk):
             self.title(f"MiNERVA Archive Browser v{APP_VERSION}")
 
     def _poll_downloads(self):
-        if self._torrent_engine is not None and self._download_queue is not None:
-            finished_ids = []
-            queue_changed = False
-            while True:
+        try:
+            self._poll_downloads_once()
+        except Exception as e:
+            # One bad tick (e.g. a TclError on a destroyed widget) must not stop download
+            # updates for the rest of the session; log at most every 30 s.
+            now = time.monotonic()
+            if now - self._poll_error_logged_at > 30:
+                self._poll_error_logged_at = now
+                log_error("MinervaApp._poll_downloads tick failed", e)
+        finally:
+            if not self._quitting:
                 try:
-                    event = self._torrent_engine.events.get_nowait()
-                except queue.Empty:
-                    break
-                etype = event.get("type")
-                did = event.get("id", "")
-                if etype == "finished":
-                    self._normalize_downloaded_file_location(did)
-                    self._torrent_engine.stop_seeding(did)
-                    self._download_queue.on_finished(did)
-                    finished_ids.append(did)
-                    queue_changed = True
-                elif etype == "error":
-                    self._download_queue.on_finished(did, error=event.get("msg", "Unknown error"))
-                    queue_changed = True
-            if finished_ids:
-                self._invalidate_library_keys_cache()
-                self._prompt_post_download_actions_batch(finished_ids)
-            if queue_changed:
-                self._save_settings()
+                    self._poll_after_id = self.after(500, self._poll_downloads)
+                except tk.TclError:
+                    pass  # window destroyed
 
-            snap = self._download_queue.snapshot()
-            self._rebuild_dl_panel(snap)
-            self._refresh_toggle_label()
+    def _downloads_panel_visible(self) -> bool:
+        """True when rebuilding the downloads panel would actually be seen."""
+        if not self._downloads_visible:
+            return False
+        try:
+            return self.state() in ("normal", "zoomed")
+        except tk.TclError:
+            return False
 
-        self.after(500, self._poll_downloads)
+    def _poll_downloads_once(self):
+        engine = self._torrent_engine
+        dl_queue = self._download_queue
+        if engine is None or dl_queue is None:
+            return
+        finished_ids: list[str] = []
+        finished_names: list[str] = []
+        queue_changed = False
+        while True:
+            try:
+                event = engine.events.get_nowait()
+            except queue.Empty:
+                break
+            etype = event.get("type")
+            did = event.get("id", "")
+            if etype == "finished":
+                meta = engine.get_meta(did) or {}
+                if meta.get("name"):
+                    finished_names.append(meta["name"])
+                if not self._seed_var.get():
+                    engine.stop_seeding(did)
+                dl_queue.on_finished(did)
+                finished_ids.append(did)
+                queue_changed = True
+            elif etype == "error":
+                # Transient failures (stall, busy torrent, network) wait out a backoff and retry.
+                dl_queue.on_failed(did, event.get("msg", "Unknown error"), retryable=bool(event.get("retryable")))
+                queue_changed = True
+        if dl_queue.tick():  # retry timers that elapsed
+            queue_changed = True
+        if finished_ids:
+            # Add the new files to the library index instead of rescanning the disk.
+            if self._library_index.add_names(finished_names):
+                self._request_icon_refresh()
+            self._prompt_post_download_actions_batch(finished_ids)
+        if queue_changed:
+            self._save_settings()
+
+        snap = dl_queue.snapshot()
+        statuses = engine.get_all_statuses()
+        # Rebuilding the row widgets is wasted work while the drawer is collapsed or the
+        # window is minimised/in the tray; _toggle_downloads rebuilds when it is reopened.
+        if self._downloads_panel_visible():
+            self._rebuild_dl_panel(snap, statuses)
+        self._refresh_toggle_label(snap, statuses)
 
     def _normalize_downloaded_file_location(self, download_id: str):
         if not self._torrent_engine:
             return
-        meta = self._torrent_engine._meta.get(download_id)
+        meta = self._torrent_engine.get_meta(download_id)
         if not meta:
             return
         file_name = meta.get("name", "")
@@ -1441,7 +1429,15 @@ class MinervaApp(tk.Tk):
                 except OSError:
                     pass
             parent_dir = src.parent
-            shutil.move(str(src), str(target))
+            for attempt in range(5):
+                try:
+                    shutil.move(str(src), str(target))
+                    break
+                except PermissionError:
+                    # Windows: libtorrent/AV may still hold the file for a moment.
+                    if attempt == 4:
+                        raise
+                    time.sleep(1)
             log_activity(f"download.flatten id={download_id} src='{src}' dst='{target}'")
             try:
                 if parent_dir != save_path and not any(parent_dir.iterdir()):
@@ -1454,47 +1450,68 @@ class MinervaApp(tk.Tk):
                 e
             )
 
+    def _queued_keys(self) -> frozenset[str]:
+        q = self._download_queue
+        return q.queued_keys() if q is not None else frozenset()
+
+    def _reset_row_status(self):
+        self._row_keys.clear()
+        self._row_status.clear()
+        self._icon_state = None
+
     def _invalidate_library_keys_cache(self):
-        self._library_keys_cache = None
-        self._library_keys_cache_dir = None
+        """Rebuild the on-disk key index in the background (never on the Tk thread)."""
+        self._library_index.rescan(self.get_download_dir(), on_change=self._on_library_index_changed)
 
-    def _on_disk_library_keys(self) -> set[str]:
-        download_dir = self.get_download_dir()
-        if (
-            self._library_keys_cache is not None
-            and self._library_keys_cache_dir == download_dir
-        ):
-            return self._library_keys_cache
-        keys = collect_library_match_keys(pathlib.Path(download_dir))
-        self._library_keys_cache = keys
-        self._library_keys_cache_dir = download_dir
-        return keys
+    def _on_disk_library_keys(self) -> frozenset[str]:
+        return self._library_index.ensure(
+            self.get_download_dir(), on_change=self._on_library_index_changed
+        )
 
-    def _library_status_for_name(self, name: str) -> str:
-        queued = self._in_progress_download_names()
-        return library_status_for_name(name, queued, self._on_disk_library_keys())
+    def _on_library_index_changed(self):
+        # Called from the index's worker thread.
+        try:
+            self.after(0, self._request_icon_refresh)
+        except (RuntimeError, tk.TclError):
+            pass  # window already closed
+
+    def _request_icon_refresh(self):
+        """Coalesce bursts (e.g. queueing 200 files) into a single icon pass."""
+        if self._icon_refresh_after_id is not None:
+            return
+        self._icon_refresh_after_id = self.after(40, self._run_icon_refresh)
+
+    def _run_icon_refresh(self):
+        self._icon_refresh_after_id = None
+        self._refresh_library_status_icons()
 
     def _refresh_library_status_icons(self):
-        if not hasattr(self, "_right_tree"):
+        """Update ⬇/✓ icons, touching only rows whose status actually changed."""
+        if not hasattr(self, "_right_tree") or not self._row_keys:
             return
-        for iid in self._right_tree.get_children():
-            if iid == "__empty_state__":
+        queued_keys = self._queued_keys()
+        disk_keys = self._on_disk_library_keys()
+        last = self._icon_state
+        if last is not None and last[0] == queued_keys and last[1] is disk_keys:
+            return
+        self._icon_state = (queued_keys, disk_keys)
+        tree = self._right_tree
+        icons = {"downloaded": "✓", "queued": "⬇"}
+        for iid, keys in self._row_keys.items():
+            status = status_from_keys(keys, queued_keys, disk_keys)
+            if status == self._row_status.get(iid, ""):
                 continue
-            tags = set(self._right_tree.item(iid, "tags") or ())
-            if "file" not in tags:
-                continue
-            values = self._right_tree.item(iid, "values")
-            if len(values) < 4:
-                continue
-            raw_name = str(values[2]).removeprefix("📄 ").strip()
-            status = self._library_status_for_name(raw_name)
-            status_icon = {"downloaded": "✓", "queued": "⬇"}.get(status, "")
-            self._right_tree.set(iid, "dlstat", status_icon)
-            tags.discard("queued")
-            tags.discard("downloaded")
-            if status:
-                tags.add(status)
-            self._right_tree.item(iid, tags=tuple(tags))
+            self._row_status[iid] = status
+            try:
+                tags = set(tree.item(iid, "tags") or ())
+                tags.discard("queued")
+                tags.discard("downloaded")
+                if status:
+                    tags.add(status)
+                tree.set(iid, "dlstat", icons.get(status, ""))
+                tree.item(iid, tags=tuple(tags))
+            except tk.TclError:
+                continue  # row was removed between render and refresh
 
     def _hide_dlstat_tip(self):
         tw = getattr(self, "_dlstat_tip_window", None)
@@ -1535,75 +1552,12 @@ class MinervaApp(tk.Tk):
         self._dlstat_tip_window = tw
         self._dlstat_tip_text = text
 
-    def _rebuild_dl_panel(self, snap: dict):
-        active_ids = set(snap["active"])
-        pending_ids = {item["id"] for item in snap["pending"]}
-        self._queued_selected_ids.intersection_update(pending_ids)
-        statuses = self._torrent_engine.get_all_statuses() if self._torrent_engine else {}
-
-        gone = [did for did in list(self._dl_active_widgets) if did not in active_ids]
-        for did in gone:
-            w = self._dl_active_widgets.pop(did)
-            w["frame"].destroy()
-            self._dl_speed_samples.pop(did, None)
-
-        for did in snap["active"]:
-            st = statuses.get(did, {})
-            if did not in self._dl_active_widgets:
-                self._make_active_row(did, st.get("name", did))
-            self._update_active_row(did, st)
-
-        if not hasattr(self, "_dl_queued_frame"):
-            self._dl_queued_frame = tk.Frame(self._dl_inner, bg=PANEL)
-            self._dl_queued_frame.pack(fill="x")
-        pending_map = {item["id"]: item for item in snap["pending"]}
-        gone_pending = [did for did in list(self._dl_queued_widgets) if did not in pending_map]
-        for did in gone_pending:
-            w = self._dl_queued_widgets.pop(did)
-            w["frame"].destroy()
-
-        if pending_map:
-            if not hasattr(self, "_dl_queued_header") or not self._dl_queued_header.winfo_exists():
-                self._dl_queued_header = tk.Label(
-                    self._dl_queued_frame, text="  QUEUED",
-                    bg=PANEL, fg=FG_DIM, font=("TkDefaultFont", 8, "bold")
-                )
-                self._dl_queued_header.pack(anchor="w", padx=6)
-            for item in snap["pending"]:
-                did = item["id"]
-                if did not in self._dl_queued_widgets:
-                    self._make_queued_row(self._dl_queued_frame, item)
-                self._update_queued_row(did, item)
-        else:
-            if hasattr(self, "_dl_queued_header") and self._dl_queued_header.winfo_exists():
-                self._dl_queued_header.destroy()
-                del self._dl_queued_header
-
-        if not hasattr(self, "_dl_done_frame"):
-            self._dl_done_frame = tk.Frame(self._dl_inner, bg=PANEL)
-            self._dl_done_frame.pack(fill="x")
-
-        done_ids = {item["id"] for item in snap["done"]}
-        gone_done = [did for did in list(self._dl_done_widgets) if did not in done_ids]
-        for did in gone_done:
-            w = self._dl_done_widgets.pop(did)
-            w["frame"].destroy()
-
-        if snap["done"]:
-            if not hasattr(self, "_dl_done_header") or not self._dl_done_header.winfo_exists():
-                self._dl_done_header = tk.Label(
-                    self._dl_done_frame, text="  COMPLETED",
-                    bg=PANEL, fg=FG_DIM, font=("TkDefaultFont", 8, "bold"))
-                self._dl_done_header.pack(anchor="w", padx=6)
-            for item in snap["done"]:
-                did = item["id"]
-                if did not in self._dl_done_widgets:
-                    self._make_done_row(self._dl_done_frame, item)
-        else:
-            if hasattr(self, "_dl_done_header") and self._dl_done_header.winfo_exists():
-                self._dl_done_header.destroy()
-                del self._dl_done_header
-        self._refresh_library_status_icons()
+    def _rebuild_dl_panel(self, snap: dict, statuses: dict | None = None):
+        """Bring the downloads list up to date with the queue/engine (cheap when nothing changed)."""
+        if statuses is None:
+            statuses = self._torrent_engine.get_all_statuses() if self._torrent_engine else {}
+        self._downloads_panel.sync(snap, statuses, self._extract_progress)
+        self._request_icon_refresh()
 
     def _show_rom_tools_menu(self):
         callbacks = {
@@ -1641,234 +1595,17 @@ class MinervaApp(tk.Tk):
             for i, btn in enumerate(self._dl_action_buttons):
                 btn.grid(row=i // act_cols, column=i % act_cols, sticky="ew", padx=2, pady=2)
 
-    def _make_active_row(self, did: str, name: str):
-        row = tk.Frame(self._dl_inner, bg=PANEL)
-        row.pack(fill="x", before=self._dl_queued_frame if hasattr(self, "_dl_queued_frame") else None)
-
-        cancel_btn = ttk.Button(row, text="✕", width=2,
-                                command=lambda d=did: self._cancel_download(d))
-        cancel_btn.pack(side="right", padx=(0, 6))
-        HoverTooltip(cancel_btn, "Cancel download")
-
-        pause_btn = ttk.Button(row, text="⏸", width=3,
-                               command=lambda d=did: self._toggle_pause(d))
-        pause_btn.pack(side="right", padx=(2, 4))
-        HoverTooltip(pause_btn, "Pause/Resume download")
-
-        state_lbl = tk.Label(row, text="—", bg=PANEL, fg=FG,
-                             font=("TkDefaultFont", 9), width=16, anchor="w")
-        state_lbl.pack(side="right", padx=(4, 8))
-
-        speed_lbl = tk.Label(row, text="↓ —", bg=PANEL, fg=FG_DIM,
-                             font=("TkDefaultFont", 9), width=14, anchor="e")
-        speed_lbl.pack(side="right", padx=(4, 6))
-
-        pct_lbl = tk.Label(row, text="0%", bg=PANEL, fg=FG,
-                           font=("TkDefaultFont", 9), width=5, anchor="e")
-        pct_lbl.pack(side="right", padx=(0, 6))
-
-        pv = tk.DoubleVar(value=0)
-        pb = ttk.Progressbar(row, variable=pv, maximum=100,
-                             mode="determinate", length=110)
-        pb.pack(side="right", padx=(0, 8))
-
-        name_lbl = tk.Label(row, text="📄 " + name,
-                            bg=PANEL, fg=FG, font=("TkDefaultFont", 9), anchor="w")
-        name_lbl.pack(side="left", fill="x", expand=True, padx=(8, 6))
-
-        self._dl_active_widgets[did] = {
-            "frame": row,
-            "pv": pv,
-            "pct_lbl": pct_lbl,
-            "speed_lbl": speed_lbl,
-            "state_lbl": state_lbl,
-            "pause_btn": pause_btn,
-        }
-
-    def _update_active_row(self, did: str, st: dict):
-        w = self._dl_active_widgets.get(did)
-        if not w:
-            return
-        pct = st.get("progress", 0) * 100
-        w["pv"].set(pct)
-        w["pct_lbl"].config(text=f"{pct:.0f}%")
-        state = st.get("state", "—")
-        paused = st.get("paused", False)
-        total_done = int(st.get("total_done", 0) or 0)
-        now = time.monotonic()
-        sample = self._dl_speed_samples.get(did)
-        calc_rate = 0.0
-        if sample is not None:
-            prev_done, prev_ts = sample
-            delta_bytes = max(0, total_done - prev_done)
-            delta_t = max(1e-6, now - prev_ts)
-            calc_rate = delta_bytes / delta_t
-        self._dl_speed_samples[did] = (total_done, now)
-        raw_rate = float(st.get("download_rate", 0) or 0.0)
-        rate = calc_rate if (state == "Downloading" and not paused and calc_rate > 0) else raw_rate
-        w["speed_lbl"].config(text=self._fmt_rate(rate))
-        w["state_lbl"].config(text=state)
-        w["pause_btn"].config(text="▶" if paused else "⏸")
-
-    def _make_queued_row(self, parent: tk.Frame, item: dict):
-        row = tk.Frame(parent, bg=PANEL)
-        row.pack(fill="x")
-        did = item["id"]
-        is_selected = did in self._queued_selected_ids
-        sel_var = tk.BooleanVar(value=is_selected)
-
-        cb = tk.Checkbutton(
-            row,
-            variable=sel_var,
-            bg=PANEL,
-            fg=FG,
-            selectcolor=PANEL,
-            activebackground=PANEL,
-            activeforeground=FG,
-            relief="flat",
-            highlightthickness=1,
-            highlightbackground=ACCENT,
-            highlightcolor=ACCENT,
-            command=lambda d=did, v=sel_var: self._set_queued_selected(d, v.get())
-        )
-        cb.pack(side="left", padx=(4, 2))
-
-        btn_cancel = ttk.Button(row, text="✕", width=2,
-                                command=lambda d=did: self._cancel_download(d))
-        btn_cancel.pack(side="right", padx=(0, 6))
-        HoverTooltip(btn_cancel, "Cancel download")
-
-        btn_start = ttk.Button(row, text="Start", width=5,
-                               command=lambda d=did: self._start_specific_queued(d))
-        btn_start.pack(side="right", padx=(0, 4))
-        HoverTooltip(btn_start, "Start download now")
-
-        btn_down = ttk.Button(row, text="▼", width=2,
-                              command=lambda d=did: self._move_queued_down(d))
-        btn_down.pack(side="right", padx=1)
-        HoverTooltip(btn_down, "Move down in queue")
-
-        btn_up = ttk.Button(row, text="▲", width=2,
-                            command=lambda d=did: self._move_queued_up(d))
-        btn_up.pack(side="right", padx=1)
-        HoverTooltip(btn_up, "Move up in queue")
-
-        state_lbl = tk.Label(row, text="Queued", bg=PANEL, fg=FG_DIM,
-                             font=("TkDefaultFont", 9), anchor="w", width=12)
-        state_lbl.pack(side="right", padx=(4, 8))
-
-        name = item["name"]
-        name_lbl = tk.Label(row, text="🕐 " + name,
-                            bg=PANEL, fg=FG_DIM, font=("TkDefaultFont", 9), anchor="w")
-        name_lbl.pack(side="left", fill="x", expand=True, padx=(4, 4))
-
-        self._dl_queued_widgets[did] = {
-            "frame": row,
-            "sel_var": sel_var,
-            "state_lbl": state_lbl,
-        }
-
-    def _update_queued_row(self, download_id: str, item: dict):
-        w = self._dl_queued_widgets.get(download_id)
-        if not w:
-            return
-        try:
-            w["sel_var"].set(download_id in self._queued_selected_ids)
-            status = "Ready" if item.get("start_requested") else "Queued"
-            w["state_lbl"].config(text=status)
-        except tk.TclError:
-            pass
-
-    def _make_done_row(self, parent: tk.Frame, item: dict):
-        did = item["id"]
-        row = tk.Frame(parent, bg=PANEL)
-        row.pack(fill="x")
-
-        redownload_btn = ttk.Button(
-            row,
-            text="Redownload",
-            width=11,
-            command=lambda d=did, n=item.get("name", ""): self._redownload_item(
-                download_id=d, name=n, confirm=True
-            ),
-        )
-        redownload_btn.pack(side="right", padx=(0, 6))
-        HoverTooltip(redownload_btn, "Delete this file and download it again")
-
-        open_extracted_btn = ttk.Button(
-            row,
-            text="Extracted",
-            width=9,
-            command=lambda p=item.get("save_path", ""): self._open_folder(pathlib.Path(p) / "extracted")
-        )
-        open_extracted_btn.pack(side="right", padx=(0, 4))
-        HoverTooltip(open_extracted_btn, "Open folder containing extracted ROMs")
-
-        open_btn = ttk.Button(
-            row,
-            text="Open",
-            width=6,
-            command=lambda p=item.get("save_path", ""): self._open_folder(pathlib.Path(p))
-        )
-        open_btn.pack(side="right", padx=(0, 4))
-        HoverTooltip(open_btn, "Open download folder on disk (Ctrl+O)")
-
-        ext_lbl = tk.Label(row, text="", bg=PANEL, fg=ACCENT,
-                           font=("TkDefaultFont", 8), width=42, anchor="e")
-        ext_lbl.pack(side="right", padx=(0, 6))
-
-        ext_pv = tk.DoubleVar(value=0)
-        ext_pb = ttk.Progressbar(row, variable=ext_pv, maximum=100,
-                                 mode="determinate", length=90)
-        ext_pb.pack(side="right", padx=(0, 6))
-
-        icon = "✅" if item["status"] == "done" else "❌"
-        name = item["name"]
-        clr = FG if item["status"] == "done" else "#f38ba8"
-        lbl_text = f"{icon} " + name
-        if item.get("error"):
-            lbl_text += f"  ({item['error']})"
-
-        name_lbl = tk.Label(row, text=lbl_text, bg=PANEL, fg=clr,
-                            font=("TkDefaultFont", 9), anchor="w")
-        name_lbl.pack(side="left", fill="x", expand=True, padx=(6, 4))
-
-        self._dl_done_widgets[did] = {
-            "frame": row,
-            "ext_pv": ext_pv,
-            "ext_pb": ext_pb,
-            "ext_lbl": ext_lbl,
-        }
-
-        if did in self._extract_progress:
-            self._apply_extract_progress(did)
-
     def _refresh_extract_rows(self):
-        for did in list(self._extract_progress.keys()):
-            self._apply_extract_progress(did)
-
-    def _apply_extract_progress(self, did: str):
-        w = self._dl_done_widgets.get(did)
-        info = self._extract_progress.get(did)
-        if not w or not info:
+        """Extraction progress changed (called via after(0) from worker threads; coalesced)."""
+        if self._extract_refresh_pending:
             return
-        pct = info.get("pct", 0)
-        status = info.get("status", "")
-        try:
-            w["ext_pv"].set(pct)
-            w["ext_lbl"].config(text=status)
-        except tk.TclError:
-            pass
+        self._extract_refresh_pending = True
+        self.after(100, self._flush_extract_rows)
 
-    @staticmethod
-    def _fmt_rate(r: float) -> str:
-        if r <= 0:
-            return "↓ —"
-        if r < 1024:
-            return f"↓ {r:.0f} B/s"
-        if r < 1024 * 1024:
-            return f"↓ {r / 1024:.1f} KB/s"
-        return f"↓ {r / 1024 / 1024:.1f} MB/s"
+    def _flush_extract_rows(self):
+        self._extract_refresh_pending = False
+        if self._download_queue is not None and self._downloads_panel_visible():
+            self._rebuild_dl_panel(self._download_queue.snapshot())
 
     def _on_max_concurrent_change(self):
         if self._download_queue is not None:
@@ -1912,6 +1649,7 @@ class MinervaApp(tk.Tk):
             "autostart_with_windows": bool(self._autostart_var.get()),
             "start_minimized": bool(self._start_minimized_var.get()),
             "offer_companions": bool(self._offer_companions_var.get()),
+            "seed_after_download": bool(self._seed_var.get()),
             "download_queue": self._get_persisted_queue_for_settings(),
             "download_history": list(self._download_history.values())[-400:],
             "last_path": self._current_path,
@@ -1919,9 +1657,10 @@ class MinervaApp(tk.Tk):
         }
 
     def _save_settings(self):
+        """Snapshot the settings now; the write happens on a background thread (latest wins)."""
         settings = self._collect_settings()
-        save_app_settings(settings)
         self._settings = settings
+        self._settings_writer.submit(settings)
 
     @staticmethod
     def _normalize_queue_item(raw: dict) -> dict | None:
@@ -1948,7 +1687,7 @@ class MinervaApp(tk.Tk):
         return {
             "id": download_id,
             "name": name,
-            "source": source,
+            "source": strip_default_trackers(source),
             "so_id": so_id,
             "save_path": save_path,
             "start_requested": bool(raw.get("start_requested", False)),
@@ -2018,9 +1757,15 @@ class MinervaApp(tk.Tk):
             self._save_settings()
 
     def _on_download_dir_change(self, *_):
-        self._invalidate_library_keys_cache()
         self._save_settings()
-        self._refresh_library_status_icons()
+        # Debounced: the folder entry fires this on every keystroke.
+        if self._library_rescan_after_id is not None:
+            self.after_cancel(self._library_rescan_after_id)
+        self._library_rescan_after_id = self.after(400, self._run_library_rescan)
+
+    def _run_library_rescan(self):
+        self._library_rescan_after_id = None
+        self._invalidate_library_keys_cache()
 
     def _on_extract_defaults_change(self):
         if self._compress_ps1_chd_var.get() and not self._chdman_path:
@@ -2035,6 +1780,11 @@ class MinervaApp(tk.Tk):
             self._extract_status_var.set(f"CHD tool: {self._chdman_path}")
         else:
             self._extract_status_var.set("")
+        self._save_settings()
+
+    def _on_seed_setting_change(self):
+        if self._torrent_engine is not None:
+            self._torrent_engine.set_seeding(bool(self._seed_var.get()))
         self._save_settings()
 
     def _on_startup_settings_change(self):
@@ -2294,19 +2044,16 @@ class MinervaApp(tk.Tk):
             log_activity("chd.install.fail no_path")
 
     def _start_selected_queued(self):
-        if not self._download_queue or not self._queued_selected_ids:
+        ids = self._downloads_panel.selected_pending_ids()
+        if not self._download_queue or not ids:
             return
-        selected_ids = list(self._queued_selected_ids)
-        self._download_queue.start_selected(selected_ids)
-        for did in selected_ids:
-            self._queued_selected_ids.discard(did)
+        self._download_queue.start_selected(ids)
         self._save_settings()
 
     def _start_specific_queued(self, download_id: str):
         if not self._download_queue:
             return
         self._download_queue.start_selected([download_id])
-        self._queued_selected_ids.discard(download_id)
         self._save_settings()
 
     def _start_all_queued(self):
@@ -2314,12 +2061,6 @@ class MinervaApp(tk.Tk):
             return
         self._download_queue.start_all_pending()
         self._save_settings()
-
-    def _set_queued_selected(self, download_id: str, selected: bool):
-        if selected:
-            self._queued_selected_ids.add(download_id)
-        else:
-            self._queued_selected_ids.discard(download_id)
 
     def _toggle_pause_all_active(self):
         if not self._download_queue or not self._torrent_engine:
@@ -2346,23 +2087,15 @@ class MinervaApp(tk.Tk):
     def _clear_completed(self):
         if self._download_queue:
             self._download_queue.clear_done()
-        for did, w in list(self._dl_done_widgets.items()):
-            try:
-                w["frame"].destroy()
-            except tk.TclError:
-                pass
-        self._dl_done_widgets.clear()
         self._extract_progress.clear()
-        if hasattr(self, "_dl_done_header") and self._dl_done_header.winfo_exists():
-            self._dl_done_header.destroy()
-            del self._dl_done_header
+        self._sync_downloads_panel()
 
     def _prompt_post_download_actions_batch(self, download_ids: list[str]):
         if not self._torrent_engine:
             return
         valid_items: list[tuple[str, dict]] = []
         for did in download_ids:
-            meta = self._torrent_engine._meta.get(did)
+            meta = self._torrent_engine.get_meta(did)
             if meta:
                 valid_items.append((did, meta))
 
@@ -2967,6 +2700,10 @@ class MinervaApp(tk.Tk):
         if rewritten:
             self._save_settings()
 
+    def _start_startup_cleanup(self):
+        """The cleanup walks the whole extracted/ tree; keep that off the UI thread."""
+        threading.Thread(target=self._run_startup_cleanup, name="startup-cleanup", daemon=True).start()
+
     def _run_startup_cleanup(self):
         try:
             download_dir = self.get_download_dir()
@@ -3130,12 +2867,8 @@ class MinervaApp(tk.Tk):
             engine.pause(download_id)
 
     def _cancel_download(self, download_id: str):
-        self._queued_selected_ids.discard(download_id)
         if self._download_queue:
             self._download_queue.cancel(download_id)
-        w = self._dl_active_widgets.pop(download_id, None)
-        if w:
-            w["frame"].destroy()
         self._refresh_toggle_label()
         self._save_settings()
 
@@ -3296,16 +3029,120 @@ class MinervaApp(tk.Tk):
         self.bind_all("<Escape>", self._on_escape_pressed)
 
     def _move_queued_up(self, download_id: str):
-        if self._download_queue:
-            self._download_queue.move_up(download_id)
-            snap = self._download_queue.snapshot()
-            self._rebuild_dl_panel(snap)
+        self._move_queued([download_id], "up")
 
     def _move_queued_down(self, download_id: str):
+        self._move_queued([download_id], "down")
+
+    def _move_queued(self, ids: list[str], where: str):
         if self._download_queue:
-            self._download_queue.move_down(download_id)
-            snap = self._download_queue.snapshot()
-            self._rebuild_dl_panel(snap)
+            self._download_queue.move(ids, where)
+            self._sync_downloads_panel()
+            self._save_settings()
+
+    def _sync_downloads_panel(self):
+        if self._download_queue is not None:
+            self._rebuild_dl_panel(self._download_queue.snapshot())
+
+    # -- downloads list actions (wired to DownloadsPanel) ----------------------------------------
+    def _build_panel_actions(self) -> PanelActions:
+        return PanelActions(
+            start_now=self._panel_start_now,
+            toggle_pause=self._panel_toggle_pause,
+            cancel=self._panel_cancel,
+            remove=self._panel_remove,
+            retry=self._panel_retry,
+            redownload=self._panel_redownload,
+            move=self._move_queued,
+            open_folder=self._panel_open_folder,
+            show_error=self._panel_show_error,
+            copy_names=self._panel_copy_names,
+            on_filter_change=self._sync_downloads_panel,
+        )
+
+    def _done_item(self, download_id: str) -> dict | None:
+        if self._download_queue is None:
+            return None
+        return next((d for d in self._download_queue.snapshot()["done"] if d["id"] == download_id), None)
+
+    def _panel_start_now(self, ids: list[str]):
+        if self._download_queue:
+            self._download_queue.start_selected(ids)
+            self._save_settings()
+            self._sync_downloads_panel()
+
+    def _panel_toggle_pause(self, ids: list[str]):
+        for did in ids:
+            self._toggle_pause(did)
+
+    def _panel_cancel(self, ids: list[str]):
+        snap = self._download_queue.snapshot() if self._download_queue else {"active": []}
+        active = set(snap["active"])
+        needs_confirm = len(ids) > 1 or any(i in active for i in ids)
+        if needs_confirm and not messagebox.askyesno(
+            "Cancel downloads",
+            f"Cancel {len(ids)} download(s)?\n\nPartly downloaded data for them is deleted.",
+        ):
+            return
+        if self._download_queue:
+            self._download_queue.cancel_many(ids)  # one pass: no pending item starts just to be cancelled
+        self._refresh_toggle_label()
+        self._save_settings()
+        self._sync_downloads_panel()
+
+    def _panel_remove(self, ids: list[str]):
+        if not self._download_queue:
+            return
+        for did in ids:
+            self._download_queue.pop_done(did)
+            self._extract_progress.pop(did, None)
+        self._save_settings()
+        self._sync_downloads_panel()
+
+    def _panel_retry(self, ids: list[str]):
+        if not self._download_queue:
+            return
+        retried = 0
+        for did in ids:
+            if self._download_queue.requeue_done(did, str(uuid.uuid4()), start=True):
+                self._extract_progress.pop(did, None)
+                retried += 1
+        if retried:
+            self._status_var.set(f"Retrying {retried} download(s)")
+            self._save_settings()
+            self._sync_downloads_panel()
+
+    def _panel_redownload(self, ids: list[str]):
+        if not ids:
+            return
+        if len(ids) > 1 and not messagebox.askyesno(
+            "Redownload", f"Delete {len(ids)} files and download them again?"
+        ):
+            return
+        for did in ids:
+            item = self._done_item(did)
+            self._redownload_item(download_id=did, name=(item or {}).get("name"), confirm=len(ids) == 1)
+
+    def _panel_open_folder(self, ids: list[str], extracted: bool):
+        for did in ids:
+            item = self._done_item(did)
+            base = pathlib.Path((item or {}).get("save_path") or self.get_download_dir())
+            self._open_folder(base / "extracted" if extracted else base)
+
+    def _panel_show_error(self, download_id: str):
+        item = self._done_item(download_id)
+        if item:
+            messagebox.showerror(item.get("name", "Download failed"), item.get("error") or "Unknown error")
+
+    def _panel_copy_names(self, ids: list[str]):
+        if not self._download_queue:
+            return
+        snap = self._download_queue.snapshot()
+        names = {it["id"]: it["name"] for it in (*snap["pending"], *snap.get("retry", ()), *snap["done"], *snap["active_items"])}
+        text = "\n".join(names[i] for i in ids if i in names)
+        if text:
+            self.clipboard_clear()
+            self.clipboard_append(text)
 
     def _queue_checked_downloads(self):
         if not _LT_AVAILABLE:
@@ -3318,21 +3155,114 @@ class MinervaApp(tk.Tk):
         if not hrefs:
             return
         save_path = self.get_download_dir()
+        browse_path = self._current_path
+        by_href = {e["href"]: e for e in self._all_entries}
         for href in hrefs:
             rom_id = extract_rom_id(href)
             if not rom_id:
                 continue
-            entry = next((e for e in self._all_entries if e["href"] == href), None)
+            entry = by_href.get(href)
             file_name = entry["name"] if entry else href
-            download_id = str(uuid.uuid4())
-            threading.Thread(
-                target=self._lookup_and_enqueue,
-                args=(download_id, rom_id, file_name, save_path, self._current_path),
-                daemon=True
-            ).start()
+            self._submit_lookup(str(uuid.uuid4()), rom_id, file_name, save_path, browse_path)
         self._clear_checked()
         if not self._downloads_visible:
             self._toggle_downloads()
+
+    # -- lookups: bounded worker pool -> result queue -> one batched enqueue on the Tk thread --
+    def _submit_lookup(self, download_id: str, rom_id: str, file_name: str, save_path: str,
+                       browse_path: str = "", **flags) -> bool:
+        """Resolve and enqueue one file on the lookup pool (max 5 concurrent requests)."""
+        if not is_safe_leaf_name(file_name):
+            self._record_lookup_error("unexpected", file_name, "the file name contains path characters and was refused")
+            return False
+        if self.get_torrent_engine() is None:
+            return False
+        with self._lookup_lock:
+            self._lookup_pending += 1
+
+        def run():
+            try:
+                self._lookup_and_enqueue(download_id, rom_id, file_name, save_path, browse_path, **flags)
+            except Exception as e:
+                log_error(f"MinervaApp lookup worker failed for {file_name}", e)
+                self._record_lookup_error("unexpected", file_name, str(e))
+            finally:
+                with self._lookup_lock:
+                    self._lookup_pending -= 1
+
+        try:
+            self._lookup_pool.submit(run)
+        except RuntimeError:  # pool already shut down (app closing)
+            with self._lookup_lock:
+                self._lookup_pending -= 1
+            return False
+        self._schedule_lookup_pump()
+        return True
+
+    def _schedule_lookup_pump(self):
+        if self._lookup_pump_after_id is None and not self._quitting:
+            self._lookup_pump_after_id = self.after(100, self._lookup_pump)
+
+    def _wake_lookup_pump(self):
+        """Thread-safe: ask the Tk thread to drain results/errors."""
+        try:
+            self.after(0, self._schedule_lookup_pump)
+        except (RuntimeError, tk.TclError):
+            pass  # window closed
+
+    def _record_lookup_error(self, kind: str, name: str, message: str):
+        self._lookup_errors.add(kind, name, message)
+        self._wake_lookup_pump()
+
+    def _lookup_pump(self):
+        self._lookup_pump_after_id = None
+        batch: list[QueuedDownload] = []
+        while len(batch) < 200:
+            try:
+                batch.append(self._lookup_results.get_nowait())
+            except queue.Empty:
+                break
+        if batch:
+            self._enqueue_resolved(batch)
+        with self._lookup_lock:
+            pending = self._lookup_pending
+        if pending > 0 or not self._lookup_results.empty():
+            if pending > 0:
+                self._status_var.set(f"Looking up {pending} file(s)…")
+            self._schedule_lookup_pump()
+        else:
+            self._flush_lookup_errors()
+
+    def _enqueue_resolved(self, results: list[QueuedDownload]):
+        dl_queue = self._download_queue
+        if self.get_torrent_engine() is None or dl_queue is None:
+            for r in results:
+                dl_queue and dl_queue.release(r.name)
+            return
+        dl_queue.enqueue_many(
+            {"id": r.download_id, "name": r.name, "source": r.source, "so_id": r.so_id, "save_path": r.save_path}
+            for r in results
+        )
+        for r in results:
+            self._remember_download(r.name, r.source, r.so_id, r.save_path)
+        self._save_settings()  # once per batch, not once per file
+        self._request_icon_refresh()
+        self._status_var.set(f"Queued {len(results)} download(s)")
+        if not self._downloads_visible:
+            self._toggle_downloads()
+
+    def _flush_lookup_errors(self):
+        errors = self._lookup_errors.take()
+        if not errors:
+            return
+        title, body = LookupErrors.format(errors)
+        self._status_var.set(f"{len(errors)} download(s) could not be queued")
+        if len(errors) == 1 and errors[0].kind in ("not_found", "no_torrent"):
+            messagebox.showwarning(title, body)
+        elif len(errors) == 1:
+            messagebox.showerror(title, body)
+        else:
+            messagebox.showwarning(title, body)
 
     def _lookup_and_enqueue(
         self,
@@ -3346,77 +3276,35 @@ class MinervaApp(tk.Tk):
         fetch_ps3_dkey: bool = True,
         skip_companions: bool = False,
     ):
-        if not skip_name_dedupe and self._download_queue and self._download_queue.has_name(file_name):
-            if fetch_ps3_dkey and is_ps3_iso_browse_path(browse_path):
-                self._enqueue_matching_ps3_dkey(file_name, save_path)
-            return
-
-        self.after(0, lambda: self._status_var.set(f"Looking up: {file_name}…"))
+        dl_queue = self._download_queue
+        reserved = False
+        if not skip_name_dedupe and dl_queue is not None:
+            # Atomic claim: concurrent lookups of the same title can no longer both pass.
+            if not dl_queue.reserve(file_name):
+                if fetch_ps3_dkey and is_ps3_iso_browse_path(browse_path):
+                    self._enqueue_matching_ps3_dkey(file_name, save_path)
+                return
+            reserved = True
 
         try:
-            row = fetch_rom_info(rom_id)
+            resolved = self._rom_resolver.resolve(rom_id, file_name)
+        except LookupFailure as e:
+            if reserved:
+                dl_queue.release(file_name)
+            log_error(f"MinervaApp._lookup_and_enqueue {e.kind} for {file_name}: {e.message}")
+            self._record_lookup_error(e.kind, file_name, e.message)
+            return
         except Exception as e:
-            log_error(f"MinervaApp._lookup_and_enqueue rom lookup failed for {file_name}", e)
-            self.after(0, lambda err=e: messagebox.showerror(
-                "Lookup Failed", f"Could not look up {file_name}:\n{err}"
-            ))
+            if reserved:
+                dl_queue.release(file_name)
+            log_error(f"MinervaApp._lookup_and_enqueue failed for {file_name}", e)
+            self._record_lookup_error("unexpected", file_name, str(e))
             return
 
-        if row is None:
-            self.after(0, lambda: messagebox.showwarning(
-                "Not Found", f"{file_name} was not found on the server."
-            ))
-            return
-
-        so_id = row.get("so_id") or 0
-        full_path = row.get("full_path") or file_name
-
-        torrent_url = None
-        if row.get("torrents"):
-            encoded_path = urllib.parse.quote(row["torrents"], safe="/")
-            torrent_url = "https://minerva-archive.org/assets/" + encoded_path
-
-        if torrent_url:
-            try:
-                torrent_dir = get_torrent_dir()
-                source_key = hashlib.sha1(full_path.encode("utf-8", errors="ignore")).hexdigest()[:10]
-                torrent_filename = (
-                    row["torrents"].replace("/", "_").replace("\\", "_") + f"__{source_key}.torrent"
-                )
-                torrent_local = torrent_dir / torrent_filename
-                if not torrent_local.exists():
-                    req = urllib.request.Request(
-                        torrent_url, headers={"User-Agent": "MiNERVA-Browser/1.0"}
-                    )
-                    with urllib.request.urlopen(req, timeout=30) as resp:
-                        torrent_data = resp.read()
-                    torrent_local.write_bytes(torrent_data)
-                torrent_source = str(torrent_local)
-            except Exception as e:
-                log_error(f"MinervaApp._lookup_and_enqueue torrent fetch failed for {file_name}", e)
-                torrent_source = None
-                if row.get("magnet"):
-                    torrent_source = row["magnet"] + TRACKERS
-                if torrent_source is None:
-                    self.after(0, lambda err=e: messagebox.showerror(
-                        "Torrent Download Failed", f"Could not download torrent for {file_name}:\n{err}"
-                    ))
-                    return
-        elif row.get("magnet"):
-            torrent_source = row["magnet"] + TRACKERS
-        else:
-            self.after(0, lambda: messagebox.showwarning(
-                "No Torrent", f"No torrent info found for {file_name}."
-            ))
-            return
-
-        self.after(0, lambda: self.enqueue_download(
-            download_id=download_id,
-            name=file_name,
-            source=torrent_source,
-            so_id=so_id,
-            save_path=save_path,
-        ))
+        self._lookup_results.put(
+            QueuedDownload(download_id, file_name, resolved.source, resolved.so_id, save_path)
+        )
+        self._wake_lookup_pump()
         if fetch_ps3_dkey and is_ps3_iso_browse_path(browse_path):
             self._enqueue_matching_ps3_dkey(file_name, save_path)
         if not skip_companions:
@@ -3467,13 +3355,10 @@ class MinervaApp(tk.Tk):
                 continue
             if self._download_queue and self._download_queue.has_name(item.name):
                 continue
-            download_id = str(uuid.uuid4())
-            threading.Thread(
-                target=self._lookup_and_enqueue,
-                args=(download_id, rom_id, item.name, save_path, browse_path),
-                kwargs={"skip_companions": True, "fetch_ps3_dkey": False},
-                daemon=True,
-            ).start()
+            self._submit_lookup(
+                str(uuid.uuid4()), rom_id, item.name, save_path, browse_path,
+                skip_companions=True, fetch_ps3_dkey=False,
+            )
         if items and not self._downloads_visible:
             self._toggle_downloads()
         n = len(items)
@@ -3665,6 +3550,22 @@ class MinervaApp(tk.Tk):
         self._extract_status_var.set(msg)
         messagebox.showinfo(TITLE, msg)
 
+    @staticmethod
+    def _delete_file_best_effort(path: pathlib.Path, attempts: int = 5, delay: float = 1.0) -> bool:
+        """Delete ``path``, retrying while another process (libtorrent, antivirus) holds it open."""
+        for attempt in range(attempts):
+            try:
+                path.unlink()
+                return True
+            except FileNotFoundError:
+                return True
+            except PermissionError:
+                if attempt < attempts - 1:
+                    time.sleep(delay)
+            except OSError:
+                break
+        return False
+
     def _find_downloaded_file(self, save_path: pathlib.Path, file_name: str) -> pathlib.Path | None:
         if not file_name:
             return None
@@ -3703,9 +3604,13 @@ class MinervaApp(tk.Tk):
     def _extract_download_sync(self, download_id: str):
         if not self._torrent_engine:
             return
-        meta = self._torrent_engine._meta.get(download_id)
+        meta = self._torrent_engine.get_meta(download_id)
         if not meta:
             return
+
+        # Moves the file next to the other downloads.  Runs here (worker thread) because it
+        # polls with sleep() while the torrent releases the file; it used to freeze the UI.
+        self._normalize_downloaded_file_location(download_id)
 
         save_path = pathlib.Path(meta["save_path"])
         torrent_dir = save_path / "extracted"
@@ -3989,8 +3894,12 @@ class MinervaApp(tk.Tk):
                 log_activity(f"extract.verify.ok id={download_id} dir='{extracted_dir}'")
 
             if extracted_ok and delete_archive and src.exists():
-                src.unlink()
-                log_activity(f"extract.delete_archive id={download_id} src='{src}'")
+                self._torrent_engine.stop_seeding(download_id)  # release the file if it is being seeded
+                if self._delete_file_best_effort(src):
+                    log_activity(f"extract.delete_archive id={download_id} src='{src}'")
+                else:
+                    # Extraction worked; a file Windows still has locked is not a failed download.
+                    log_activity(f"extract.delete_archive.skipped id={download_id} src='{src}'")
 
             status_text = "Extracted ✓"
             if extracted_ok and extracted_dir is not None:
@@ -4302,8 +4211,14 @@ class MinervaApp(tk.Tk):
 
     def _on_close(self):
         self._quitting = True
+        self._lookup_pool.shutdown()
         self._shutdown_tray()
         self._save_settings()
+        self._settings_writer.close()
+        try:
+            self.withdraw()  # engine shutdown writes resume data (<= a few seconds); don't look frozen
+        except tk.TclError:
+            pass
         if self._torrent_engine is not None:
             try:
                 self._torrent_engine.shutdown()
@@ -4315,9 +4230,30 @@ class MinervaApp(tk.Tk):
             log_error("MinervaApp._on_close extraction queue shutdown failed", e)
         self.destroy()
 
-    def _show_error(self, msg):
+    _TIMER_ATTRS = (
+        "_poll_after_id", "_render_after_id", "_icon_refresh_after_id", "_lookup_pump_after_id",
+        "_library_rescan_after_id", "_search_save_after_id",
+    )
+
+    def destroy(self):
+        """Cancel our own timers first so none fires into a half-destroyed window."""
+        self._quitting = True
+        for attr in self._TIMER_ATTRS:
+            after_id = getattr(self, attr, None)
+            if after_id is not None:
+                try:
+                    self.after_cancel(after_id)
+                except tk.TclError:
+                    pass
+                setattr(self, attr, None)
+        super().destroy()
+
+    def _show_error(self, msg, generation: int | None = None):
+        if generation is not None and generation != self._nav_generation:
+            return
         log_error(f"MinervaApp._show_error: {msg}")
         self._set_loading(False)
         self._right_tree.delete(*self._right_tree.get_children())
+        self._reset_row_status()
         self._status_var.set(f"Error: {msg}")
         messagebox.showerror("Error", f"Failed to load page:\n{msg}")

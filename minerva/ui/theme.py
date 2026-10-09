@@ -183,6 +183,43 @@ def setup_modern_styles(root: tk.Tk) -> ttk.Style:
         relief="flat",
     )
 
+    style.configure(
+        "Downloads.Treeview",
+        background=PANEL,
+        foreground=FG,
+        fieldbackground=PANEL,
+        borderwidth=0,
+        rowheight=22,
+        font=("TkDefaultFont", 9),
+    )
+    style.map(
+        "Downloads.Treeview",
+        background=[("selected", SEL_BG)],
+        foreground=[("selected", "#ffffff")],
+    )
+    style.configure(
+        "Downloads.Treeview.Heading",
+        background=PANEL_ALT,
+        foreground=ACCENT,
+        font=("TkDefaultFont", 9, "bold"),
+        borderwidth=1,
+        relief="flat",
+    )
+    style.configure(
+        "Chip.Toolbutton",
+        background=PANEL_ALT,
+        foreground=FG_DIM,
+        padding=(8, 2),
+        relief="flat",
+        borderwidth=0,
+        font=("TkDefaultFont", 9),
+    )
+    style.map(
+        "Chip.Toolbutton",
+        background=[("selected", SEL_BG), ("active", SEL_BG)],
+        foreground=[("selected", ACCENT), ("active", FG)],
+    )
+
     # Entry styles
     style.configure(
         "TEntry",

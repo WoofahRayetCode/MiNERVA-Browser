@@ -245,7 +245,9 @@ def get_dkey_save_dir(download_dir: str | pathlib.Path) -> pathlib.Path:
 def is_dkey_save_path(save_path: str | pathlib.Path | None) -> bool:
     if not save_path:
         return False
-    parts = [p.lower() for p in pathlib.Path(save_path).parts]
+    # Split on both separators so a Windows-style path saved in settings still
+    # matches when evaluated on Linux (pathlib only honours the host separator).
+    parts = [p.lower() for p in re.split(r"[\\/]+", str(save_path)) if p]
     return DKEY_DIR_NAME in parts
 
 
