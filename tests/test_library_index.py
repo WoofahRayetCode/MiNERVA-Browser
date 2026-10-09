@@ -21,7 +21,7 @@ class _Scan:
         self.gate.set()
 
     def __call__(self, root):
-        self.calls.append(str(root))
+        self.calls.append(root.as_posix())  # platform-neutral: str(Path("/lib")) is "\\lib" on Windows
         self.gate.wait(5)
         return set(self.result)
 
