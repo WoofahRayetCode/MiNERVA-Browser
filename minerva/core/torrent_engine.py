@@ -56,7 +56,9 @@ DISK_RESERVE = 64 * 1024 * 1024
 STALL_REANNOUNCE_AFTER = 300.0 # no bytes for this long -> force a tracker/DHT announce
 STALL_FAIL_AFTER = 600.0       # ...and still nothing -> fail with a retryable error
 METADATA_TIMEOUT = 120.0       # magnet link without metadata for this long -> retryable error
-DISK_FULL_ERRNOS = {28, 39, 112}  # ENOSPC, ERROR_HANDLE_DISK_FULL, ERROR_DISK_FULL
+# ENOSPC on POSIX; ERROR_HANDLE_DISK_FULL / ERROR_DISK_FULL on Windows (39 and 112 mean other
+# things on Linux, so the set is per platform).
+DISK_FULL_ERRNOS = {39, 112} if os.name == "nt" else {28}
 
 
 def _build_torrent_state_map() -> dict:
@@ -135,6 +137,7 @@ class _Member:
     state_override: str = ""
     flat_name: str | None = None
     preexisting: bool = False   # the file was already on disk when we attached: never delete it
+    await_check: bool = False   # a recheck was requested; do not trust 'complete' until it ends
     last_done: int = 0
     last_progress_at: float = field(default_factory=time.monotonic)
     stall_stage: int = 0
@@ -157,6 +160,7 @@ class _Group:
     checked: bool = False
     seeding_since: float = 0.0
     handle_paused: bool = False
+    renamed: dict = field(default_factory=dict)   # file index -> flat name libtorrent now uses
     last_downloaded: int = 0        # all_time_download at the last scan
     last_activity: float = field(default_factory=time.monotonic)  # last time *any* bytes arrived
 
@@ -190,6 +194,8 @@ class TorrentEngine:
         self._meta: dict[str, dict] = {}
         self._groups: dict[str, _Group] = {}
         self._cleanup: list[dict] = []
+        self._claim_seq = 0
+        self._path_claims: dict[pathlib.Path, int] = {}
         self._torrent_infos: OrderedDict = OrderedDict()
         self._seeding = {"enabled": False, "ratio": 1.0, "hours": 24.0}
         self._snapshot: tuple[int, dict] = (0, {})
@@ -407,9 +413,11 @@ class TorrentEngine:
         flat = member.name
         if not is_safe_leaf_name(flat):
             return None
+        if idx in group.renamed:
+            return group.renamed[idx]  # an earlier member already flattened this very file
         if torrent_file_storage(ti).file_path(idx) == flat:
             return None  # already at the top level
-        if any(o.flat_name == flat for o in group.members.values() if o is not member):
+        if flat in group.renamed.values():
             return None  # two files with the same name in one torrent: keep the second nested
         return flat
 
@@ -494,7 +502,10 @@ class TorrentEngine:
             member.size = torrent_file_storage(ti).file_size(idx)
             self._preflight_disk(member, member.size)
             member.flat_name = self._flat_name(group, member, idx, ti)
+            if member.flat_name:
+                group.renamed[idx] = member.flat_name
             member.preexisting = self._file_on_disk(group.save_path, member, ti)
+            self._claim_paths(group, member, ti)
             # Resume data must never decide what we download or where it lands.
             priorities = [0] * ti.num_files()
             priorities[idx] = FILE_PRIORITY
@@ -505,6 +516,10 @@ class TorrentEngine:
         member.group = group
         member.state_override = "" if ti is not None else "Metadata"
         self._groups[info_hash] = group
+        if member.paused and member.file_idx >= 0:
+            # Pause-all can arrive while the .torrent is still being parsed, before any group exists.
+            self._sync_priority(group, member.file_idx)
+            self._sync_handle_pause(group)
 
     def _attach(self, group: _Group, member: _Member):
         if group.save_path != member.save_path:
@@ -535,14 +550,42 @@ class TorrentEngine:
         member.file_idx, member.size, member.state_override = idx, size, ""
         member.preexisting = self._file_on_disk(group.save_path, member, ti)
         flat = self._flat_name(group, member, idx, ti)
-        if flat and not (pathlib.Path(group.save_path) / flat).exists():
+        if flat and idx in group.renamed:
+            member.flat_name = flat  # libtorrent already maps this file there
+        elif flat and not (pathlib.Path(group.save_path) / flat).exists():
             try:
                 group.handle.rename_file(idx, flat)
+                group.renamed[idx] = flat
                 member.flat_name = flat
             except Exception as e:
                 log_error(f"TorrentEngine rename_file failed for {member.name}", e)
+        self._claim_paths(group, member, ti)
+        self._verify_not_stale(group, member)
         self._sync_priority(group, idx)
         self._sync_handle_pause(group)
+
+    def _claim_paths(self, group: _Group, member: _Member, ti) -> None:
+        """Record that ``member`` now owns its file path, voiding older cleanup jobs for it."""
+        for path in self._member_paths(group, member):
+            self._claim_seq += 1
+            self._path_claims[path] = self._claim_seq
+
+    def _verify_not_stale(self, group: _Group, member: _Member) -> None:
+        """Re-adding a file to a *running* torrent after it was deleted from disk.
+
+        libtorrent still has the pieces marked as have, so the file would be reported complete
+        at once and recreated empty.  Ask it to recheck and hold completion until that is done.
+        """
+        if any(p.exists() for p in self._member_paths(group, member)):
+            return
+        try:
+            have = group.handle.file_progress(flags=lt.torrent_handle.piece_granularity)[member.file_idx]
+            if have > 0:
+                group.handle.force_recheck()
+                group.checked = False
+                member.await_check = True
+        except Exception as e:
+            log_error("TorrentEngine stale-file check failed", e)
 
     # -- pausing / priorities ----------------------------------------------------------------------
     @staticmethod
@@ -590,9 +633,13 @@ class TorrentEngine:
                     member.error, member.state_override = "", ""
                     if group is not None:
                         try:
+                            # After a storage error libtorrent parks the torrent in upload mode.
                             group.handle.clear_error()
-                        except Exception:
-                            pass
+                            group.handle.unset_flags(lt.torrent_flags.upload_mode)
+                            group.handle.resume()
+                            group.handle_paused = False
+                        except Exception as e:
+                            log_error("TorrentEngine could not resume after a storage error", e)
             if group is not None and member.file_idx >= 0:
                 self._sync_priority(group, member.file_idx)
                 self._sync_handle_pause(group)
@@ -605,7 +652,9 @@ class TorrentEngine:
         shared = any(o.file_idx == member.file_idx for o in group.members.values())
         if (delete_partial and member.file_idx >= 0 and member.done < member.size
                 and not member.preexisting and not shared):
-            group.cleanup_paths.extend(self._member_paths(group, member))
+            group.cleanup_paths.extend(
+                (path, self._path_claims.get(path, 0)) for path in self._member_paths(group, member)
+            )
         if member.file_idx >= 0 and not group.removing:
             self._sync_priority(group, member.file_idx)
         self._maybe_remove_group(group)
@@ -613,8 +662,9 @@ class TorrentEngine:
     @staticmethod
     def _member_paths(group: _Group, member: _Member) -> list[pathlib.Path]:
         base = pathlib.Path(group.save_path)
-        if member.flat_name:
-            return [base / member.flat_name]
+        flat = group.renamed.get(member.file_idx) or member.flat_name
+        if flat:
+            return [base / flat]
         if group.ti is not None and member.file_idx >= 0:
             return [base / torrent_file_storage(group.ti).file_path(member.file_idx)]
         return []
@@ -653,8 +703,10 @@ class TorrentEngine:
             for event in group.pending_events:
                 self.events.put(event)
             group.pending_events = []
-            for path in group.cleanup_paths:
-                self._cleanup.append({"path": path, "base": pathlib.Path(group.save_path), "tries": 0})
+            for path, claim in group.cleanup_paths:
+                self._cleanup.append(
+                    {"path": path, "claim": claim, "base": pathlib.Path(group.save_path), "tries": 0}
+                )
             group.cleanup_paths = []
             if self._store is not None:
                 self._store.delete(group.info_hash)
@@ -666,7 +718,8 @@ class TorrentEngine:
                 return
             group = member.group
             if group is not None:
-                self._detach(group, member, delete_partial=True)
+                # Keep the partial file for a retry: libtorrent re-verifies it, so progress survives.
+                self._detach(group, member, delete_partial=not retryable)
             self._members.pop(member.did, None)
             member.error = message
         log_activity(f"engine.error id={member.did} name='{member.name}' retryable={retryable} msg={message}")
@@ -678,8 +731,14 @@ class TorrentEngine:
         next_resume = time.monotonic() + RESUME_INTERVAL
         try:
             while not self._stop.is_set():
-                self._session.wait_for_alert(250)
-                for alert in self._session.pop_alerts():
+                try:
+                    self._session.wait_for_alert(250)
+                    alerts = self._session.pop_alerts()
+                except Exception as e:
+                    log_error("TorrentEngine could not read alerts", e)
+                    time.sleep(0.25)
+                    continue
+                for alert in alerts:
                     try:
                         self._handle_alert(alert)
                     except Exception as e:
@@ -741,7 +800,8 @@ class TorrentEngine:
         elif isinstance(alert, lt.save_resume_data_alert):
             self._store_resume(alert)
         elif isinstance(alert, lt.file_error_alert):
-            self._on_storage_error(self._group_of(alert.handle), alert.error, str(alert.filename))
+            name = alert.filename
+            self._on_storage_error(self._group_of(alert.handle), alert.error, str(name() if callable(name) else name))
         elif isinstance(alert, lt.torrent_error_alert):
             group = self._group_of(alert.handle)
             if group is not None and alert.error.value():
@@ -754,19 +814,30 @@ class TorrentEngine:
                         self._fail(member, f"libtorrent rejected the torrent: {alert.error.message()}")
 
     def _on_storage_error(self, group: "_Group | None", error, filename: str):
+        """A full disk affects every download; any other file error only the file it names."""
         if group is None:
             return
         disk_full = error.value() in DISK_FULL_ERRNOS
         text = "Disk full" if disk_full else f"Disk error: {error.message()}"
         where = f" ({filename})" if filename else ""
         with self._lock:
-            for member in group.members.values():
-                if member.finished or member.cancelled:
-                    continue
+            if disk_full:
+                affected = [m for m in group.members.values() if not (m.finished or m.cancelled)]
+            else:
+                bad = os.path.normcase(os.path.abspath(filename)) if filename else ""
+                affected = [
+                    m for m in group.members.values()
+                    if not (m.finished or m.cancelled)
+                    and any(os.path.normcase(os.path.abspath(str(p))) == bad for p in self._member_paths(group, m))
+                ]
+            for member in affected:
                 member.error = f"{text} in {group.save_path}{where}"
                 member.state_override = "Disk full" if disk_full else "Error"
                 member.paused = True  # libtorrent has stopped the torrent; resume() clears this
-            log_activity(f"engine.storage_error hash={group.info_hash} {text} {error.message()}{where}")
+            log_activity(
+                f"engine.storage_error hash={group.info_hash} {text} {error.message()}{where} "
+                f"affected={len(affected)}"
+            )
 
     # -- scanning ----------------------------------------------------------------------------------
     def _scan(self, now: float):
@@ -779,12 +850,17 @@ class TorrentEngine:
                     if now - group.removing_since > REMOVE_TIMEOUT:
                         log_activity(f"engine.removal_timeout hash={group.info_hash}")
                         self._finish_removal(group)
+                    else:
+                        # Closing the torrent takes a moment; keep showing its finishing members.
+                        for member in group.members.values():
+                            if not member.cancelled:
+                                statuses[member.did] = self._status_dict(member, group, group.status, 1)
                     continue
                 self._scan_group(group, now, statuses)
             for did, member in self._members.items():
                 if did not in statuses and member.group is None:
                     statuses[did] = self._status_dict(member, None, None, 1)
-        self._snapshot = (self._snapshot[0] + 1, statuses)
+            self._snapshot = (self._snapshot[0] + 1, statuses)
 
     def _scan_group(self, group: _Group, now: float, statuses: dict):
         st = group.status
@@ -806,6 +882,10 @@ class TorrentEngine:
                 log_error("TorrentEngine file_progress failed", e)
         finishing: list[_Member] = []
         for member in unfinished:
+            if member.await_check:
+                if not group.checked:
+                    continue  # a recheck is running: piece map may be stale
+                member.await_check = False
             if progress_list is not None and 0 <= member.file_idx < len(progress_list):
                 member.done = min(int(progress_list[member.file_idx]), member.size) if member.size else 0
                 if (member.size > 0 and member.done >= member.size) or (member.size == 0 and group.checked):
@@ -921,17 +1001,20 @@ class TorrentEngine:
         keep = []
         for job in pending:
             path: pathlib.Path = job["path"]
-            try:
-                path.unlink()
-            except FileNotFoundError:
-                pass
-            except OSError:
-                job["tries"] += 1
-                if job["tries"] < 30:  # Windows may still hold the file for a moment
-                    keep.append(job)
-                else:
-                    log_activity(f"engine.cleanup_gave_up path='{path}'")
-                continue
+            with self._lock:
+                if self._path_claims.get(path, 0) != job["claim"]:
+                    continue  # a newer download owns this path now: leave it alone
+                try:
+                    path.unlink()
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    job["tries"] += 1
+                    if job["tries"] < 30:  # Windows may still hold the file for a moment
+                        keep.append(job)
+                    else:
+                        log_activity(f"engine.cleanup_gave_up path='{path}'")
+                    continue
             parent, base = path.parent, job["base"]
             while parent != base and base in parent.parents:
                 try:

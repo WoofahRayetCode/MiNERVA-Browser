@@ -29,6 +29,13 @@ class TestDetectors(unittest.TestCase):
                      "protocol zero (usa).zip", "hacker (usa).zip"):
             self.assertEqual(detect_release_tags(name), set(), name)
 
+    def test_tags_without_a_space_before_the_number(self):
+        # The previous word-based version missed these; the hide-tag filters must still hide them.
+        self.assertEqual(detect_release_tags("game (rev1).zip"), {"revision"})
+        self.assertEqual(detect_release_tags("game (beta2).zip"), {"beta"})
+        self.assertEqual(detect_release_tags("game (demo2).zip"), {"demo"})
+        self.assertEqual(detect_release_tags("game (proto2).zip"), {"proto"})
+
     def test_unbracketed_hints_still_count_as_whole_words(self):
         self.assertEqual(detect_release_tags("game demo.zip"), {"demo"})
         self.assertEqual(detect_release_tags("game - beta.zip"), {"beta"})
@@ -49,6 +56,20 @@ class TestDetectors(unittest.TestCase):
         self.assertEqual(detect_regions("game (japan, usa, korea).zip"), {"japan", "usa", "korea"})
         self.assertEqual(detect_regions("game (usa/europe).zip"), {"usa", "europe"})
         self.assertEqual(detect_regions("game (usa, australia) (en,fr,de).zip"), {"usa", "australia"})
+
+    def test_regions_separated_by_spaces_semicolons_and_frequency_notes(self):
+        self.assertEqual(detect_regions("game (usa europe).zip"), {"usa", "europe"})
+        self.assertEqual(detect_regions("game (usa; europe).zip"), {"usa", "europe"})
+        self.assertEqual(detect_regions("game (europe 50hz).zip"), {"europe"})
+        self.assertEqual(detect_regions("game (usa 60hz).zip"), {"usa"})
+        self.assertEqual(detect_regions("game (usa and canada).zip"), {"usa", "canada"})
+        self.assertEqual(detect_regions("game (us, eu).zip"), {"usa", "europe"})
+        self.assertEqual(detect_regions("game (jp, kr).zip"), {"japan", "korea"})
+
+    def test_unrelated_words_next_to_a_region_name_do_not_add_regions(self):
+        self.assertEqual(detect_regions("game (super italy edition).zip"), {"other"})
+        self.assertEqual(detect_regions("game (europe) (fr,de).zip"), {"europe"})
+        self.assertEqual(detect_regions("game (fr,de).zip"), {"other"})  # a language list, not countries
 
     def test_language_lists_and_title_words_are_not_regions(self):
         self.assertEqual(detect_regions("game (usa) (en,fr,de,es,it).zip"), {"usa"})

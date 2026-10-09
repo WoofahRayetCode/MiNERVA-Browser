@@ -32,6 +32,7 @@ from minerva.core.http import SITE_GATE, RateGate, atomic_write_bytes, get_bytes
 
 ASSETS_URL = BASE_URL.rstrip("/") + "/assets/"
 MAX_TORRENT_BYTES = 256 * 1024 * 1024
+REFRESH_COOLDOWN = 600.0  # a collection torrent fetched this recently is not fetched again
 _STALE_PART_SECONDS = 3600
 _INVALID_NAME_CHARS = re.compile(r'[<>:"|?*\x00-\x1f]')
 
@@ -88,6 +89,7 @@ class TorrentCache:
         gate: RateGate | None = None,
         parse: Callable[[bytes], TorrentSummary] = parse_torrent_bytes,
         memo_size: int = 8,
+        clock: Callable[[], float] = time.monotonic,
     ):
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
@@ -96,6 +98,8 @@ class TorrentCache:
         self._fetch = fetch or self._default_fetch
         self._parse = parse
         self._memo_size = memo_size
+        self._clock = clock
+        self._fetched_at: dict[str, float] = {}
         self._lock = threading.Lock()
         self._inflight: dict[tuple[str, bool], Future] = {}
         self._memo: OrderedDict[Path, tuple[tuple[int, int], TorrentSummary]] = OrderedDict()
@@ -208,7 +212,13 @@ class TorrentCache:
     def _ensure_uncached(self, rel_path: str, refresh: bool) -> Path:
         dest = self.path_for(rel_path)
         if refresh:
-            self._evict(dest)
+            fetched = self._fetched_at.get(rel_path)
+            if fetched is not None and self._clock() - fetched < REFRESH_COOLDOWN and self._is_valid(dest):
+                # We downloaded this torrent moments ago, so a mismatch is the server's index
+                # being wrong, not our copy being stale; fetching the same bytes again (up to
+                # 256 MB, once per queued file) would only hammer the server.
+                return dest
+            # The cached copy stays in place until a fresh one has downloaded and validated.
         elif dest.exists():
             if self._is_valid(dest):
                 return dest
@@ -223,6 +233,7 @@ class TorrentCache:
             holder.append(self._parse(blob))
 
         atomic_write_bytes(dest, data, validate)
+        self._fetched_at[rel_path] = self._clock()
         st = dest.stat()
         self._remember(dest, (st.st_mtime_ns, st.st_size), holder[0])
         return dest

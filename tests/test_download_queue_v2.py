@@ -262,6 +262,38 @@ class TestDoneCap(unittest.TestCase):
         self.assertFalse(queue.has_name("Game 1.zip"))  # trimmed names leave the index
 
 
+class TestCancelAndStartFailures(unittest.TestCase):
+    def test_cancel_many_does_not_start_items_that_are_about_to_be_cancelled(self):
+        engine = _Engine()
+        queue = DownloadQueue(engine, max_active=2)
+        queue.enqueue_many([_item(i, start_requested=True) for i in range(6)])
+        queue._try_advance()
+        self.assertEqual(engine.added, ["id-0", "id-1"])
+        queue.cancel_many([f"id-{i}" for i in range(6)])  # "select all, Delete"
+        self.assertEqual(engine.added, ["id-0", "id-1"])  # nothing new started
+        self.assertEqual(sorted(engine.removed), ["id-0", "id-1"])
+        snap = queue.snapshot()
+        self.assertEqual((snap["pending"], snap["active"]), ([], []))
+
+    def test_a_failing_engine_start_does_not_strand_the_item_or_the_rest(self):
+        class Flaky(_Engine):
+            def add_download(self, source, so_id, name, save_path, download_id=None):
+                if download_id == "id-0":
+                    raise RuntimeError("engine is shutting down")
+                super().add_download(source, so_id, name, save_path, download_id)
+
+        engine = Flaky()
+        queue = DownloadQueue(engine, max_active=3)
+        queue.enqueue_many([_item(i, start_requested=True) for i in range(3)])
+        queue._try_advance()
+        snap = queue.snapshot()
+        self.assertEqual(snap["active"], ["id-1", "id-2"])
+        self.assertEqual(engine.added, ["id-1", "id-2"])
+        failed = [d for d in snap["done"] if d["id"] == "id-0"]
+        self.assertEqual(failed[0]["status"], "error")
+        self.assertIn("Could not start", failed[0]["error"])
+
+
 class TestScale(unittest.TestCase):
     N = 10_000
 

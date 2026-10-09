@@ -101,12 +101,41 @@ class TestTorrentCache(unittest.TestCase):
         self.assertEqual(len(fetch.urls), 1)
         self.assertTrue(path.read_bytes().startswith(b"d"))
 
-    def test_refresh_discards_cached_copy(self):
+    def test_refresh_replaces_an_old_cached_copy(self):
+        now = [0.0]
         fetch = _Fetch()
-        cache = self.cache(fetch)
+        cache = self.cache(fetch, clock=lambda: now[0])
         cache.ensure("t/one.torrent")
+        now[0] += tc.REFRESH_COOLDOWN + 1  # the copy is old enough that a refresh is meaningful
         cache.ensure("t/one.torrent", refresh=True)
         self.assertEqual(len(fetch.urls), 2)
+
+
+    def test_refresh_right_after_a_fetch_does_not_download_the_same_torrent_again(self):
+        now = [0.0]
+        fetch = _Fetch()
+        cache = self.cache(fetch, clock=lambda: now[0])
+        cache.ensure("t/one.torrent")
+        for _ in range(5):  # five queued files whose index "mismatches"
+            cache.ensure("t/one.torrent", refresh=True)
+        self.assertEqual(len(fetch.urls), 1)
+        now[0] += tc.REFRESH_COOLDOWN + 1
+        cache.ensure("t/one.torrent", refresh=True)  # a genuinely stale copy is refreshed
+        self.assertEqual(len(fetch.urls), 2)
+
+    def test_a_failed_refresh_keeps_the_good_cached_copy(self):
+        now = [0.0]
+        fetch = _Fetch()
+        cache = self.cache(fetch, clock=lambda: now[0])
+        path = cache.ensure("t/one.torrent")
+        now[0] += tc.REFRESH_COOLDOWN + 1
+        fetch.error = HttpError("HTTP 503", status=503, retryable=True)
+        with self.assertRaises(HttpError):
+            cache.ensure("t/one.torrent", refresh=True)
+        self.assertTrue(path.is_file())  # not deleted before the replacement arrived
+        fetch.error = None
+        self.assertEqual(cache.ensure("t/one.torrent"), path)
+        self.assertEqual(len(fetch.urls), 2)  # served from disk, no extra fetch
 
     def test_failure_reaches_every_waiter_and_is_not_sticky(self):
         fetch = _Fetch(delay=0.1, error=HttpError("HTTP 503", status=503, retryable=True))

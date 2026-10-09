@@ -329,5 +329,43 @@ class TestAppSmoke(unittest.TestCase):
         self._run_in_mainloop(scenario)
 
 
+@unittest.skipIf(app_module is None, "tkinter UI not importable")
+class TestDeleteFileBestEffort(unittest.TestCase):
+    """Deleting the archive after extraction must never turn a good download into an error."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.path = pathlib.Path(self._tmp.name) / "game.zip"
+        self.path.write_bytes(b"x")
+
+    def test_deletes_a_normal_file(self):
+        self.assertTrue(app_module.MinervaApp._delete_file_best_effort(self.path, delay=0))
+        self.assertFalse(self.path.exists())
+
+    def test_missing_file_counts_as_deleted(self):
+        self.path.unlink()
+        self.assertTrue(app_module.MinervaApp._delete_file_best_effort(self.path, delay=0))
+
+    def test_retries_while_the_file_is_locked_then_succeeds(self):
+        real_unlink = pathlib.Path.unlink
+        calls = []
+
+        def flaky(p, *a, **k):
+            calls.append(1)
+            if len(calls) < 3:
+                raise PermissionError("in use by another process")
+            return real_unlink(p, *a, **k)
+
+        with mock.patch.object(pathlib.Path, "unlink", flaky):
+            self.assertTrue(app_module.MinervaApp._delete_file_best_effort(self.path, delay=0))
+        self.assertEqual(len(calls), 3)
+
+    def test_gives_up_quietly_when_the_file_stays_locked(self):
+        with mock.patch.object(pathlib.Path, "unlink", side_effect=PermissionError("locked")):
+            self.assertFalse(app_module.MinervaApp._delete_file_best_effort(self.path, attempts=3, delay=0))
+        self.assertTrue(self.path.exists())
+
+
 if __name__ == "__main__":
     unittest.main()

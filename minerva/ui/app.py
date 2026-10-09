@@ -3084,8 +3084,10 @@ class MinervaApp(tk.Tk):
             f"Cancel {len(ids)} download(s)?\n\nPartly downloaded data for them is deleted.",
         ):
             return
-        for did in ids:
-            self._cancel_download(did)
+        if self._download_queue:
+            self._download_queue.cancel_many(ids)  # one pass: no pending item starts just to be cancelled
+        self._refresh_toggle_label()
+        self._save_settings()
         self._sync_downloads_panel()
 
     def _panel_remove(self, ids: list[str]):
@@ -3548,6 +3550,22 @@ class MinervaApp(tk.Tk):
         self._extract_status_var.set(msg)
         messagebox.showinfo(TITLE, msg)
 
+    @staticmethod
+    def _delete_file_best_effort(path: pathlib.Path, attempts: int = 5, delay: float = 1.0) -> bool:
+        """Delete ``path``, retrying while another process (libtorrent, antivirus) holds it open."""
+        for attempt in range(attempts):
+            try:
+                path.unlink()
+                return True
+            except FileNotFoundError:
+                return True
+            except PermissionError:
+                if attempt < attempts - 1:
+                    time.sleep(delay)
+            except OSError:
+                break
+        return False
+
     def _find_downloaded_file(self, save_path: pathlib.Path, file_name: str) -> pathlib.Path | None:
         if not file_name:
             return None
@@ -3877,8 +3895,11 @@ class MinervaApp(tk.Tk):
 
             if extracted_ok and delete_archive and src.exists():
                 self._torrent_engine.stop_seeding(download_id)  # release the file if it is being seeded
-                src.unlink()
-                log_activity(f"extract.delete_archive id={download_id} src='{src}'")
+                if self._delete_file_best_effort(src):
+                    log_activity(f"extract.delete_archive id={download_id} src='{src}'")
+                else:
+                    # Extraction worked; a file Windows still has locked is not a failed download.
+                    log_activity(f"extract.delete_archive.skipped id={download_id} src='{src}'")
 
             status_text = "Extracted ✓"
             if extracted_ok and extracted_dir is not None:

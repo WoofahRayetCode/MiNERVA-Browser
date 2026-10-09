@@ -23,6 +23,8 @@ import time
 from collections import deque
 from typing import Callable, Iterable
 
+from minerva.constants import log_error
+
 DEFAULT_RETRY_DELAYS = (30.0, 120.0, 600.0)
 DEFAULT_MAX_DONE = 500
 
@@ -200,13 +202,22 @@ class DownloadQueue:
         if self.engine is None:
             return
         for item in to_start:
-            self.engine.add_download(
-                item["source"],
-                item["so_id"],
-                item["name"],
-                item["save_path"],
-                download_id=item["id"],
-            )
+            try:
+                self.engine.add_download(
+                    item["source"],
+                    item["so_id"],
+                    item["name"],
+                    item["save_path"],
+                    download_id=item["id"],
+                )
+            except Exception as e:
+                # One bad start must not leave this item "active" forever or strand the rest.
+                log_error(f"DownloadQueue could not start {item.get('name')}", e)
+                with self._lock:
+                    if self._where.get(item["id"]) == _ACTIVE:
+                        self._remove(item["id"])
+                        self._to_done(item["id"], item, f"Could not start: {e}")
+                        self._bump()
 
     def set_max_active(self, n: int):
         self.max_active = max(1, n)
@@ -319,14 +330,29 @@ class DownloadQueue:
         return item
 
     def cancel(self, download_id: str):
+        self.cancel_many([download_id])
+
+    def cancel_many(self, download_ids: Iterable[str]):
+        """Cancel several items at once.
+
+        Done under one lock and with a single advance at the end: cancelling one by one used to
+        free a slot per active item and start pending items that were about to be cancelled too.
+        """
+        was_active: list[str] = []
         with self._lock:
-            where = self._where.get(download_id)
-            was_active = where == _ACTIVE
-            if where in (_PENDING, _ACTIVE, _RETRY):
-                self._remove(download_id)
+            changed = False
+            for did in download_ids:
+                where = self._where.get(did)
+                if where in (_PENDING, _ACTIVE, _RETRY):
+                    if where == _ACTIVE:
+                        was_active.append(did)
+                    self._remove(did)
+                    changed = True
+            if changed:
                 self._bump()
-        if was_active and self.engine is not None:
-            self.engine.remove_handle(download_id)
+        if self.engine is not None:
+            for did in was_active:
+                self.engine.remove_handle(did)
         self._try_advance()
 
     def clear_done(self):

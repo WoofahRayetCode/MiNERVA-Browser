@@ -235,6 +235,38 @@ class TestSharedTorrent(EngineCase):
         self.assertEqual((self.save / BETA).read_bytes(), self.seeder.files["Games/Beta (USA).bin"])
 
 
+    def test_a_stale_cleanup_never_deletes_a_file_that_was_requeued_and_finished(self):
+        # G is cancelled while B keeps the torrent alive (G's partial path is queued for cleanup),
+        # then G is queued again and finishes.  When the group finally closes, the old cleanup
+        # job must not delete the fresh download.
+        engine = self.make_engine()
+        self.add(engine, "b", BETA, 1)
+        self.add(engine, "g", "Gamma.bin", 2)
+        wait_until(lambda: len(engine._groups) == 1 and len(next(iter(engine._groups.values())).members) == 2, 5)
+        engine.remove_handle("g")
+        self.add(engine, "g2", "Gamma.bin", 2)
+        self.assertTrue(self.wait_finished(engine, ["b", "g2"]), self.events)
+        wait_until(lambda: not self.torrents(engine), 5)
+        wait_until(lambda: False, 1.0)  # let any (wrong) cleanup job run
+        gamma = [p for p in self.save.rglob("Gamma.bin")]
+        self.assertEqual(len(gamma), 1, gamma)
+        self.assertEqual(gamma[0].read_bytes(), self.seeder.files["Gamma.bin"])
+
+    def test_requeueing_a_deleted_file_into_a_running_torrent_downloads_it_again(self):
+        # With seeding on the torrent stays alive after A finishes.  If the user deletes A and
+        # queues it again, libtorrent still "has" the pieces; without a recheck the new member
+        # would finish at once with an empty file.
+        engine = self.make_engine()
+        engine.set_seeding(True, ratio=100.0, hours=24)
+        self.add(engine, "a", ALPHA, 0)
+        self.assertTrue(self.wait_finished(engine, ["a"]))
+        engine.stop_seeding("a")
+        (self.save / ALPHA).unlink()
+        self.add(engine, "a2", ALPHA, 0)
+        self.assertTrue(self.wait_finished(engine, ["a2"], timeout=40), self.events)
+        self.assertEqual((self.save / ALPHA).read_bytes(), self.seeder.files["Games/Alpha (USA).bin"])
+
+
 class TestPauseResume(EngineCase):
     def test_paused_member_does_not_download_until_resumed(self):
         engine = self.make_engine()
@@ -260,6 +292,30 @@ class TestPauseResume(EngineCase):
         engine.pause("a")
         self.assertTrue(self.wait_finished(engine, ["b"]), self.events)
         self.assertNotIn("a", self.finished_ids(engine))
+        engine.resume("a")
+        self.assertTrue(self.wait_finished(engine, ["a"]), self.events)
+
+
+    def test_pause_issued_before_the_torrent_is_added_is_honoured(self):
+        # Pause-all can land while a large .torrent is still being parsed (no group yet).
+        engine = self.make_engine()
+        real = engine._load_torrent_info
+
+        def slow(source):
+            time.sleep(0.6)
+            return real(source)
+
+        engine._load_torrent_info = slow
+        self.add(engine, "a", BETA, 1)
+        engine.pause("a")  # the add worker has not created the group yet
+        self.assertTrue(wait_until(lambda: len(self.torrents(engine)) == 1, 10))
+        for _ in range(10):
+            self.connect(engine)
+            wait_until(lambda: False, 0.15)
+        self.assertEqual(self.finished_ids(engine), set())
+        self.assertTrue(engine.get_all_statuses()["a"]["paused"])
+        self.assertFalse((self.save / BETA).exists() and (self.save / BETA).stat().st_size
+                         and (self.save / BETA).read_bytes() == self.seeder.files["Games/Beta (USA).bin"])
         engine.resume("a")
         self.assertTrue(self.wait_finished(engine, ["a"]), self.events)
 
@@ -380,6 +436,65 @@ class TestGuards(EngineCase):
         self.assertEqual((group.last_downloaded, group.last_activity), (500, now))
         engine._scan_group(group, now + 5, {})  # nothing new arrived: activity time must not move
         self.assertEqual(group.last_activity, now)
+
+
+    def _two_member_group(self, engine):
+        group = te._Group(info_hash="cd" * 20, save_path=str(self.save), ti=object())
+        group.handle = mock.Mock()
+        members = []
+        for did, name, idx in (("a", "A.bin", 0), ("b", "B.bin", 1)):
+            m = te._Member(did, name, idx, str(self.save), "src", {}, group=group, file_idx=idx, size=100, flat_name=name)
+            group.members[did] = m
+            engine._members[did] = m
+            members.append(m)
+        return group, members
+
+    @staticmethod
+    def _err(value, text="boom"):
+        return types.SimpleNamespace(value=lambda: value, message=lambda: text)
+
+    def test_a_full_disk_marks_every_running_member(self):
+        engine = self.make_engine()
+        group, (a, b) = self._two_member_group(engine)
+        engine._on_storage_error(group, self._err(next(iter(te.DISK_FULL_ERRNOS))), "")
+        for m in (a, b):
+            self.assertEqual(m.state_override, "Disk full")
+            self.assertIn("Disk full", m.error)
+            self.assertTrue(m.paused)
+
+    def test_a_file_error_only_marks_the_member_whose_file_failed(self):
+        engine = self.make_engine()
+        group, (a, b) = self._two_member_group(engine)
+        engine._on_storage_error(group, self._err(5, "Input/output error"), str(self.save / "B.bin"))
+        self.assertEqual((a.error, a.paused), ("", False))  # the healthy sibling is untouched
+        self.assertEqual(b.state_override, "Error")
+        self.assertIn("B.bin", b.error)
+        self.assertNotIn("bound method", b.error)
+
+    def test_a_file_error_naming_no_known_file_marks_nobody(self):
+        engine = self.make_engine()
+        group, (a, b) = self._two_member_group(engine)
+        engine._on_storage_error(group, self._err(5), str(self.save / "deleted-archive.zip"))
+        self.assertEqual([(m.error, m.paused) for m in (a, b)], [("", False), ("", False)])
+
+    def test_resume_after_a_storage_error_really_restarts_the_torrent(self):
+        engine = self.make_engine()
+        group, (a, b) = self._two_member_group(engine)
+        engine._on_storage_error(group, self._err(5), str(self.save / "A.bin"))
+        group.handle.reset_mock()
+        engine.resume("a")
+        group.handle.clear_error.assert_called()
+        group.handle.unset_flags.assert_called_with(lt.torrent_flags.upload_mode)  # libtorrent parks it there
+        group.handle.resume.assert_called()
+        self.assertEqual((a.error, a.paused), ("", False))
+
+    def test_retryable_failures_keep_the_partial_file_and_final_ones_delete_it(self):
+        engine = self.make_engine()
+        group, (a, b) = self._two_member_group(engine)
+        with mock.patch.object(engine, "_detach") as detach:
+            engine._fail(a, "Stalled", retryable=True)
+            engine._fail(b, "Invalid torrent", retryable=False)
+        self.assertEqual([c.kwargs["delete_partial"] for c in detach.call_args_list], [False, True])
 
     def test_events_are_only_finished_or_error(self):
         engine = self.make_engine()

@@ -36,8 +36,9 @@ class TestRomResolver(unittest.TestCase):
         self.rows = {}
         self.rom_fetches = []
         self.torrent_fetch = _Fetcher()
+        self.now = [0.0]
         self.cache = TorrentCache(pathlib.Path(self._tmp.name), fetch=self.torrent_fetch, parse=_parse,
-                                  base_url="https://x.test/")
+                                  base_url="https://x.test/", clock=lambda: self.now[0])
         self.resolver = lookup.RomResolver(self.cache, self._fetch_rom)
 
     def _fetch_rom(self, rom_id):
@@ -71,11 +72,18 @@ class TestRomResolver(unittest.TestCase):
         self.rows["1"] = {"so_id": 2, "torrents": "t/coll.torrent"}
         self.resolver.resolve("1", "c.zip")  # populates the cache
         stale_calls = self.torrent_fetch.calls
+        self.now[0] += 3600  # the cached copy is an hour old, so a refresh is allowed
         # Server renumbered: 'a.zip' is now at index 2 in the *fresh* torrent, but the cache says index 0.
         self.rows["2"] = {"so_id": 1, "torrents": "t/coll.torrent"}
         result = self.resolver.resolve("2", "a.zip")  # idx 1 != 'a.zip' -> refresh -> name fallback -> 0
         self.assertEqual(result.so_id, 0)
         self.assertEqual(self.torrent_fetch.calls, stale_calls + 1)
+
+    def test_a_mismatch_right_after_fetching_does_not_refetch_the_torrent(self):
+        self.rows["1"] = {"so_id": 1, "torrents": "t/coll.torrent"}
+        result = self.resolver.resolve("1", "a.zip")  # server says 1, torrent says a.zip is 0
+        self.assertEqual(result.so_id, 0)  # fixed by name from the torrent we just downloaded
+        self.assertEqual(self.torrent_fetch.calls, 1)
 
     def test_index_mismatch_after_refresh_is_reported(self):
         self.rows["1"] = {"so_id": 0, "torrents": "t/coll.torrent"}

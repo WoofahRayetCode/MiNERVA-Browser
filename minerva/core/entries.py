@@ -40,7 +40,8 @@ def parse_size_bytes(size_str: str) -> int:
 _TRAILING = re.compile(r"[\s\-_]([a-z]+)(?:\.[a-z0-9]{1,5})?$")
 _GROUP_RE = re.compile(r"[\(\[]([^\)\]]*)[\)\]]")
 _SPLIT_RE = re.compile(r"\s*(?:,|/|\+|&|\band\b)\s*")
-_WORD_RE = re.compile(r"[a-z0-9+]+")
+_WORD_RE = re.compile(r"[a-z]+|\d+|\+")
+_LETTERS_RE = re.compile(r"[a-z]+")
 
 
 def _groups(name_lower: str) -> list[str]:
@@ -102,6 +103,8 @@ _REGION_LETTERS = {
     "c": "china", "f": "france", "g": "germany", "i": "italy", "s": "spain",
 }
 _LETTER_COMBOS = {"ue", "uj", "uw", "ej", "ew", "jw", "uej", "uew", "ujw", "ejw", "uejw"}
+_SAFE_CODES = {"us", "eu", "jp", "kr", "cn", "hk", "tw", "au"}
+_REGION_NOISE = {"hz", "and"}  # "(Europe 50Hz)", "(USA and Canada)" style extras
 
 
 def detect_regions(name_lower: str) -> set[str]:
@@ -113,6 +116,14 @@ def detect_regions(name_lower: str) -> set[str]:
             region = _REGION_NAMES.get(token)
             if region:
                 regions.add(region)
+        # "(USA Europe)", "(USA; Europe)", "(Europe 50Hz)": region words separated by spaces or ';'.
+        words = _LETTERS_RE.findall(group)
+        named = {_REGION_NAMES[w] for w in words if w in _REGION_NAMES}
+        if named and all(w in _REGION_NAMES or w in _REGION_NOISE for w in words):
+            regions.update(named)
+        # "(US, EU)": every token is an unambiguous region code (a list like "(Fr,De)" is languages).
+        if len(tokens) > 1 and all(t in _SAFE_CODES or t in _REGION_NAMES for t in tokens):
+            regions.update(_REGION_CODES.get(t) or _REGION_NAMES[t] for t in tokens)
         if len(tokens) == 1:
             token = tokens[0]
             region = _REGION_CODES.get(token) or _REGION_LETTERS.get(token)
