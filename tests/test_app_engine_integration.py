@@ -135,7 +135,10 @@ class TestAppWithRealEngine(unittest.TestCase):
             self.assertEqual(len(extracted), 2)  # post-download processing was triggered for each
 
             # The browse list now shows both titles as downloaded, with no disk rescan.
-            self._pump_until(lambda: app._right_tree.set("/rom?id=1", "dlstat") == "✓", 5)
+            # The icon refresh is coalesced (~40 ms) and the two downloads may finish in different
+            # poll ticks, so wait for both rows rather than just the first.
+            self._pump_until(lambda: app._right_tree.set("/rom?id=1", "dlstat") == "✓"
+                             and app._right_tree.set("/rom?id=2", "dlstat") == "✓", 10)
             self.assertEqual(app._right_tree.set("/rom?id=1", "dlstat"), "✓")
             self.assertEqual(app._right_tree.set("/rom?id=2", "dlstat"), "✓")
             self.assertEqual(app._right_tree.set("/rom?id=3", "dlstat"), "")

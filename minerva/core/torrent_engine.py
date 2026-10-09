@@ -157,6 +157,8 @@ class _Group:
     checked: bool = False
     seeding_since: float = 0.0
     handle_paused: bool = False
+    last_downloaded: int = 0        # all_time_download at the last scan
+    last_activity: float = field(default_factory=time.monotonic)  # last time *any* bytes arrived
 
 
 class TorrentEngine:
@@ -222,6 +224,10 @@ class TorrentEngine:
         """
         with self._lock:
             self._seeding = {"enabled": bool(enabled), "ratio": float(ratio), "hours": float(hours)}
+            if not enabled:
+                # Torrents that only stayed alive to seed must go now, not at the next limit check.
+                for group in list(self._groups.values()):
+                    self._maybe_remove_group(group)
 
     # -- public API ------------------------------------------------------------------------------
     def add_download(self, torrent_source: str, so_id: int, file_name: str, save_path: str,
@@ -472,10 +478,16 @@ class TorrentEngine:
         return saved
 
     def _create_group(self, info_hash: str, params, ti, member: _Member):
-        group = _Group(info_hash=info_hash, save_path=member.save_path, ti=ti)
         params.save_path = member.save_path
         _prepare_add_params(params, defer_download=ti is None)
         self._trackers_into(params, ti)
+        params = self._merge_resume(info_hash, params, ti)
+        if ti is None and getattr(params, "ti", None) is not None:
+            # A resumed magnet whose blob was saved with the info dict: libtorrent already has the
+            # metadata and will not post metadata_received_alert, so waiting for it would leave
+            # the member in "Metadata" forever.  Treat it like a .torrent from here on.
+            ti = params.ti
+        group = _Group(info_hash=info_hash, save_path=member.save_path, ti=ti)
         if ti is not None:
             idx = self._resolve_index(ti, member)
             member.file_idx = idx
@@ -483,13 +495,11 @@ class TorrentEngine:
             self._preflight_disk(member, member.size)
             member.flat_name = self._flat_name(group, member, idx, ti)
             member.preexisting = self._file_on_disk(group.save_path, member, ti)
-        params = self._merge_resume(info_hash, params, ti)
-        if ti is not None:
             # Resume data must never decide what we download or where it lands.
             priorities = [0] * ti.num_files()
-            priorities[member.file_idx] = FILE_PRIORITY
+            priorities[idx] = FILE_PRIORITY
             params.file_priorities = priorities
-            params.renamed_files = {member.file_idx: member.flat_name} if member.flat_name else {}
+            params.renamed_files = {idx: member.flat_name} if member.flat_name else {}
         group.handle = self._session.add_torrent(params)
         group.members[member.did] = member
         member.group = group
@@ -784,6 +794,10 @@ class TorrentEngine:
             except Exception:
                 st = None
         unfinished = [m for m in group.members.values() if not (m.finished or m.cancelled)]
+        downloaded = int(getattr(st, "all_time_download", 0) or 0) if st is not None else 0
+        if downloaded > group.last_downloaded:
+            group.last_downloaded = downloaded
+            group.last_activity = now
         progress_list = None
         if group.ti is not None and any(m.file_idx >= 0 for m in unfinished):
             try:
@@ -821,7 +835,9 @@ class TorrentEngine:
         if st is not None and _TORRENT_STATE_MAP.get(st.state) == "Checking":
             member.last_progress_at = now
             return
-        idle = now - member.last_progress_at
+        # A healthy torrent can spend a long time on one sibling before writing a byte of this
+        # member's file; only call it stalled when the whole torrent has gone quiet.
+        idle = now - max(member.last_progress_at, group.last_activity)
         if idle > STALL_FAIL_AFTER:
             self._fail(member, "Stalled: no data received for 10 minutes", retryable=True)
         elif idle > STALL_REANNOUNCE_AFTER and member.stall_stage == 0:

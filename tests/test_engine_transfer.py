@@ -2,6 +2,8 @@
 import pathlib
 import queue
 import shutil
+import time
+import types
 import tempfile
 import threading
 import unittest
@@ -280,12 +282,44 @@ class TestSeeding(EngineCase):
         self.assertTrue(wait_until(lambda: not self.torrents(engine), 5))
 
 
+    def test_turning_seeding_off_releases_torrents_that_only_stayed_to_seed(self):
+        engine = self.make_engine()
+        engine.set_seeding(True, ratio=100.0, hours=24)
+        self.add(engine, "a", BETA, 1)
+        self.assertTrue(self.wait_finished(engine, ["a"]))
+        self.assertEqual(len(self.torrents(engine)), 1)  # seeding
+        engine.set_seeding(False)
+        self.assertTrue(wait_until(lambda: not self.torrents(engine), 5))
+        self.assertEqual((self.save / BETA).read_bytes(), self.seeder.files["Games/Beta (USA).bin"])
+
+
 class TestMagnet(EngineCase):
     def test_magnet_metadata_then_only_the_wanted_file(self):
         engine = self.make_engine()
         engine.add_download(f"magnet:?xt=urn:btih:{self.seeder.info_hash}", 1, BETA, str(self.save), "m")
         self.assertTrue(self.wait_finished(engine, ["m"], timeout=30), self.events)
         self.assertEqual([p.name for p in self.save.rglob("*") if p.is_file()], [BETA])
+        self.assertEqual((self.save / BETA).read_bytes(), self.seeder.files["Games/Beta (USA).bin"])
+
+
+    def test_magnet_resumed_with_saved_metadata_does_not_wait_for_metadata(self):
+        # A resume blob saved with the info dict hands libtorrent the metadata up front, so no
+        # metadata_received_alert follows.  The member must not sit in "Metadata" forever.
+        engine = self.make_engine()
+        info = lt.torrent_info(lt.bdecode(self.seeder.torrent_bytes))
+
+        def merge_with_info_dict(info_hash, params, ti):
+            params.ti = info  # what read_resume_data returns for a blob saved with save_info_dict
+            return params
+
+        engine._merge_resume = merge_with_info_dict
+        engine.add_download(f"magnet:?xt=urn:btih:{self.seeder.info_hash}", 1, BETA, str(self.save), "m")
+        group = wait_until(lambda: next(iter(engine._groups.values()), None), 5)
+        self.assertIsNotNone(group)
+        self.assertIsNotNone(group.ti)  # known immediately, before any peer is connected
+        status = wait_until(lambda: engine.get_all_statuses().get("m"), 5)
+        self.assertNotEqual(status["state"], "Metadata")
+        self.assertTrue(self.wait_finished(engine, ["m"]), self.events)
         self.assertEqual((self.save / BETA).read_bytes(), self.seeder.files["Games/Beta (USA).bin"])
 
 
@@ -309,6 +343,43 @@ class TestGuards(EngineCase):
         self.assertTrue(errors[0]["retryable"])
         self.assertIn("Stalled", errors[0]["msg"])
         self.assertTrue(wait_until(lambda: not self.torrents(engine), 5))
+
+
+    def _stub_group(self, engine, **member_kw):
+        group = te._Group(info_hash="ab" * 20, save_path=str(self.save), ti=object())
+        group.handle = mock.Mock()
+        member = te._Member("a", "A.bin", 0, str(self.save), "src", {}, group=group, file_idx=0, size=100, **member_kw)
+        group.members["a"] = member
+        return group, member
+
+    def test_a_member_is_not_stalled_while_the_torrent_is_receiving_data_for_a_sibling(self):
+        engine = self.make_engine()
+        group, member = self._stub_group(engine)
+        now = time.monotonic()
+        member.last_progress_at = now - 10_000  # this file has been untouched for hours...
+        group.last_activity = now               # ...but bytes for another file just arrived
+        with mock.patch.object(engine, "_fail") as fail:
+            engine._watchdog(group, member, now)
+        fail.assert_not_called()
+        group.last_activity = now - 10_000      # now the whole torrent is quiet
+        with mock.patch.object(engine, "_fail") as fail:
+            engine._watchdog(group, member, now)
+        fail.assert_called_once()
+        self.assertTrue(fail.call_args.kwargs["retryable"])
+
+    def test_scan_records_torrent_wide_download_activity(self):
+        engine = self.make_engine()
+        group, member = self._stub_group(engine)
+        group.handle.file_progress.return_value = [0]
+        group.status = types.SimpleNamespace(state=0, download_rate=0, upload_rate=0, num_peers=0,
+                                             total_done=0, all_time_download=500)
+        old = time.monotonic() - 1000
+        group.last_activity = old
+        now = time.monotonic()
+        engine._scan_group(group, now, {})
+        self.assertEqual((group.last_downloaded, group.last_activity), (500, now))
+        engine._scan_group(group, now + 5, {})  # nothing new arrived: activity time must not move
+        self.assertEqual(group.last_activity, now)
 
     def test_events_are_only_finished_or_error(self):
         engine = self.make_engine()
