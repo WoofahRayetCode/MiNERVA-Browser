@@ -25,6 +25,7 @@ A portable desktop GUI for browsing and downloading from [minerva-archive.org](h
 - 🔄 **Download queue** with configurable concurrency (1–10 simultaneous downloads), tested with 10,000 queued items
 - 📋 **Downloads list** — one scalable table (name, size, progress, speed, ETA, peers, status) with **All / Active / Queued / Done / Errors** filters, multi-select, right-click menu, and keyboard control (`Space` pause/resume, `Del` cancel/remove, `R` retry, `Alt+↑/↓` reorder, `Ctrl+A`, `Enter` open folder)
 - 🔁 **Automatic retry** — stalled or failed downloads wait out a backoff (30 s, 2 min, 10 min) and retry before being reported as errors; failed items show the real reason and a **Retry** action
+- 🧯 **Lookups survive the archive's ROM page being down** — the file → torrent mapping is read from the archive's published `hashes.db` with a few small range requests (no 1.7 GB download); files whose lookup still fails stay in the list under **Errors** with a **Retry** action instead of disappearing
 - 🔌 **Resumes after a crash or restart** — libtorrent resume data and DHT state are saved periodically and on exit, so partial downloads continue without a full re-check
 - 🌱 **Optional seeding** — "Seed finished files" (off by default) keeps finished torrents alive until ratio 1.0 or 24 hours
 - ⚙️ **Advanced downloads panel** — save folder, extract/CHD/Xbox toggles, and ROM tools (collapsed by default)
@@ -149,7 +150,8 @@ Local settings (`minerva_settings.json`), logs, torrents, downloads, extracted d
 │   │   ├── resume_store.py    # Resume data + DHT state persistence
 │   │   ├── http.py            # Retrying HTTP client, rate gate, atomic file writes
 │   │   ├── torrent_cache.py   # Single-flight, validated collection .torrent cache
-│   │   ├── lookup.py          # ROM page → verified torrent source, aggregated errors
+│   │   ├── lookup.py          # Row lookup (hashes.db → ROM page) → verified torrent source, aggregated errors
+│   │   ├── hashes_db.py       # Reads single rows of the archive's hashes.db over HTTP range requests
 │   │   ├── library_index.py   # Background "already downloaded" index
 │   │   ├── entries.py         # Per-listing precompute (regions, tags, sizes, match keys)
 │   │   ├── download_view.py   # Row formatting for the downloads list (Tk-free)
@@ -173,7 +175,7 @@ Local settings (`minerva_settings.json`), logs, torrents, downloads, extracted d
     ├── test_app_smoke.py              # headless window: scale, debounce, bulk queue, polling
     ├── test_downloads_panel.py        # 5k-row panel budgets, filters, key handling
     ├── test_download_queue*.py        # queue behaviour incl. 10k-item scale tests
-    ├── test_http.py / test_torrent_cache.py / test_lookup.py
+    ├── test_http.py / test_torrent_cache.py / test_lookup.py / test_hashes_db.py
     ├── test_extractors.py / test_companions.py / test_ps3_dkeys.py / test_parsers.py
     └── …                              # settings, library index, entries, view model, assets
 ```
@@ -184,7 +186,7 @@ Local settings (`minerva_settings.json`), logs, torrents, downloads, extracted d
 
 MiNERVA distributes all files via BitTorrent:
 
-1. Looks up the selected file on its minerva-archive.org `/rom?id=…` page to find its collection torrent and file index (a bounded pool of workers, rate-limited and retried)
+1. Looks up the selected file to find its collection torrent and file index (a bounded pool of workers, rate-limited and retried). The answer comes from the archive's `hashes.db`, read row by row with HTTP range requests and only accepted when its file name matches the listing; the `/rom?id=…` page is the fallback. A file that cannot be looked up stays in the list as an error you can retry
 2. Fetches the collection `.torrent` once into `torrentfiles/` and verifies that the file index really is the requested file
 3. Adds the collection to libtorrent **once** and downloads only the selected files within it; several queued files from one collection share one torrent, and cancelling one never disturbs the others. Files land directly in your save folder (no collection sub-folders)
 4. Optionally extracts the file using detected extractors (7-Zip / PeaZip / WinRAR / zipfile)

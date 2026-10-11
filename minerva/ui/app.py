@@ -53,6 +53,7 @@ from minerva.ui.components.filter_bar import FilterBar
 from minerva.ui.downloads_panel import DownloadsPanel, PanelActions
 from minerva.ui.components.tools_dialog import ToolsMenu, ToolsDialog
 from minerva.ui.components.companion_dialog import prompt_companions
+from minerva.core.hashes_db import HashesDb
 from minerva.core.sqlite_http import fetch_entries, fetch_rom_info, extract_rom_id
 from minerva.core.companions import find_companions, classify_release, KIND_BASE
 from minerva.core.ps3_dkeys import (
@@ -78,6 +79,7 @@ from minerva.core.workers import DaemonPool
 from minerva.core.lookup import (
     LookupErrors,
     LookupFailure,
+    failure_text,
     QueuedDownload,
     RomResolver,
     strip_default_trackers,
@@ -316,7 +318,7 @@ class MinervaApp(tk.Tk):
         self._lookup_errors = LookupErrors()
         self._lookup_pump_after_id = None
         self._torrent_cache = TorrentCache(get_torrent_dir())
-        self._rom_resolver = RomResolver(self._torrent_cache, fetch_rom_info)
+        self._rom_resolver = RomResolver(self._torrent_cache, fetch_rom_info, rom_db=HashesDb())
         self._dlstat_tip_window = None
         self._dlstat_tip_text = ""
         self._checked_hrefs: set[str] = set()
@@ -3110,9 +3112,21 @@ class MinervaApp(tk.Tk):
     def _panel_retry(self, ids: list[str]):
         if not self._download_queue:
             return
+        done = {d["id"]: d for d in self._download_queue.snapshot()["done"]}
         retried = 0
         for did in ids:
-            if self._download_queue.requeue_done(did, str(uuid.uuid4()), start=True):
+            item = done.get(did) or {}
+            lookup = item.get("lookup")
+            if lookup is not None:
+                # The file never made it into the queue: run its lookup again; the outcome replaces this row.
+                if self._submit_lookup(
+                    str(uuid.uuid4()), lookup.get("rom_id", ""), item["name"],
+                    item.get("save_path") or self.get_download_dir(), lookup.get("browse_path", ""),
+                    **lookup.get("flags", {}),
+                ):
+                    self._download_queue.pop_done(did)
+                    retried += 1
+            elif self._download_queue.requeue_done(did, str(uuid.uuid4()), start=True):
                 self._extract_progress.pop(did, None)
                 retried += 1
         if retried:
@@ -3123,6 +3137,14 @@ class MinervaApp(tk.Tk):
     def _panel_redownload(self, ids: list[str]):
         if not ids:
             return
+        if self._download_queue:
+            done = {d["id"]: d for d in self._download_queue.snapshot()["done"]}
+            never_queued = [i for i in ids if "lookup" in done.get(i, {})]
+            if never_queued:  # nothing was downloaded, so there is nothing to delete: just try again
+                self._panel_retry(never_queued)
+                ids = [i for i in ids if i not in never_queued]
+                if not ids:
+                    return
         if len(ids) > 1 and not messagebox.askyesno(
             "Redownload", f"Delete {len(ids)} files and download them again?"
         ):
@@ -3259,12 +3281,30 @@ class MinervaApp(tk.Tk):
         if not self._downloads_visible:
             self._toggle_downloads()
 
+    def _record_failed_lookup(self, download_id: str, rom_id: str, file_name: str, save_path: str,
+                              browse_path: str, kind: str, message: str, flags: dict):
+        """Keep a file that could not be queued in the downloads list (Errors), where Retry can run it again."""
+        dl_queue = self._download_queue
+        if dl_queue is None:
+            return
+        try:
+            dl_queue.add_failed(
+                download_id, file_name, failure_text(kind, message),
+                save_path=save_path, rom_id=rom_id, browse_path=browse_path, flags=flags,
+            )
+        except Exception as e:
+            log_error(f"MinervaApp could not record the failed lookup of {file_name}", e)
+
     def _flush_lookup_errors(self):
         errors = self._lookup_errors.take()
         if not errors:
             return
         title, body = LookupErrors.format(errors)
-        self._status_var.set(f"{len(errors)} download(s) could not be queued")
+        self._status_var.set(f"{len(errors)} download(s) could not be queued - see Errors in the downloads list")
+        if not self._downloads_visible:
+            self._toggle_downloads()
+        else:
+            self._sync_downloads_panel()
         if len(errors) == 1 and errors[0].kind in ("not_found", "no_torrent"):
             messagebox.showwarning(title, body)
         elif len(errors) == 1:
@@ -3294,18 +3334,22 @@ class MinervaApp(tk.Tk):
                 return
             reserved = True
 
+        flags = {"skip_name_dedupe": skip_name_dedupe, "fetch_ps3_dkey": fetch_ps3_dkey,
+                 "skip_companions": skip_companions}
         try:
             resolved = self._rom_resolver.resolve(rom_id, file_name)
         except LookupFailure as e:
             if reserved:
                 dl_queue.release(file_name)
             log_error(f"MinervaApp._lookup_and_enqueue {e.kind} for {file_name}: {e.message}")
+            self._record_failed_lookup(download_id, rom_id, file_name, save_path, browse_path, e.kind, e.message, flags)
             self._record_lookup_error(e.kind, file_name, e.message)
             return
         except Exception as e:
             if reserved:
                 dl_queue.release(file_name)
             log_error(f"MinervaApp._lookup_and_enqueue failed for {file_name}", e)
+            self._record_failed_lookup(download_id, rom_id, file_name, save_path, browse_path, "unexpected", str(e), flags)
             self._record_lookup_error("unexpected", file_name, str(e))
             return
 
@@ -3532,8 +3576,8 @@ class MinervaApp(tk.Tk):
                     snap = self._download_queue.snapshot()
                     for item in (*snap["pending"], *snap["done"]):
                         name = item.get("name") or ""
-                        if is_dkey_save_path(item.get("save_path")):
-                            continue
+                        if item.get("lookup") is not None or is_dkey_save_path(item.get("save_path")):
+                            continue  # a failed lookup was never downloaded
                         entry = self._resolve_dkey_catalog_entry(name, item.get("save_path") or "")
                         if entry:
                             rom_names.add(entry.get("name") or name)

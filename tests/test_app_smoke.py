@@ -92,6 +92,17 @@ class TestAppSmoke(unittest.TestCase):
             self.app.update()
             time.sleep(0.005)
 
+    def _wait_for_lookups(self, timeout=30):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            self.app.update()
+            with self.app._lookup_lock:
+                pending = self.app._lookup_pending
+            if pending == 0 and self.app._lookup_pump_after_id is None and self.app._lookup_results.empty():
+                return
+            time.sleep(0.01)
+        self.fail("lookups did not finish")
+
     def _run_in_mainloop(self, fn):
         """Run ``fn`` once the loop is up, re-raise whatever it raises, then stop the loop."""
         failure = []
@@ -232,6 +243,87 @@ class TestAppSmoke(unittest.TestCase):
 
         self._run_in_mainloop(scenario)
 
+    def test_failed_lookups_stay_in_the_list_as_errors_and_retry_queues_them(self):
+        def scenario():
+            app = self.app
+            self._pump(0.8)
+            engine = _FakeEngine()
+            app._torrent_engine = engine
+            app._download_queue = DownloadQueue(engine, max_active=3, key_fn=library_keys_for_name)
+            archive_down = [True]
+
+            class Resolver:
+                def resolve(self_inner, rom_id, name):
+                    if archive_down[0] and int(rom_id) % 2 == 0:
+                        raise LookupFailure("lookup", "ROM page: timed out (file database: unreachable)")
+                    return ResolvedDownload(f"src-{rom_id}", int(rom_id), name)
+
+            app._rom_resolver = Resolver()
+            dialogs = []
+            with mock.patch.object(app, "_save_settings"), \
+                    mock.patch.object(app_module.messagebox, "showwarning",
+                                      side_effect=lambda title, body: dialogs.append((title, body))), \
+                    mock.patch.object(app_module.messagebox, "showerror",
+                                      side_effect=lambda title, body: dialogs.append((title, body))):
+                for i in range(1, 7):
+                    app._submit_lookup(f"id{i}", str(i), f"Game {i}.zip", "/tmp", "/browse/Redump/")
+                self._wait_for_lookups()
+
+                snap = app._download_queue.snapshot()
+                self.assertEqual(sorted(d["name"] for d in snap["pending"]), ["Game 1.zip", "Game 3.zip", "Game 5.zip"])
+                failed = {d["name"]: d for d in snap["done"]}
+                self.assertEqual(sorted(failed), ["Game 2.zip", "Game 4.zip", "Game 6.zip"])  # nothing silently lost
+                row = failed["Game 2.zip"]
+                self.assertEqual(row["status"], "error")
+                self.assertTrue(row["error"].startswith("Lookup Failed:"))
+                self.assertEqual(row["lookup"]["rom_id"], "2")
+                self.assertEqual(row["lookup"]["browse_path"], "/browse/Redump/")
+                self.assertEqual(len(dialogs), 1)
+                self.assertIn("under Errors", dialogs[0][1])
+
+                # Picking the same titles again is not ignored just because a failed row exists...
+                app._submit_lookup("again2", "2", "Game 2.zip", "/tmp", "/browse/Redump/")
+                self._wait_for_lookups()
+                self.assertEqual([d["name"] for d in app._download_queue.snapshot()["done"]].count("Game 2.zip"), 1)
+
+                # ...and Retry on the Errors rows runs the lookups again; successes replace the rows.
+                archive_down[0] = False
+                app._panel_retry([d["id"] for d in app._download_queue.snapshot()["done"]])
+                self._wait_for_lookups()
+
+            snap = app._download_queue.snapshot()
+            self.assertEqual(len(snap["pending"]), 6)
+            self.assertEqual(snap["done"], [])
+            self.assertEqual(len(dialogs), 2)  # the second attempt at Game 2 failed too, and said so
+
+        self._run_in_mainloop(scenario)
+
+    def test_redownload_on_a_failed_lookup_retries_it_without_asking_to_delete_anything(self):
+        def scenario():
+            app = self.app
+            self._pump(0.8)
+            engine = _FakeEngine()
+            app._torrent_engine = engine
+            app._download_queue = DownloadQueue(engine, max_active=3, key_fn=library_keys_for_name)
+            app._download_queue.add_failed("f1", "Game 8.zip", "Lookup Failed: x", save_path="/tmp",
+                                           rom_id="8", browse_path="/browse/Redump/")
+
+            class Resolver:
+                def resolve(self_inner, rom_id, name):
+                    return ResolvedDownload(f"src-{rom_id}", int(rom_id), name)
+
+            app._rom_resolver = Resolver()
+            with mock.patch.object(app, "_save_settings"), \
+                    mock.patch.object(app_module.messagebox, "askyesno",
+                                      side_effect=AssertionError("must not ask to delete files")):
+                app._panel_redownload(["f1"])
+                self._wait_for_lookups()
+            snap = app._download_queue.snapshot()
+            self.assertEqual([d["name"] for d in snap["pending"]], ["Game 8.zip"])
+            self.assertEqual(snap["done"], [])
+
+        self._run_in_mainloop(scenario)
+
     def test_search_typing_is_debounced_into_one_render(self):
         def scenario():
             app = self.app
@@ -310,7 +402,9 @@ class TestAppSmoke(unittest.TestCase):
             app._download_queue.enqueue("a1", "A.zip", "s", 0, "/tmp")
             app._download_queue.start_selected(["a1"])
             app._downloads_visible = True
-            app._poll_downloads_once()  # used to raise NameError once a download was active
+            # Some window managers leave the test window iconified, which skips the panel rebuild.
+            with mock.patch.object(app, "state", return_value="normal"):
+                app._poll_downloads_once()  # used to raise NameError once a download was active
             self.assertIn("3.0 MB/s", app._dl_summary_lbl.cget("text"))
             self.assertIn("50% @ 3.0 MB/s", app.title())
             self.assertEqual(app._downloads_panel.kind_of("a1"), "active")

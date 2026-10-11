@@ -13,7 +13,9 @@ What changed for scale (thousands of items):
   network lookup, closing the duplicate race;
 * ``enqueue_many`` takes the lock once for a whole batch;
 * failed items can wait out a backoff in ``retry`` state (``on_failed`` / ``tick``);
-* the done list is capped so a long session cannot grow without bound.
+* the done list is capped so a long session cannot grow without bound;
+* a file whose lookup failed is kept as an error row (``add_failed``) so it stays visible and can be
+  retried; it never counts as "already queued" and is replaced by the next attempt for that name.
 """
 from __future__ import annotations
 
@@ -97,6 +99,28 @@ class DownloadQueue:
             self._place(where, item)
         return item
 
+    def _is_failed_lookup(self, did: str) -> bool:
+        return self._where.get(did) == _DONE and "lookup" in self._done.get(did, ())
+
+    def _has_live_entry(self, name: str) -> bool:
+        """True if ``name`` is queued/active/retrying/finished; failed-lookup rows do not count."""
+        ids = self._by_name.get(name)
+        return bool(ids) and any(not self._is_failed_lookup(did) for did in ids)
+
+    def _drop_failed_lookups(self, name: str) -> None:
+        """A new attempt for ``name`` replaces its failed-lookup rows."""
+        ids = self._by_name.get(name)
+        if ids:
+            for did in [d for d in ids if self._is_failed_lookup(d)]:
+                self._remove(did)
+
+    def _trim_done(self) -> None:
+        while len(self._done) > self._max_done:
+            victim = next((k for k, v in self._done.items() if v.get("status") == "done"), None)
+            if victim is None:
+                victim = next(iter(self._done))
+            self._remove(victim)
+
     # -- enqueue ---------------------------------------------------------------------------------
     @staticmethod
     def _make_item(download_id: str, name: str, source: str, so_id: int, save_path: str,
@@ -117,6 +141,7 @@ class DownloadQueue:
             if self._where.get(download_id) not in (None, _PENDING):
                 return  # never clobber an item that already started or finished
             self._remove(download_id)
+            self._drop_failed_lookups(name)
             self._place(_PENDING, item)
             self._bump()
 
@@ -134,6 +159,7 @@ class DownloadQueue:
                     continue
                 item = self._make_item(did, raw["name"], raw["source"], int(raw["so_id"]),
                                        raw["save_path"], bool(raw.get("start_requested", False)))
+                self._drop_failed_lookups(item["name"])
                 self._place(_PENDING, item)
                 if item["start_requested"]:
                     self._startable.append(did)
@@ -143,9 +169,11 @@ class DownloadQueue:
         return added
 
     def reserve(self, name: str) -> bool:
-        """Atomically claim ``name`` before a slow lookup; False if it is already queued/reserved."""
+        """Atomically claim ``name`` before a slow lookup; False if it is already queued/reserved.
+
+        A name whose only entries are failed lookups can be claimed again: that is a retry."""
         with self._lock:
-            if name in self._by_name or name in self._reserved:
+            if name in self._reserved or self._has_live_entry(name):
                 return False
             self._reserved.add(name)
             return True
@@ -153,6 +181,39 @@ class DownloadQueue:
     def release(self, name: str) -> None:
         with self._lock:
             self._reserved.discard(name)
+
+    def add_failed(
+        self,
+        download_id: str,
+        name: str,
+        error: str,
+        *,
+        save_path: str,
+        rom_id: str = "",
+        browse_path: str = "",
+        flags: dict | None = None,
+    ) -> None:
+        """Keep a file that could not be queued (its lookup failed) as an error row.
+
+        The row remembers what the lookup needs (``lookup``: rom id, archive folder, options) so Retry can
+        run it again.  At most one such row exists per name; a later attempt replaces it.
+        """
+        item = {
+            "id": download_id,
+            "name": name,
+            "source": "",
+            "so_id": 0,
+            "save_path": str(pathlib.Path(save_path).resolve()) if save_path else "",
+            "status": "error",
+            "error": error,
+            "lookup": {"rom_id": str(rom_id), "browse_path": browse_path, "flags": dict(flags or {})},
+        }
+        with self._lock:
+            self._remove(download_id)
+            self._drop_failed_lookups(name)
+            self._place(_DONE, item)
+            self._trim_done()
+            self._bump()
 
     # -- starting --------------------------------------------------------------------------------
     def start_selected(self, download_ids: list[str]):
@@ -235,11 +296,7 @@ class DownloadQueue:
             "error": error,
         }
         self._place(_DONE, done)
-        while len(self._done) > self._max_done:
-            victim = next((k for k, v in self._done.items() if v.get("status") == "done"), None)
-            if victim is None:
-                victim = next(iter(self._done))
-            self._remove(victim)
+        self._trim_done()
 
     def on_finished(self, download_id: str, error: str = ""):
         with self._lock:
@@ -315,6 +372,9 @@ class DownloadQueue:
             return item
 
     def requeue_done(self, download_id: str, new_id: str, start: bool = True) -> dict | None:
+        with self._lock:
+            if self._is_failed_lookup(download_id):
+                return None  # nothing to start: the lookup has to run again
         item = self.pop_done(download_id)
         if item is None:
             return None
@@ -368,7 +428,7 @@ class DownloadQueue:
 
     def has_name(self, name: str) -> bool:
         with self._lock:
-            return name in self._by_name or name in self._reserved
+            return name in self._reserved or self._has_live_entry(name)
 
     def find_by_name(self, name: str) -> dict | None:
         with self._lock:
@@ -378,7 +438,7 @@ class DownloadQueue:
             # Prefer live entries over finished ones, like the original list scan order.
             for where in (_PENDING, _ACTIVE, _RETRY, _DONE):
                 for did in ids:
-                    if self._where.get(did) == where:
+                    if self._where.get(did) == where and not self._is_failed_lookup(did):
                         return dict(self._store(where)[did])
             return None
 

@@ -121,14 +121,21 @@ class TestAppWithRealEngine(unittest.TestCase):
                 self.assertTrue(self._pump_until(lambda: len(app._download_queue.snapshot()["pending"]) == 2, 10))
                 self.assertEqual(len(dialogs), 1)  # the one failure is reported once
                 self.assertIn("Gamma.bin", dialogs[0][1])
+                # ...and it stays in the list as an error row instead of vanishing
+                (failed,) = app._download_queue.snapshot()["done"]
+                self.assertEqual((failed["name"], failed["status"]), ("Gamma.bin", "error"))
+                self.assertEqual(failed["error"], "Not found on the server")
 
                 app._download_queue.start_all_pending()
-                done = lambda: len(app._download_queue.snapshot()["done"]) == 2  # noqa: E731
+                done = lambda: sum(  # noqa: E731
+                    1 for d in app._download_queue.snapshot()["done"] if d["status"] == "done") == 2
                 self.assertTrue(self._pump_until(done, 40), app._download_queue.snapshot())
 
             snap = app._download_queue.snapshot()
-            self.assertEqual({d["name"] for d in snap["done"]}, {ALPHA, BETA})
-            self.assertTrue(all(d["status"] == "done" for d in snap["done"]), snap["done"])
+            finished = [d for d in snap["done"] if "lookup" not in d]
+            self.assertEqual({d["name"] for d in finished}, {ALPHA, BETA})
+            self.assertTrue(all(d["status"] == "done" for d in finished), finished)
+            self.assertEqual([d["name"] for d in snap["done"] if "lookup" in d], ["Gamma.bin"])
             download_dir = pathlib.Path(app.get_download_dir())
             self.assertEqual((download_dir / ALPHA).read_bytes(), self.seeder.files[f"Games/{ALPHA}"])
             self.assertEqual((download_dir / BETA).read_bytes(), self.seeder.files[f"Games/{BETA}"])

@@ -1,9 +1,11 @@
 import pathlib
 import tempfile
 import unittest
+import unittest.mock
 
 from minerva.constants import TRACKERS
 from minerva.core import lookup
+from minerva.core.hashes_db import HashesDbError
 from minerva.core.http import HttpError
 from minerva.core.torrent_cache import TorrentCache, TorrentSummary, TorrentInvalid
 
@@ -130,6 +132,183 @@ class TestRomResolver(unittest.TestCase):
             self.resolver.resolve("1", "a.zip")
 
 
+class _FakeDb:
+    """Stands in for HashesDb: ``rows`` maps id -> row dict, None (unknown id) or an exception to raise."""
+
+    def __init__(self):
+        self.rows = {}
+        self.calls = []
+
+    def lookup_id(self, rowid):
+        self.calls.append(rowid)
+        row = self.rows.get(rowid)
+        if isinstance(row, Exception):
+            raise row
+        return row
+
+
+def _db_row(rowid, name="b.zip", **extra):
+    row = {"id": rowid, "full_path": f"dir/{name}", "file_name": name, "so_id": 1,
+           "torrents": "t/coll.torrent", "magnet": "magnet:?xt=urn:btih:abc"}
+    row.update(extra)
+    return row
+
+
+class TestRomResolverWithDatabase(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.now = [0.0]
+        self.torrent_fetch = _Fetcher()
+        self.cache = TorrentCache(pathlib.Path(self._tmp.name), fetch=self.torrent_fetch, parse=_parse,
+                                  base_url="https://x.test/", clock=lambda: self.now[0])
+        self.db = _FakeDb()
+        self.page_rows = {}
+        self.page_calls = []
+        self.page_error = None
+        self.resolver = lookup.RomResolver(self.cache, self._fetch_page, rom_db=self.db,
+                                           clock=lambda: self.now[0], outage_threshold=3, outage_cooldown=60.0)
+
+    def _fetch_page(self, rom_id):
+        self.page_calls.append(rom_id)
+        if self.page_error is not None:
+            raise self.page_error
+        return self.page_rows.get(rom_id)
+
+    def test_the_database_answers_without_touching_the_rom_page(self):
+        self.db.rows[10] = _db_row(10)
+        result = self.resolver.resolve("10", "b.zip")
+        self.assertEqual(result.so_id, 1)
+        self.assertTrue(pathlib.Path(result.source).is_file())
+        self.assertEqual(result.full_path, "dir/b.zip")
+        self.assertEqual(self.page_calls, [])
+
+    def test_a_dead_rom_page_does_not_matter_when_the_database_has_the_rows(self):
+        self.page_error = HttpError("The read operation timed out", retryable=True)
+        for i in range(30):
+            self.db.rows[i] = _db_row(i, name=NAMES[i % 3], so_id=i % 3)
+        for i in range(30):
+            self.assertEqual(self.resolver.resolve(str(i), NAMES[i % 3]).so_id, i % 3)
+        self.assertEqual(self.page_calls, [])
+
+    def test_names_are_compared_ignoring_case(self):
+        self.db.rows[10] = _db_row(10, name="inFamous (USA).iso", so_id=0)
+        # the listing only knows the lowercase form; the torrent index check is case-insensitive as well
+        self.resolver.row_for("10", "infamous (usa).iso")
+        self.assertEqual(self.page_calls, [])
+
+    def test_rows_for_a_different_file_are_not_used(self):
+        self.db.rows[10] = _db_row(10, name="other.zip")
+        self.page_rows["10"] = {"so_id": 1, "torrents": "t/coll.torrent", "full_path": "page/b.zip"}
+        result = self.resolver.resolve("10", "b.zip")
+        self.assertEqual(result.full_path, "page/b.zip")  # came from the ROM page
+        self.assertEqual(self.page_calls, ["10"])
+
+    def test_unknown_ids_and_incomplete_rows_fall_back_to_the_rom_page(self):
+        self.page_rows["11"] = {"so_id": 1, "torrents": "t/coll.torrent", "full_path": "page/11"}
+        self.page_rows["12"] = {"so_id": 1, "torrents": "t/coll.torrent", "full_path": "page/12"}
+        self.page_rows["13"] = {"so_id": 1, "torrents": "t/coll.torrent", "full_path": "page/13"}
+        self.db.rows[12] = _db_row(12, so_id=None)             # older row without a file index
+        self.db.rows[13] = _db_row(13, torrents=None, magnet=None)
+        for rom_id in ("11", "12", "13"):
+            self.assertEqual(self.resolver.resolve(rom_id, "b.zip").full_path, f"page/{rom_id}")
+        self.assertEqual(self.page_calls, ["11", "12", "13"])
+
+    def test_a_non_numeric_id_skips_the_database(self):
+        self.page_rows["abc"] = {"so_id": 1, "torrents": "t/coll.torrent"}
+        self.resolver.resolve("abc", "b.zip")
+        self.assertEqual(self.db.calls, [])
+
+    def test_a_database_error_falls_back_to_the_page_and_the_page_wins(self):
+        self.db.rows[10] = HashesDbError("The read operation timed out", retryable=True)
+        self.page_rows["10"] = {"so_id": 1, "torrents": "t/coll.torrent", "full_path": "page/b.zip"}
+        self.assertEqual(self.resolver.resolve("10", "b.zip").full_path, "page/b.zip")
+
+    def test_a_crashing_reader_never_blocks_queueing(self):
+        self.db.rows[10] = RuntimeError("bug in the reader")
+        self.page_rows["10"] = {"so_id": 1, "torrents": "t/coll.torrent", "full_path": "page/b.zip"}
+        with unittest.mock.patch("minerva.core.lookup.log_error"):
+            self.assertEqual(self.resolver.resolve("10", "b.zip").full_path, "page/b.zip")
+
+    def test_the_database_breaker_stops_asking_a_broken_database(self):
+        for i in range(10):
+            self.db.rows[i] = HashesDbError("timed out", retryable=True)
+            self.page_rows[str(i)] = {"so_id": 1, "torrents": "t/coll.torrent"}
+        for i in range(10):
+            self.resolver.resolve(str(i), "b.zip")
+        self.assertEqual(len(self.db.calls), 3)  # tripped after three failures
+        self.now[0] += 61
+        self.db.rows[20] = _db_row(20)
+        self.resolver.resolve("20", "b.zip")  # the probe after the cooldown
+        self.assertEqual(len(self.db.calls), 4)
+        self.assertEqual(self.page_calls.count("20"), 0)  # and it worked, so the page was not needed
+
+    def test_unknown_ids_do_not_count_as_database_failures(self):
+        for i in range(10):
+            self.page_rows[str(i)] = {"so_id": 1, "torrents": "t/coll.torrent"}
+            self.resolver.resolve(str(i), "b.zip")
+        self.assertEqual(len(self.db.calls), 10)
+
+    def test_both_sources_failing_gives_one_readable_message(self):
+        self.db.rows[10] = HashesDbError("timed out", retryable=True)
+        self.page_error = HttpError("The read operation timed out (https://x.test/rom?id=10)", retryable=True)
+        with self.assertRaises(lookup.LookupFailure) as ctx:
+            self.resolver.resolve("10", "b.zip")
+        message = ctx.exception.message
+        self.assertEqual(ctx.exception.kind, "lookup")
+        self.assertIn("timed out", message)
+        self.assertIn("file database", message)
+        self.assertNotIn("http", message)  # no URLs in the message
+
+    def test_an_id_that_exists_nowhere_is_not_found_not_a_lookup_failure(self):
+        with self.assertRaises(lookup.LookupFailure) as ctx:
+            self.resolver.resolve("99", "b.zip")
+        self.assertEqual(ctx.exception.kind, "not_found")
+
+    def test_rows_are_remembered_so_each_id_is_looked_up_once(self):
+        self.db.rows[10] = _db_row(10)
+        self.resolver.resolve("10", "b.zip")
+        self.resolver.resolve("10", "b.zip")
+        self.assertEqual(self.db.calls, [10])
+
+    def test_a_torrent_the_snapshot_points_to_but_the_archive_no_longer_serves_uses_the_live_row(self):
+        self.torrent_fetch.payloads = [HttpError("HTTP 404", status=404), b"d4:infode"]
+        self.db.rows[10] = _db_row(10, torrents="old/coll.torrent")
+        self.page_rows["10"] = {"so_id": 1, "torrents": "new/coll.torrent", "full_path": "page/b.zip"}
+        result = self.resolver.resolve("10", "b.zip")
+        self.assertTrue(pathlib.Path(result.source).is_file())  # a real torrent file, not the magnet
+        self.assertEqual(result.full_path, "page/b.zip")
+        self.assertEqual(self.page_calls, ["10"])
+
+    def test_a_gone_torrent_with_the_page_down_falls_back_to_the_magnet(self):
+        self.torrent_fetch.payloads = [HttpError("HTTP 404", status=404)]
+        self.page_error = HttpError("timed out", retryable=True)
+        self.db.rows[10] = _db_row(10, torrents="old/coll.torrent")
+        result = self.resolver.resolve("10", "b.zip")
+        self.assertEqual(result.source, "magnet:?xt=urn:btih:abc")
+
+    def test_a_transient_torrent_error_does_not_ask_the_page(self):
+        self.torrent_fetch.payloads = [HttpError("HTTP 503", status=503, retryable=True)]
+        self.db.rows[10] = _db_row(10)
+        result = self.resolver.resolve("10", "b.zip")
+        self.assertEqual(result.source, "magnet:?xt=urn:btih:abc")
+        self.assertEqual(self.page_calls, [])
+
+
+class TestDescribeError(unittest.TestCase):
+    def test_urls_are_stripped_from_the_end_of_messages(self):
+        for raw, expected in (
+            ("The read operation timed out (https://minerva-archive.org/rom?id=1070219)", "The read operation timed out"),
+            ("HTTP 503 for https://minerva-archive.org/rom?id=1", "HTTP 503"),
+            ("Response too large (1759227904 bytes)", "Response too large (1759227904 bytes)"),
+            ("server ignored the range request (HTTP 200)", "server ignored the range request (HTTP 200)"),
+        ):
+            self.assertEqual(lookup.describe_error(Exception(raw)), expected)
+
+    def test_an_empty_message_falls_back_to_the_type_name(self):
+        self.assertEqual(lookup.describe_error(RuntimeError("")), "RuntimeError")
+
+
 class TestOutageBreaker(unittest.TestCase):
     def setUp(self):
         self.now = [0.0]
@@ -232,6 +411,7 @@ class TestLookupErrors(unittest.TestCase):
         self.assertIn("Not Found: 1", body)
         self.assertIn("…and 36 more", body)
         self.assertEqual(body.count("Game "), 5)  # only a handful of examples
+        self.assertIn("under Errors", body)  # failures stay visible and retryable in the downloads list
 
     def test_take_empties_the_collector_and_bounds_memory(self):
         errors = lookup.LookupErrors(max_keep=3)

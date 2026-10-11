@@ -84,6 +84,11 @@ def _nfc(text: str) -> str:
     return unicodedata.normalize("NFC", text).casefold()
 
 
+def names_match(a: str, b: str) -> bool:
+    """True when two file names are the same up to Unicode form and letter case."""
+    return _nfc(a) == _nfc(b)
+
+
 class TorrentCache:
     def __init__(
         self,

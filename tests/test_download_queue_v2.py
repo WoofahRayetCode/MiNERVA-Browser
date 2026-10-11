@@ -67,6 +67,96 @@ class TestReservations(unittest.TestCase):
         self.assertEqual(len(wins), 1)
 
 
+class TestFailedLookups(unittest.TestCase):
+    def setUp(self):
+        self.engine = _Engine()
+        self.queue = DownloadQueue(self.engine, max_active=2)
+
+    def fail(self, did="f1", name="A.zip", **kw):
+        kw.setdefault("save_path", "/tmp")
+        kw.setdefault("rom_id", "42")
+        self.queue.add_failed(did, name, "Lookup Failed: timed out", **kw)
+
+    def done_rows(self):
+        return self.queue.snapshot()["done"]
+
+    def test_a_failed_lookup_is_kept_as_an_error_row_with_what_a_retry_needs(self):
+        before = self.queue.version
+        self.fail(browse_path="Redump/Sony - PlayStation 3/", flags={"fetch_ps3_dkey": False})
+        (row,) = self.done_rows()
+        self.assertEqual((row["id"], row["name"], row["status"]), ("f1", "A.zip", "error"))
+        self.assertEqual(row["error"], "Lookup Failed: timed out")
+        self.assertEqual(row["lookup"], {"rom_id": "42", "browse_path": "Redump/Sony - PlayStation 3/",
+                                         "flags": {"fetch_ps3_dkey": False}})
+        self.assertGreater(self.queue.version, before)  # the UI notices
+
+    def test_it_is_not_a_download_and_not_persisted_or_counted_as_queued(self):
+        self.fail()
+        self.assertEqual(self.queue.export_for_persistence(), [])
+        self.assertEqual(self.queue.in_progress_names(), set())
+        self.assertEqual(self.queue.queued_keys(), frozenset())
+        self.queue.start_all_pending()
+        self.assertEqual(self.engine.added, [])
+
+    def test_the_name_can_be_queued_again(self):
+        self.fail()
+        self.assertFalse(self.queue.has_name("A.zip"))
+        self.assertIsNone(self.queue.find_by_name("A.zip"))
+        self.assertTrue(self.queue.reserve("A.zip"))
+        self.assertFalse(self.queue.reserve("A.zip"))  # but only one attempt at a time
+
+    def test_a_live_entry_still_blocks_a_duplicate(self):
+        self.queue.enqueue("1", "A.zip", "s", 0, "/tmp")
+        self.fail()
+        self.assertTrue(self.queue.has_name("A.zip"))
+        self.assertFalse(self.queue.reserve("A.zip"))
+
+    def test_a_successful_queue_replaces_the_failed_row(self):
+        self.fail()
+        self.queue.enqueue_many([{"id": "n1", "name": "A.zip", "source": "s", "so_id": 3, "save_path": "/tmp"}])
+        self.assertEqual(self.done_rows(), [])
+        self.assertEqual([i["id"] for i in self.queue.snapshot()["pending"]], ["n1"])
+
+    def test_single_enqueue_also_replaces_it(self):
+        self.fail()
+        self.queue.enqueue("n1", "A.zip", "s", 3, "/tmp")
+        self.assertEqual(self.done_rows(), [])
+
+    def test_another_failure_replaces_the_previous_row_for_that_name(self):
+        self.fail("f1")
+        self.fail("f2")
+        self.assertEqual([r["id"] for r in self.done_rows()], ["f2"])
+        self.fail("f3", name="B.zip")
+        self.assertEqual(sorted(r["id"] for r in self.done_rows()), ["f2", "f3"])
+
+    def test_rows_of_other_names_are_untouched_by_a_successful_queue(self):
+        self.fail("f1", name="A.zip")
+        self.queue.enqueue("n1", "B.zip", "s", 3, "/tmp")
+        self.assertEqual([r["id"] for r in self.done_rows()], ["f1"])
+
+    def test_retry_of_a_failed_lookup_is_not_a_requeue_and_keeps_the_row(self):
+        self.fail()
+        self.assertIsNone(self.queue.requeue_done("f1", "new"))
+        self.assertEqual([r["id"] for r in self.done_rows()], ["f1"])
+        self.assertEqual(self.engine.added, [])
+
+    def test_the_row_can_be_removed_from_the_list(self):
+        self.fail()
+        self.assertEqual(self.queue.pop_done("f1")["name"], "A.zip")
+        self.assertEqual(self.done_rows(), [])
+        self.assertTrue(self.queue.reserve("A.zip"))
+
+    def test_a_flood_of_failures_is_bounded_like_any_done_list(self):
+        queue = DownloadQueue(_Engine(), max_done=5)
+        for i in range(20):
+            queue.add_failed(f"f{i}", f"G{i}.zip", "x", save_path="/tmp")
+        self.assertEqual(len(queue.snapshot()["done"]), 5)
+
+    def test_a_relative_save_path_is_stored_resolved_and_an_empty_one_stays_empty(self):
+        self.fail(save_path="")
+        self.assertEqual(self.done_rows()[0]["save_path"], "")
+
+
 class TestIndexesAndVersion(unittest.TestCase):
     def setUp(self):
         self.engine = _Engine()

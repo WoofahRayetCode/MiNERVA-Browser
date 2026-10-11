@@ -78,6 +78,7 @@ _hidden = [
     'minerva.core.download_queue',
     'minerva.core.download_view',
     'minerva.core.entries',
+    'minerva.core.hashes_db',
     'minerva.core.http',
     'minerva.core.library_index',
     'minerva.core.lookup',

@@ -16,6 +16,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Mapping
 
@@ -113,7 +114,14 @@ def _read_limited(resp, max_bytes: int | None, url: str) -> bytes:
     return b"".join(chunks)
 
 
-def get_bytes(
+@dataclass(frozen=True)
+class HttpResponse:
+    status: int
+    headers: dict  # lower-cased header names
+    body: bytes
+
+
+def get_response(
     url: str,
     *,
     headers: Mapping[str, str] | None = None,
@@ -125,8 +133,8 @@ def get_bytes(
     opener=urllib.request.urlopen,
     sleep: Callable[[float], None] = time.sleep,
     rng: Callable[[], float] = random.random,
-) -> bytes:
-    """GET ``url`` and return the body, retrying transient failures.
+) -> HttpResponse:
+    """GET ``url`` and return status, headers and body, retrying transient failures.
 
     Raises :class:`HttpError`; ``retryable`` tells the caller whether trying again later
     could help (the retries here were already exhausted).
@@ -148,7 +156,11 @@ def get_bytes(
                 expected = resp.headers.get("Content-Length")
                 if expected and expected.isdigit() and len(data) != int(expected):
                     raise http.client.IncompleteRead(data, int(expected) - len(data))
-                return data
+                return HttpResponse(
+                    status=getattr(resp, "status", 200) or 200,
+                    headers={k.lower(): v for k, v in resp.headers.items()},
+                    body=data,
+                )
         except urllib.error.HTTPError as e:
             status = e.code
             retry_after = parse_retry_after(e.headers.get("Retry-After") if e.headers else None)
@@ -176,6 +188,11 @@ def get_bytes(
         else:
             sleep(delay)
         attempt += 1
+
+
+def get_bytes(url: str, **kwargs) -> bytes:
+    """GET ``url`` and return just the body (see :func:`get_response` for the options)."""
+    return get_response(url, **kwargs).body
 
 
 def atomic_write_bytes(dest: Path, data: bytes, validate: Callable[[bytes], None] | None = None) -> None:
