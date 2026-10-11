@@ -8,6 +8,7 @@ dialog per failed file.
 from __future__ import annotations
 
 import threading
+import time
 import urllib.parse
 from collections import Counter, OrderedDict
 from dataclasses import dataclass
@@ -72,17 +73,39 @@ def strip_default_trackers(magnet: str) -> str:
     return head + "?" + "&".join(kept) if kept else head
 
 
+OUTAGE_MESSAGE = (
+    "minerva-archive.org is not answering requests for ROM details right now (timed out). "
+    "Wait a few minutes and queue these again."
+)
+
+
 class RomResolver:
+    """Resolve a browse row to a verified torrent source.
+
+    ``outage_threshold`` consecutive transient failures (timeouts, 5xx) mean the archive's ROM page
+    endpoint is down; for ``outage_cooldown`` seconds further lookups fail immediately with one clear
+    message instead of each waiting out its own multi-minute timeout.  One probe is let through after
+    the cooldown, and any success closes the breaker.
+    """
+
     def __init__(
         self,
         torrent_cache: TorrentCache,
         fetch_rom: Callable[[str], dict | None],
         *,
         cache_size: int = 2048,
+        outage_threshold: int = 3,
+        outage_cooldown: float = 60.0,
+        clock: Callable[[], float] = time.monotonic,
     ):
         self._cache = torrent_cache
         self._fetch_rom = fetch_rom
         self._cache_size = cache_size
+        self._outage_threshold = outage_threshold
+        self._outage_cooldown = outage_cooldown
+        self._clock = clock
+        self._failures = 0
+        self._outage_until = 0.0
         self._rows: OrderedDict[str, dict] = OrderedDict()
         self._lock = threading.Lock()
 
@@ -92,10 +115,22 @@ class RomResolver:
             if row is not None:
                 self._rows.move_to_end(rom_id)
                 return row
+        with self._lock:
+            if self._clock() < self._outage_until:
+                raise LookupFailure("lookup", OUTAGE_MESSAGE)
         try:
             row = self._fetch_rom(rom_id)
         except Exception as e:  # HttpError after retries, parse errors, ...
+            if getattr(e, "retryable", False):
+                with self._lock:
+                    self._failures += 1
+                    if self._failures >= self._outage_threshold:
+                        self._outage_until = self._clock() + self._outage_cooldown
+                        self._failures = self._outage_threshold - 1  # one failed probe re-opens it
             raise LookupFailure("lookup", str(e)) from e
+        with self._lock:
+            self._failures = 0
+            self._outage_until = 0.0
         if row is None:
             raise LookupFailure("not_found", "was not found on the server")
         with self._lock:

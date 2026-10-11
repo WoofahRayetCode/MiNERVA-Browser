@@ -73,7 +73,7 @@ def fetch_entries(path: str) -> list[dict]:
 
 def fetch_rom_info(rom_id: str) -> dict | None:
     url = f"{BASE_URL}/rom?id={rom_id}"
-    html = get_bytes(url, timeout=45, retries=3, gate=SITE_GATE).decode("utf-8", errors="replace")
+    html = get_bytes(url, timeout=30, retries=2, gate=SITE_GATE).decode("utf-8", errors="replace")
     match = _ROM_JS_RE.search(html)
     if not match:
         return None

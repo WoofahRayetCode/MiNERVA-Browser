@@ -191,6 +191,12 @@ class TestTorrentCache(unittest.TestCase):
         self.assertFalse(any(c in p.name for c in '<>:"|?*'))
         self.assertNotEqual(p, cache.path_for("torrents/other.torrent"))
 
+    def test_names_that_differ_only_in_case_still_verify(self):
+        cache = self.cache(_Fetch())
+        path = cache.ensure("t/one.torrent")
+        self.assertEqual(cache.resolve_index(path, 1, "B.ZIP"), 1)  # listing says B.ZIP, torrent says b.zip
+        self.assertEqual(cache.resolve_index(path, 0, "B.zip", allow_name_fallback=True), 1)
+
     def test_resolve_index_exact_mismatch_and_fallback(self):
         cache = self.cache(_Fetch())
         path = cache.ensure("t/one.torrent")

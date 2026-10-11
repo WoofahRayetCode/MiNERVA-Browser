@@ -109,7 +109,12 @@ def _prepare_add_params(params, *, defer_download: bool = False):
 
 
 def _nfc(text: str) -> str:
-    return unicodedata.normalize("NFC", text)
+    """Name comparison key: Unicode-normalised and case-insensitive.
+
+    The archive listing and the torrent can disagree on case (e.g. "inFAMOUS" vs "Infamous"), and
+    the file index is what identifies the file, so case must not reject a correct index.
+    """
+    return unicodedata.normalize("NFC", text).casefold()
 
 
 class _MemberError(Exception):

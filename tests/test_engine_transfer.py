@@ -138,6 +138,14 @@ class TestSingleDownload(EngineCase):
         self.assertTrue(self.wait_finished(engine, ["fix"]))
         self.assertEqual((self.save / BETA).read_bytes(), self.seeder.files["Games/Beta (USA).bin"])
 
+    def test_a_listing_name_that_differs_only_in_case_is_accepted(self):
+        # Real report: the archive listing showed "infamous 2 (usa)..." while the torrent holds
+        # "inFAMOUS 2 (USA)..."; the (correct) index was rejected as a mismatch.
+        engine = self.make_engine()
+        self.add(engine, "a", "beta (usa).bin", 1)
+        self.assertTrue(self.wait_finished(engine, ["a"]), self.events)
+        self.assertEqual((self.save / "beta (usa).bin").read_bytes(), self.seeder.files["Games/Beta (USA).bin"])
+
     def test_missing_torrent_file_is_a_clean_error(self):
         engine = self.make_engine()
         engine.add_download(str(self.tmp / "missing.torrent"), 0, "x.bin", str(self.save), "m")

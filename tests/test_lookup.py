@@ -130,6 +130,71 @@ class TestRomResolver(unittest.TestCase):
             self.resolver.resolve("1", "a.zip")
 
 
+class TestOutageBreaker(unittest.TestCase):
+    def setUp(self):
+        self.now = [0.0]
+        self.fetches = []
+        self.mode = "timeout"
+        self.cache = TorrentCache(pathlib.Path(tempfile.mkdtemp()), fetch=lambda url: b"d4:infode", parse=_parse,
+                                  base_url="https://x.test/")
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.cache.cache_dir, ignore_errors=True))
+        self.resolver = lookup.RomResolver(self.cache, self._fetch, clock=lambda: self.now[0],
+                                           outage_threshold=3, outage_cooldown=60.0)
+
+    def _fetch(self, rom_id):
+        self.fetches.append(rom_id)
+        if self.mode == "timeout":
+            raise HttpError("The read operation timed out", retryable=True)
+        if self.mode == "404":
+            raise HttpError("HTTP 404", status=404, retryable=False)
+        return {"so_id": 0, "magnet": "magnet:?xt=urn:btih:abc"}
+
+    def lookup(self, rom_id="1"):
+        try:
+            self.resolver.row_for(rom_id)
+            return "ok"
+        except lookup.LookupFailure as e:
+            return e.message
+
+    def test_repeated_timeouts_trip_the_breaker_and_later_lookups_fail_instantly(self):
+        for i in range(3):
+            self.assertIn("timed out", self.lookup(str(i)))
+        before = len(self.fetches)
+        for i in range(10, 20):
+            self.assertEqual(self.lookup(str(i)), lookup.OUTAGE_MESSAGE)
+        self.assertEqual(len(self.fetches), before)  # no request was made while the site is down
+
+    def test_one_probe_is_allowed_after_the_cooldown_and_success_closes_the_breaker(self):
+        for i in range(3):
+            self.lookup(str(i))
+        self.now[0] += 61
+        self.mode = "ok"
+        self.assertEqual(self.lookup("100"), "ok")
+        self.assertEqual(self.lookup("101"), "ok")  # fully closed again
+
+    def test_a_failed_probe_reopens_the_breaker_immediately(self):
+        for i in range(3):
+            self.lookup(str(i))
+        self.now[0] += 61
+        self.assertIn("timed out", self.lookup("100"))  # the probe fails...
+        self.assertEqual(self.lookup("101"), lookup.OUTAGE_MESSAGE)  # ...so it is open again
+
+    def test_permanent_errors_do_not_count_as_an_outage(self):
+        self.mode = "404"
+        for i in range(10):
+            self.assertIn("404", self.lookup(str(i)))
+        self.mode = "ok"
+        self.assertEqual(self.lookup("200"), "ok")
+
+    def test_rows_already_cached_are_still_served_during_an_outage(self):
+        self.mode = "ok"
+        self.assertEqual(self.lookup("7"), "ok")
+        self.mode = "timeout"
+        for i in range(3):
+            self.lookup(str(100 + i))
+        self.assertEqual(self.lookup("7"), "ok")
+
+
 class TestStripDefaultTrackers(unittest.TestCase):
     def test_removes_only_default_trackers(self):
         magnet = "magnet:?xt=urn:btih:abc&dn=Name&tr=udp%3A%2F%2Fcustom.example%3A1%2Fannounce" + TRACKERS
