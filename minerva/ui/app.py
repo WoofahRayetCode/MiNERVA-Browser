@@ -65,6 +65,8 @@ from minerva.core.ps3_dkeys import (
     find_local_dkey_zip,
     get_dkey_save_dir,
     is_dkey_save_path,
+    place_dkeys_beside_isos,
+    pop_ambiguous,
     is_ps3_iso_browse_path,
 )
 from minerva.core.entries import detect_regions, detect_release_tags, enrich_entries, parse_size_bytes
@@ -3522,15 +3524,23 @@ class MinervaApp(tk.Tk):
             except Exception as e:
                 log_error("MinervaApp._ensure_ps3_dkeys_button_click failed", e)
                 errors.append(str(e))
+            ambiguous = pop_ambiguous()
+            try:
+                placement = place_dkeys_beside_isos(download_dir)
+            except Exception as e:
+                log_error("place_dkeys_beside_isos failed", e)
+                placement = {"placed": 0, "mismatch": 0}
             self.after(
                 0,
-                lambda q=queued, o=ok, r=repaired, s=skipped, e=errors:
-                    self._finish_ensure_ps3_dkeys(q, o, r, s, e),
+                lambda q=queued, o=ok, r=repaired, s=skipped, e=errors, pl=placement["placed"],
+                       mm=placement["mismatch"], amb=ambiguous:
+                    self._finish_ensure_ps3_dkeys(q, o, r, s, e, pl, mm, amb),
             )
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _finish_ensure_ps3_dkeys(self, queued: int, ok: int, repaired: int, skipped: int, errors: list[str]):
+    def _finish_ensure_ps3_dkeys(self, queued: int, ok: int, repaired: int, skipped: int, errors: list[str],
+                                 placed: int = 0, mismatched: int = 0, ambiguous: dict | None = None):
         self._ensure_dkeys_in_progress = False
         TITLE = "PS3 Disc Keys"
         if self._download_queue is not None:
@@ -3540,8 +3550,18 @@ class MinervaApp(tk.Tk):
             f"{queued} queued",
             f"{repaired} bad zips replaced",
             f"{skipped} still downloading",
+            f"{placed} copied next to their ISO (for RPCS3)",
         ]
         msg = "PS3 dkey check complete. " + "; ".join(parts) + "."
+        if ambiguous:
+            shown = list(ambiguous.items())[:3]
+            lines = "\n".join(f"  • {rom}  →  {' | '.join(names[:3])}" for rom, names in shown)
+            more = f"\n  …and {len(ambiguous) - 3} more" if len(ambiguous) > 3 else ""
+            msg += (f"\n\n{len(ambiguous)} ROM(s) matched several equally likely keys, so none was chosen "
+                    f"(rename the ISO to include its version, e.g. v02.00, or serial):\n{lines}{more}")
+        if mismatched:
+            msg += (f"\n\n{mismatched} ISO(s) have a key for a different region/title and were NOT "
+                    "given a key (see minerva_error.log). Check the ISO and key names.")
         if errors:
             msg += "\n\n" + errors[0]
             self._extract_status_var.set("PS3 dkey check failed")
@@ -3900,6 +3920,11 @@ class MinervaApp(tk.Tk):
                 else:
                     # Extraction worked; a file Windows still has locked is not a failed download.
                     log_activity(f"extract.delete_archive.skipped id={download_id} src='{src}'")
+            if is_dkey_save_path(save_path):
+                try:  # a freshly extracted key: put it beside its ISO so RPCS3 finds it
+                    place_dkeys_beside_isos(save_path.parent)
+                except Exception as e:
+                    log_error("place_dkeys_beside_isos failed after dkey extraction", e)
 
             status_text = "Extracted ✓"
             if extracted_ok and extracted_dir is not None:

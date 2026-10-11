@@ -5,6 +5,7 @@ build/
 *.bak
 *.tmp
 *.tmp.*
+*.part
 
 # Virtual environment
 .venv/
@@ -44,6 +45,7 @@ dkeys/
 minerva_settings.json
 minerva_settings.corrupt-*.json
 minerva_error.log
+minerva_error.log.1
 activity_log*.txt
 startup_cleanup_debug.txt
 _chdman_install_tmp/
@@ -79,6 +81,7 @@ desktop.ini
 .vscode/
 .idea/
 .grok/
+.claude/
 .agents/
 *.suo
 *.user

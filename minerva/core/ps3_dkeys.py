@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import pathlib
 import re
+import shutil
 import threading
 import time
 import urllib.parse
 import zipfile
+from dataclasses import dataclass
 from minerva.constants import log_activity, log_error
 from minerva.core.sqlite_http import fetch_entries, extract_rom_id
+from minerva.core.entries import detect_regions
 from minerva.core.extractors import is_archive_path, normalize_chd_stem
 
 PS3_DISC_KEYS_TXT_PATH = "/browse/./Redump/Sony%20-%20PlayStation%203%20-%20Disc%20Keys%20TXT/"
@@ -167,46 +170,126 @@ def _load_catalog(force_refresh: bool = False) -> dict[str, dict]:
     return index
 
 
+_VERSION_RE = re.compile(r"\bv(\d{1,2}\.\d{2})\b", re.IGNORECASE)
+_EDITIONS = ("playstation 3 the best", "fukikaeban", "jimakuban", "greatest hits", "platinum")
+_ambiguous_lock = threading.Lock()
+_ambiguous: dict[str, list[str]] = {}
+
+
+@dataclass(frozen=True)
+class DkeyResolution:
+    entry: dict | None
+    #: Catalog names that tied for best when no single entry could be chosen (never guessed).
+    ambiguous: tuple[str, ...] = ()
+
+
+def _loose_key(name: str) -> str:
+    """Case/punctuation-insensitive identity: 'DiRT 2.zip' == 'Dirt-2.zip'."""
+    stem = re.sub(r"\.zip$", "", urllib.parse.unquote(name or "").strip(), flags=re.IGNORECASE)
+    return re.sub(r"[^a-z0-9]+", " ", stem.lower()).strip()
+
+
+def _edition_tags(name: str) -> frozenset[str]:
+    low = (name or "").lower()
+    return frozenset(e for e in _EDITIONS if e in low)
+
+
+def _score_candidate(query_name: str, query_ids: set[str], candidate_name: str) -> int | None:
+    """Higher is a better match; ``None`` means the candidate contradicts the ROM and is dropped."""
+    score = 0
+    cand_serial = serial_from_name(candidate_name)
+    query_serial = serial_from_name(query_name)
+    if cand_serial:
+        known = set(query_ids) | ({query_serial} if query_serial else set())
+        if known:
+            if cand_serial in known:
+                score += 100
+            else:
+                return None  # its serial belongs to another release
+    q_ver, c_ver = _VERSION_RE.search(query_name or ""), _VERSION_RE.search(candidate_name)
+    if q_ver and c_ver:
+        if q_ver.group(1) != c_ver.group(1):
+            return None
+        score += 20
+    q_reg = detect_regions((query_name or "").lower())
+    c_reg = detect_regions(candidate_name.lower())
+    if q_reg != {"other"} and c_reg != {"other"}:
+        if q_reg.isdisjoint(c_reg):
+            return None
+        score += 10 if q_reg == c_reg else 5
+    q_ed, c_ed = _edition_tags(query_name), _edition_tags(candidate_name)
+    score += 5 if q_ed == c_ed else -3
+    return score
+
+
+def resolve_dkey_entry(
+    file_name: str,
+    *,
+    force_refresh: bool = False,
+    title_ids: list[str] | None = None,
+) -> DkeyResolution:
+    """Pick the catalog entry for a ROM, or report that several are equally plausible.
+
+    An exact name wins.  Otherwise every entry sharing the ROM's serial or cleaned title is a
+    candidate; those that contradict the ROM (other serial, other version, other region) are
+    dropped, and the rest are ranked.  A winner must beat the runner-up outright.
+    """
+    zip_name = dkey_zip_name_for_rom(file_name)
+    ids = {t.upper() for t in (title_ids or [])}
+    if not zip_name and not ids:
+        return DkeyResolution(None)
+    index = _load_catalog(force_refresh=force_refresh)
+    if zip_name:
+        exact = index.get(_normalize_key(zip_name))
+        if exact:
+            return DkeyResolution(exact)
+    pool: dict[int, dict] = {}
+    for serial in ids | ({serial_from_name(zip_name)} if zip_name else set()):
+        if serial:
+            for entry in _cache_by_serial.get(serial, []):
+                pool[id(entry)] = entry
+    if zip_name:
+        for entry in _cache_by_cleaned.get(_cleaned_key(zip_name), []):
+            pool[id(entry)] = entry
+    by_loose: dict[str, tuple[int, dict]] = {}  # same release spelled two ways counts once
+    for entry in sorted(pool.values(), key=lambda e: e.get("name") or ""):
+        name = entry.get("name") or ""
+        score = _score_candidate(zip_name or "", ids, name)
+        if score is None:
+            continue
+        key = _loose_key(name)
+        if key not in by_loose or score > by_loose[key][0]:
+            by_loose[key] = (score, entry)
+    ranked = sorted(by_loose.values(), key=lambda t: t[0], reverse=True)
+    if not ranked:
+        return DkeyResolution(None)
+    if len(ranked) == 1 or ranked[0][0] > ranked[1][0]:
+        return DkeyResolution(ranked[0][1])
+    tied = tuple(e.get("name") or "" for sc, e in ranked if sc == ranked[0][0])
+    return DkeyResolution(None, tied)
+
+
 def find_dkey_entry(
     file_name: str,
     *,
     force_refresh: bool = False,
     title_ids: list[str] | None = None,
 ) -> dict | None:
-    """Match a ROM to the Disc Keys TXT catalog by original name, serial, or cleaned title."""
-    zip_name = dkey_zip_name_for_rom(file_name)
-    if not zip_name and not title_ids:
-        return None
-    index = _load_catalog(force_refresh=force_refresh)
-    if zip_name:
-        exact = index.get(_normalize_key(zip_name))
-        if exact:
-            return exact
-        serial = serial_from_name(zip_name)
-        if serial:
-            hits = _cache_by_serial.get(serial) or []
-            if len(hits) == 1:
-                return hits[0]
-        cleaned = _cleaned_key(zip_name)
-        cleaned_hits = list(_cache_by_cleaned.get(cleaned) or [])
-        if serial:
-            serial_hits = [h for h in cleaned_hits if serial_from_name(h.get("name") or "") == serial]
-            if len(serial_hits) == 1:
-                return serial_hits[0]
-            if len(_cache_by_serial.get(serial) or []) == 1:
-                return _cache_by_serial[serial][0]
-        if len(cleaned_hits) == 1:
-            return cleaned_hits[0]
-    for title_id in title_ids or []:
-        hits = _cache_by_serial.get(title_id.upper()) or []
-        if len(hits) == 1:
-            return hits[0]
-        if zip_name:
-            cleaned = _cleaned_key(zip_name)
-            narrowed = [h for h in hits if _cleaned_key(h.get("name") or "") == cleaned]
-            if len(narrowed) == 1:
-                return narrowed[0]
-    return None
+    """Match a ROM to the Disc Keys TXT catalog (see :func:`resolve_dkey_entry`)."""
+    result = resolve_dkey_entry(file_name, force_refresh=force_refresh, title_ids=title_ids)
+    if result.ambiguous:
+        with _ambiguous_lock:
+            _ambiguous[file_name] = list(result.ambiguous)
+        log_activity(f"ps3_dkeys.ambiguous file='{file_name}' candidates={list(result.ambiguous)}")
+    return result.entry
+
+
+def pop_ambiguous() -> dict[str, list[str]]:
+    """ROMs that matched several equally plausible keys since the last call (and clear the list)."""
+    with _ambiguous_lock:
+        found = dict(_ambiguous)
+        _ambiguous.clear()
+    return found
 
 
 def find_dkey_entry_for_path(path: pathlib.Path, *, force_refresh: bool = False) -> dict | None:
@@ -309,8 +392,9 @@ def find_local_dkey(download_dir: pathlib.Path, rom_name: str) -> pathlib.Path |
                 return path
             if rom_cleaned and _cleaned_key(path.name) == rom_cleaned:
                 cleaned_hits.append(path)
-    if len(cleaned_hits) == 1:
-        return cleaned_hits[0]
+    unique_hits = list({h.resolve(): h for h in cleaned_hits}.values())  # roots overlap (dkeys/ is inside)
+    if len(unique_hits) == 1:
+        return unique_hits[0]
     return None
 
 
@@ -375,3 +459,84 @@ def collect_local_ps3_rom_names(download_dir: pathlib.Path) -> list[str]:
         seen.add(key)
         names.append(catalog_name)
     return sorted(names)
+
+
+KEY_MATCH, KEY_MISMATCH, KEY_UNKNOWN = "match", "mismatch", "unknown"
+
+
+def key_matches_iso(iso_path: pathlib.Path, key_path: pathlib.Path) -> str:
+    """Decide whether a disc key belongs to an ISO, using identity data only.
+
+    A key found by title alone ignores region, so a USA key can end up beside a Europe ISO.
+    Checks, strongest first: the ISO's embedded TITLE_ID vs the serial in the key's name (when it
+    has one), the serial in the ISO's name, and region tags in both names.  Returns ``match``,
+    ``mismatch`` or ``unknown`` (not enough information either way).
+    """
+    iso_path, key_path = pathlib.Path(iso_path), pathlib.Path(key_path)
+    key_serial = serial_from_name(key_path.stem)
+    if key_serial:
+        iso_serial = serial_from_name(iso_path.name)
+        if iso_serial and iso_serial != key_serial:
+            return KEY_MISMATCH
+        embedded = extract_title_ids_from_path(iso_path)
+        if embedded and key_serial not in embedded:
+            return KEY_MISMATCH
+    iso_regions = detect_regions(iso_path.stem.lower())
+    key_regions = detect_regions(key_path.stem.lower())
+    if iso_regions != {"other"} and key_regions != {"other"} and iso_regions.isdisjoint(key_regions):
+        return KEY_MISMATCH
+    if key_serial or key_path.stem.lower() == iso_path.stem.lower():
+        return KEY_MATCH
+    return KEY_UNKNOWN
+
+
+def place_dkeys_beside_isos(download_dir: str | pathlib.Path) -> dict[str, int]:
+    """Copy each ISO's matching disc key next to it as ``<iso name>.dkey``.
+
+    RPCS3 loads an encrypted ISO's key from a sidecar file with the ISO's own base name, so a key
+    sitting in ``dkeys/`` under the Redump zip name is not picked up.  The copy is never destructive:
+    a valid key that already sits next to the ISO is left alone (even if it differs), and the
+    original in ``dkeys/`` is kept.  A key that :func:`key_matches_iso` rejects is not placed.
+    Returns counts: placed / present / no_key / mismatch.
+    """
+    base = pathlib.Path(download_dir)
+    counts = {"placed": 0, "present": 0, "no_key": 0, "mismatch": 0}
+    if not base.exists():
+        return counts
+    skip_dirs = {DKEY_DIR_NAME, "torrentfiles", "tools", "build", "dist"}
+    for iso in sorted(base.rglob("*.iso")):
+        try:
+            rel = iso.relative_to(base)
+        except ValueError:
+            continue
+        if not iso.is_file() or any(part.lower() in skip_dirs for part in rel.parts[:-1]):
+            continue
+        target = iso.with_suffix(".dkey")
+        if target.is_file() and is_valid_dkey_file(target):
+            if key_matches_iso(iso, target) == KEY_MISMATCH:
+                counts["mismatch"] += 1  # the user's own sidecar key: report it, never touch it
+                log_activity(f"ps3_dkeys.sidecar_mismatch iso='{iso.name}'")
+            else:
+                counts["present"] += 1
+            continue
+        key = find_local_dkey(base, iso.name)
+        if key is None or key.resolve() == target.resolve():
+            counts["no_key"] += 1
+            continue
+        if key_matches_iso(iso, key) == KEY_MISMATCH:
+            counts["mismatch"] += 1
+            log_activity(f"ps3_dkeys.mismatch iso='{iso.name}' key='{key.name}' (not placed)")
+            continue
+        tmp = target.with_name(target.name + ".part")
+        try:
+            shutil.copyfile(key, tmp)
+            tmp.replace(target)
+            counts["placed"] += 1
+            log_activity(f"ps3_dkeys.placed iso='{iso.name}' key='{key.name}'")
+        except OSError as e:
+            log_error(f"place_dkeys_beside_isos failed for {iso}", e)
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+    return counts
