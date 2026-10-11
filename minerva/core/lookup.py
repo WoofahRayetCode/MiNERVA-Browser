@@ -43,6 +43,7 @@ class QueuedDownload:
     source: str
     so_id: int
     save_path: str
+    browse_path: str = ""  # archive folder it was queued from (lets updates be found later)
 
 
 @dataclass(frozen=True)

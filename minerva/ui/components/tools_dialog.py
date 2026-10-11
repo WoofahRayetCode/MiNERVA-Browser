@@ -65,6 +65,10 @@ class ToolsMenu:
             label="🔍 Verify Extracted ROM Integrity",
             command=callbacks.get("verify_extracted"),
         )
+        menu.add_command(
+            label="⬆ Check Downloaded Games for Updates / DLC",
+            command=callbacks.get("check_updates"),
+        )
         menu.add_separator()
         menu.add_command(
             label="📁 Open Extracted ROMs Folder",
@@ -179,6 +183,11 @@ class ToolsDialog(tk.Toplevel):
                 "🔑 Fix / Redownload PS3 Dkeys",
                 "Scan PS3 ROMs and queue or redownload missing or corrupt disc keys",
                 self.callbacks.get("ensure_dkeys"),
+            ),
+            (
+                "⬆ Check for Updates / DLC",
+                "Look in the archive for newer updates and DLC for games you already downloaded",
+                self.callbacks.get("check_updates"),
             ),
             (
                 "🔍 Verify Extracted Integrity",

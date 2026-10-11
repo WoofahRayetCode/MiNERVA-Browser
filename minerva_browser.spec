@@ -86,6 +86,7 @@ _hidden = [
     'minerva.core.resume_store',
     'minerva.core.settings_writer',
     'minerva.core.torrent_cache',
+    'minerva.core.update_check',
     'minerva.core.workers',
     'minerva.ui',
     'minerva.ui.app',

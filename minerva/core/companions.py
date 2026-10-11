@@ -19,7 +19,8 @@ _CACHE_TTL_SEC = 6 * 60 * 60
 _MIN_TITLE_KEY_LEN = 8
 
 _DLC_FLAG = re.compile(r"[\(\[]\s*DLC\s*[\)\]]", re.IGNORECASE)
-_UPDATE_FLAG = re.compile(r"[\(\[]\s*Updates?\s*[\)\]]", re.IGNORECASE)
+_UPDATE_FLAG = re.compile(r"[\(\[]\s*(?:Title\s+)?(?:Updates?|Patch(?:es)?)\s*[\)\]]", re.IGNORECASE)
+_HEX_ID = re.compile(r"[\(\[]\s*[0-9A-Fa-f]{8}\s*[\)\]]")  # e.g. Xbox 360 title-update hash "(1F887267)"
 _BIOS_FLAG = re.compile(r"\[BIOS\]|\(System\s+(Application|Module|Firmware|Data Archive)", re.IGNORECASE)
 _SWITCH_TID = re.compile(r"\b(01[0-9A-Fa-f]{14})\b")
 _PS_SERIAL = re.compile(
@@ -30,7 +31,7 @@ _PS_SERIAL = re.compile(
 _VERSION_BRACKET = re.compile(r"\[v(\d+)\]", re.IGNORECASE)
 _VERSION_PAREN = re.compile(r"\(\s*v(\d+(?:\.\d+)*)\s*\)", re.IGNORECASE)
 _FOLDER_STRIP = re.compile(
-    r"\s*[\(\[]\s*(Digital|CDN|PSN|DLC|Updates?|Content|eShop|Deprecated|Pre-Install|"
+    r"\s*[\(\[]\s*(Digital|CDN|PSN|DLC|Title\s+Updates?|Updates?|Content|eShop|Deprecated|Pre-Install|Decrypted|Encrypted|"
     r"SpotPass|Dev(?:elopment)?(?:\s+ROMs)?|Lotcheck)[^)\]]*[\)\]]",
     re.IGNORECASE,
 )
@@ -85,6 +86,7 @@ def title_key(name: str) -> str:
     stem = name.rsplit(".", 1)[0] if "." in name else name
     stem = _DLC_FLAG.sub(" ", stem)
     stem = _UPDATE_FLAG.sub(" ", stem)
+    stem = _HEX_ID.sub(" ", stem)
     stem = _SWITCH_TID.sub(" ", stem)
     cleaned = normalize_chd_stem(stem) or stem
     return re.sub(r"\s+", " ", cleaned).strip().lower()
@@ -157,6 +159,8 @@ def regions_compatible(left: str, right: str) -> bool:
     b = regions_from_name(right)
     if not a or not b:
         return True
+    if "world" in a or "world" in b:
+        return True  # a (World) release is the same build for every region
     return bool(a & b)
 
 
@@ -196,6 +200,7 @@ def system_key(folder_name: str) -> str:
     s = urllib.parse.unquote(folder_name or "")
     s = s.replace("\\", "/").rstrip("/")
     s = s.split("/")[-1]
+    s = re.sub(r"^\s*unofficial\s*-\s*", "", s, flags=re.IGNORECASE)  # No-Intro "Unofficial - Xbox 360 (Title Updates)"
     prev = None
     while prev != s:
         prev = s
@@ -268,6 +273,8 @@ def _cache_put(path: str, entries: list[dict]) -> None:
 def reset_companion_cache() -> None:
     with _cache_lock:
         _listing_cache.clear()
+    with _index_lock:
+        _index_cache.clear()
 
 
 def load_folder_entries(path: str, fetch_fn, current_entries: list[dict] | None = None,
@@ -288,6 +295,117 @@ def load_folder_entries(path: str, fetch_fn, current_entries: list[dict] | None 
     return entries
 
 
+#: Collections whose sibling folders may hold update/DLC sets for a base game that lives in another
+#: collection (PS3 base games are in Redump; their updates are in No-Intro "(PSN) (Updates)").
+COLLECTION_ROOTS = ("/browse/./No-Intro/", "/browse/./Redump/")
+
+
+def _path_key(path: str) -> str:
+    return urllib.parse.unquote((path or "").replace("\\", "/")).rstrip("/").lower()
+
+
+def discover_companion_paths(browse_path: str, fetch_fn) -> list[str]:
+    """Folders to search for DLC/updates: sibling collections here *and* in the other collections."""
+    current = (browse_path or "").replace("\\", "/")
+    if current and not current.endswith("/"):
+        current += "/"
+    paths: list[str] = [current] if current else []
+    seen = {_path_key(current)}
+    parent = parent_browse_path(browse_path)
+    roots = [parent]
+    roots += [r for r in COLLECTION_ROOTS if _path_key(r) != _path_key(parent)]
+    for root in roots:
+        for path in companion_folder_paths(browse_path, load_folder_entries(root, fetch_fn)):
+            key = _path_key(path)
+            if key not in seen:
+                seen.add(key)
+                paths.append(path)
+    return paths
+
+
+class CompanionIndex:
+    """DLC/update entries of one folder, indexed so a lookup does not rescan the folder.
+
+    Building costs one regex pass over the listing (the PS3 updates folder is >10 MB); after that,
+    finding the companions of a base game is a few dictionary lookups.
+    """
+
+    def __init__(self) -> None:
+        self.by_title: dict[str, list[Companion]] = {}
+        self.by_serial: dict[str, list[Companion]] = {}
+        self.by_switch: dict[str, list[Companion]] = {}
+        self.size = 0
+
+    @classmethod
+    def build(cls, entries: list[dict], folder_label: str) -> "CompanionIndex":
+        index = cls()
+        for entry in entries:
+            if entry.get("is_folder"):
+                continue
+            name = entry.get("name") or ""
+            kind = classify_release(name, folder_label)
+            if kind not in (KIND_DLC, KIND_UPDATE):
+                continue
+            companion = Companion(
+                name=name,
+                href=entry.get("href") or "",
+                size=(entry.get("size") or "").strip(),
+                kind=kind,
+                folder=folder_label,
+                version_key=version_key(name),
+            )
+            index.size += 1
+            key = title_key(name)
+            if key:
+                index.by_title.setdefault(key, []).append(companion)
+            for ident in serials_from_name(name):
+                if len(ident) == 16 and ident.startswith("01"):
+                    index.by_switch.setdefault(ident[:12], []).append(companion)
+                elif len(ident) != 16:
+                    index.by_serial.setdefault(ident, []).append(companion)
+        return index
+
+    def candidates(self, base_name: str) -> list[Companion]:
+        """Entries that *could* belong to ``base_name`` (callers confirm with names_match_companion)."""
+        found: list[Companion] = []
+        seen: set[int] = set()
+
+        def add(items):
+            for item in items or ():
+                if id(item) not in seen:
+                    seen.add(id(item))
+                    found.append(item)
+
+        add(self.by_title.get(title_key(base_name)))
+        for ident in serials_from_name(base_name):
+            if len(ident) == 16 and ident.startswith("01"):
+                add(self.by_switch.get(ident[:12]))
+            elif len(ident) != 16:
+                add(self.by_serial.get(ident))
+        return found
+
+
+_index_lock = threading.Lock()
+_index_cache: dict[str, tuple[float, CompanionIndex]] = {}
+
+
+def get_companion_index(folder_path: str, fetch_fn, *, current_entries: list[dict] | None = None,
+                        current_path: str = "") -> CompanionIndex:
+    key = _path_key(folder_path)
+    live = current_entries is not None and key == _path_key(current_path)
+    if not live:
+        with _index_lock:
+            hit = _index_cache.get(key)
+            if hit and time.time() - hit[0] <= _CACHE_TTL_SEC:
+                return hit[1]
+    entries = load_folder_entries(folder_path, fetch_fn, current_entries=current_entries, current_path=current_path)
+    index = CompanionIndex.build(entries, folder_name_from_path(folder_path))
+    if not live:
+        with _index_lock:
+            _index_cache[key] = (time.time(), index)
+    return index
+
+
 def find_companions(
     base_name: str,
     browse_path: str,
@@ -303,44 +421,18 @@ def find_companions(
         from minerva.core.sqlite_http import fetch_entries
         fetch_fn = fetch_entries
 
-    parent = parent_browse_path(browse_path)
-    siblings = load_folder_entries(parent, fetch_fn)
-    search_paths = companion_folder_paths(browse_path, siblings)
-
     found: list[Companion] = []
     seen: set[str] = set()
-    for folder_path in search_paths:
-        entries = load_folder_entries(
-            folder_path,
-            fetch_fn,
-            current_entries=current_entries,
-            current_path=browse_path,
+    for folder_path in discover_companion_paths(browse_path, fetch_fn):
+        index = get_companion_index(
+            folder_path, fetch_fn, current_entries=current_entries, current_path=browse_path
         )
-        folder_label = folder_name_from_path(folder_path)
-        for entry in entries:
-            if entry.get("is_folder"):
-                continue
-            name = entry.get("name") or ""
-            href = entry.get("href") or ""
-            kind = classify_release(name, folder_label)
-            if kind not in (KIND_DLC, KIND_UPDATE):
-                continue
-            if not names_match_companion(base_name, name):
-                continue
-            key = href.lower() or name.lower()
-            if key in seen:
+        for companion in index.candidates(base_name):
+            key = companion.href.lower() or companion.name.lower()
+            if key in seen or not names_match_companion(base_name, companion.name):
                 continue
             seen.add(key)
-            found.append(
-                Companion(
-                    name=name,
-                    href=href,
-                    size=(entry.get("size") or "").strip(),
-                    kind=kind,
-                    folder=folder_label,
-                    version_key=version_key(name),
-                )
-            )
+            found.append(companion)
 
     if latest_update_only:
         found = _keep_latest_updates(found)

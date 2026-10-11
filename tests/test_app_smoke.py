@@ -317,6 +317,61 @@ class TestAppSmoke(unittest.TestCase):
 
         self._run_in_mainloop(scenario)
 
+    def test_history_remembers_the_archive_folder_and_keeps_it_when_requeued_without_one(self):
+        app = self.app
+        app._download_history.clear()
+        app._remember_download("Game (USA).zip", "src", 0, "/tmp", "/browse/./Redump/Sony%20-%20PlayStation%203/")
+        app._remember_download("Game (USA).zip", "src2", 0, "/tmp")  # e.g. a redownload
+        self.assertEqual(app._download_history["Game (USA).zip"]["browse_path"], "/browse/./Redump/Sony%20-%20PlayStation%203/")
+        reloaded = app._load_download_history  # persisted shape survives a settings round trip
+        app._settings["download_history"] = list(app._download_history.values())
+        self.assertEqual(reloaded()["Game (USA).zip"]["browse_path"], "/browse/./Redump/Sony%20-%20PlayStation%203/")
+        app._download_history.clear()
+
+    def test_check_for_updates_tells_you_when_no_game_has_a_known_folder(self):
+        def scenario():
+            app = self.app
+            app._download_history.clear()
+            app._download_history["Old (USA).zip"] = {"name": "Old (USA).zip", "source": "s", "so_id": 0, "save_path": "/tmp"}
+            shown = []
+            with mock.patch.object(app_module.messagebox, "showinfo", side_effect=lambda t, m: shown.append(m)):
+                app._check_library_updates_click()
+            self.assertEqual(len(shown), 1)
+            self.assertIn("No downloaded games with a known archive folder", shown[0])
+            self.assertFalse(getattr(app, "_update_check_running", False))
+            app._download_history.clear()
+
+        self._run_in_mainloop(scenario)
+
+    def test_check_for_updates_offers_and_queues_what_was_found(self):
+        def scenario():
+            app = self.app
+            self._pump(0.5)
+            from minerva.core.companions import KIND_UPDATE, Companion
+            from minerva.core.update_check import UpdateCheckResult, UpdateReport
+
+            item = Companion("Game (USA) (v1.04) (Update).zip", "/rom?id=77", "1 MB", KIND_UPDATE, "Updates")
+            result = UpdateCheckResult(reports=[UpdateReport("Game (USA).zip", "/browse/x/", [item])], checked=1)
+            app._download_history.clear()
+            app._download_history["Game (USA).zip"] = {"name": "Game (USA).zip", "source": "s", "so_id": 0,
+                                                        "save_path": "/tmp", "browse_path": "/browse/x/"}
+            offered, queued = [], []
+            with mock.patch.object(app_module, "check_library_updates", return_value=result), \
+                    mock.patch.object(app_module, "prompt_companions",
+                                      side_effect=lambda parent, title, items, **kw: (offered.extend(items), list(items))[1]), \
+                    mock.patch.object(app, "_enqueue_companion_items", side_effect=lambda items, bp, sp: queued.extend(items)):
+                app._check_library_updates_click()
+                deadline = time.time() + 10
+                while time.time() < deadline and not queued:
+                    app.update()
+                    time.sleep(0.02)
+            self.assertEqual([i.name for i in offered], [item.name])
+            self.assertEqual([i.name for i in queued], [item.name])
+            self.assertFalse(app._update_check_running)
+            app._download_history.clear()
+
+        self._run_in_mainloop(scenario)
+
     def test_poll_loop_rearms_after_an_exception(self):
         def scenario():
             app = self.app

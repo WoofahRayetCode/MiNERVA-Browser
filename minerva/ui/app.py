@@ -71,6 +71,7 @@ from minerva.core.ps3_dkeys import (
 )
 from minerva.core.entries import detect_regions, detect_release_tags, enrich_entries, parse_size_bytes
 from minerva.core.library_index import LibraryIndex
+from minerva.core.update_check import check_library_updates
 from minerva.core.pathsafe import is_safe_leaf_name
 from minerva.core.settings_writer import AsyncSettingsWriter
 from minerva.core.workers import DaemonPool
@@ -1141,15 +1142,19 @@ class MinervaApp(tk.Tk):
                 "source": strip_default_trackers(source),
                 "so_id": so_id,
                 "save_path": save_path,
+                "browse_path": item.get("browse_path") if isinstance(item.get("browse_path"), str) else "",
             }
         return history
 
-    def _remember_download(self, name: str, source: str, so_id: int, save_path: str):
+    def _remember_download(self, name: str, source: str, so_id: int, save_path: str, browse_path: str = ""):
+        previous = self._download_history.get(name, {})
         self._download_history[name] = {
             "name": name,
             "source": source,
             "so_id": int(so_id),
             "save_path": str(pathlib.Path(save_path).resolve()),
+            # The archive folder lets "Check for updates" find this game's updates later.
+            "browse_path": browse_path or previous.get("browse_path", ""),
         }
 
     def _lookup_download_meta(self, name: str) -> dict | None:
@@ -1571,6 +1576,7 @@ class MinervaApp(tk.Tk):
             "verify_extracted": self._verify_extracted_button_click,
             "verify_archives": self._verify_downloaded_archives_button_click,
             "ensure_dkeys": self._ensure_ps3_dkeys_button_click,
+            "check_updates": self._check_library_updates_click,
             "open_extracted": self._open_current_extracted_folder,
             "force_delete_bins": self._force_delete_bins_button_click,
         }
@@ -3246,7 +3252,7 @@ class MinervaApp(tk.Tk):
             for r in results
         )
         for r in results:
-            self._remember_download(r.name, r.source, r.so_id, r.save_path)
+            self._remember_download(r.name, r.source, r.so_id, r.save_path, r.browse_path)
         self._save_settings()  # once per batch, not once per file
         self._request_icon_refresh()
         self._status_var.set(f"Queued {len(results)} download(s)")
@@ -3304,7 +3310,7 @@ class MinervaApp(tk.Tk):
             return
 
         self._lookup_results.put(
-            QueuedDownload(download_id, file_name, resolved.source, resolved.so_id, save_path)
+            QueuedDownload(download_id, file_name, resolved.source, resolved.so_id, save_path, browse_path)
         )
         self._wake_lookup_pump()
         if fetch_ps3_dkey and is_ps3_iso_browse_path(browse_path):
@@ -3349,6 +3355,74 @@ class MinervaApp(tk.Tk):
             nxt = None
         if nxt:
             self.after(0, lambda n=nxt: self._show_companion_prompt(*n))
+
+    def _check_library_updates_click(self):
+        """Look up updates/DLC in the archive for games that are already downloaded."""
+        TITLE = "Check for Updates"
+        if getattr(self, "_update_check_running", False):
+            messagebox.showinfo(TITLE, "An update check is already running.")
+            return
+        history = list(self._download_history.values())
+        games = [
+            h for h in history
+            if h.get("browse_path") and classify_release(h.get("name", ""), h["browse_path"]) == KIND_BASE
+        ]
+        if not games:
+            messagebox.showinfo(
+                TITLE,
+                "No downloaded games with a known archive folder yet.\n\n"
+                "The app remembers the folder a game came from when you queue it, so games "
+                "downloaded with older versions can't be checked until they are queued again.",
+            )
+            return
+        download_dir = pathlib.Path(self.get_download_dir())
+        self._update_check_running = True
+        self._extract_status_var.set("Checking downloaded games for updates…")
+
+        def worker():
+            try:
+                installed = {h.get("name", "") for h in history}
+                installed |= {p.name for p in collect_downloaded_archives(download_dir)}
+                result = check_library_updates(
+                    history,
+                    installed,
+                    fetch_entries,
+                    progress=lambda i, n, name: self.after(
+                        0, lambda: self._extract_status_var.set(f"Update check {i}/{n}: {name}")
+                    ),
+                    cancel=lambda: self._quitting,
+                )
+            except Exception as e:
+                log_error("MinervaApp library update check failed", e)
+                self.after(0, lambda err=e: self._finish_update_check(None, str(err)))
+                return
+            self.after(0, lambda: self._finish_update_check(result, ""))
+
+        threading.Thread(target=worker, name="update-check", daemon=True).start()
+
+    def _finish_update_check(self, result, error: str):
+        TITLE = "Check for Updates"
+        self._update_check_running = False
+        if result is None:
+            self._extract_status_var.set("Update check failed")
+            messagebox.showerror(TITLE, f"The update check failed:\n{error}")
+            return
+        items = result.items
+        note = ""
+        if result.unknown_folder:
+            note = f"\n\n{result.unknown_folder} game(s) were skipped: their archive folder is unknown (queue them again once)."
+        if result.errors:
+            note += f"\n{len(result.errors)} game(s) could not be checked (see minerva_error.log)."
+        if not items:
+            self._extract_status_var.set(f"No new updates for {result.checked} game(s)")
+            messagebox.showinfo(TITLE, f"Checked {result.checked} game(s): no new updates or DLC found.{note}")
+            return
+        self._extract_status_var.set(f"Updates found for {len(result.reports)} of {result.checked} game(s)")
+        picked = prompt_companions(self, f"{len(result.reports)} downloaded game(s)", items, precheck_dlc=False)
+        if picked:
+            self._enqueue_companion_items(picked, "", self.get_download_dir())
+        elif note:
+            messagebox.showinfo(TITLE, note.strip())
 
     def _enqueue_companion_items(self, items, browse_path: str, save_path: str):
         for item in items:

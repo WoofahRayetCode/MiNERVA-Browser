@@ -34,7 +34,8 @@ A portable desktop GUI for browsing and downloading from [minerva-archive.org](h
 - 🚫 **Deduplication** — automatically skips items already pending, active, completed, or being looked up
 - 🛡️ **Hardened I/O** — HTTP requests retry with backoff and honour `Retry-After`; settings are written atomically with a `.bak` and a corrupt file is quarantined, never overwritten
 - 💽 **Disk-space check** — a download that cannot fit is refused up front; a full disk mid-download pauses it with a clear "Disk full" state
-- 📦 **DLC / update matching** — after queueing a game, offers matching DLC and updates from the same folder or related digital/PSN/CDN collections (select, download all, or skip)
+- 📦 **DLC / update matching** — after queueing a game, offers matching DLC and updates from the same folder **and from the archive's other collections** (e.g. PS3 base games in Redump → No-Intro `(PSN) (Updates)`/`(DLC)`, Xbox 360 `Title Updates`); select, download all, or skip
+- ⬆ **Check downloaded games for updates** — *ROM Tools → Check Downloaded Games for Updates / DLC* looks up every game you downloaded (the app remembers its archive folder when you queue it), skips what you already have, and offers only newer updates
 - 📊 **Real-time metrics** — speed, ETA, peers, progress, and state for every download
 
 ### Extraction, CHD, and Xbox dumps
