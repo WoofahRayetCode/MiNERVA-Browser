@@ -4,6 +4,7 @@ import tkinter as tk
 from tkinter import ttk
 from typing import Callable
 
+from minerva.ui.components.modal import grab_when_mapped
 from minerva.ui.theme import (
     BG,
     PANEL,
@@ -100,7 +101,7 @@ class ToolsDialog(tk.Toplevel):
         self.geometry("540x580")
         self.resizable(False, False)
         self.transient(parent)
-        self.grab_set()
+        grab_when_mapped(self)
 
         self.callbacks = callbacks
         self.extractor_status = extractor_status

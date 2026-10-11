@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import re
 import time
+import traceback
 import zipfile
 import json
 import os
@@ -53,6 +54,7 @@ from minerva.ui.components.filter_bar import FilterBar
 from minerva.ui.downloads_panel import DownloadsPanel, PanelActions
 from minerva.ui.components.tools_dialog import ToolsMenu, ToolsDialog
 from minerva.ui.components.companion_dialog import prompt_companions
+from minerva.ui.components.modal import grab_when_mapped
 from minerva.core.hashes_db import HashesDb
 from minerva.core.sqlite_http import fetch_entries, fetch_rom_info, extract_rom_id
 from minerva.core.companions import find_companions, classify_release, KIND_BASE
@@ -171,6 +173,26 @@ class HoverTooltip:
 
 
 class MinervaApp(tk.Tk):
+    #: Pause before a queued DLC/updates prompt opens, so a double-click that dismisses one prompt cannot
+    #: land on the next one appearing under the cursor.
+    COMPANION_PROMPT_GAP_MS = 500
+
+    def report_callback_exception(self, exc, val, tb):
+        """Tk calls this when a callback raises.  The windowless build has no console, so keep it in the log."""
+        try:
+            seen = self.__dict__.setdefault("_callback_errors", {})
+            key = (getattr(exc, "__name__", str(exc)), str(val))
+            now = time.monotonic()
+            last = seen.get(key)
+            if last is None or now - last > 60.0:  # a callback that keeps failing must not flood the log
+                if len(seen) > 200:
+                    seen.clear()
+                seen[key] = now
+                log_error("Tk callback exception\n" + "".join(traceback.format_exception(exc, val, tb)).rstrip())
+        except Exception:
+            pass
+        super().report_callback_exception(exc, val, tb)
+
     def __init__(self):
         super().__init__()
         self.title(f"MiNERVA Archive Browser v{APP_VERSION}")
@@ -3384,21 +3406,41 @@ class MinervaApp(tk.Tk):
             return
         self.after(0, lambda: self._show_companion_prompt(file_name, items, browse_path, save_path))
 
-    def _show_companion_prompt(self, file_name: str, items, browse_path: str, save_path: str):
+    def _show_companion_prompt(self, file_name: str, items, browse_path: str, save_path: str, attempt: int = 0):
         if self._companion_dialog_open:
-            self._companion_prompt_queue.put((file_name, items, browse_path, save_path))
+            self._companion_prompt_queue.put((file_name, items, browse_path, save_path, attempt))
             return
         self._companion_dialog_open = True
-        picked = prompt_companions(self, file_name, items, precheck_dlc=False)
-        self._companion_dialog_open = False
-        if picked:
+        picked = None
+        failed = False
+        try:
+            picked = prompt_companions(self, file_name, items, precheck_dlc=False)
+        except Exception as e:  # whatever went wrong, the prompts queued behind this one must still be shown
+            failed = True
+            log_error(f"MinervaApp companion dialog failed for {file_name} (attempt {attempt + 1})", e)
+        finally:
+            self._companion_dialog_open = False
+        if failed:
+            if attempt < 1:  # usually momentary (e.g. a mouse button was held down): try once more
+                self.after(
+                    self.COMPANION_PROMPT_GAP_MS,
+                    lambda: self._show_companion_prompt(file_name, items, browse_path, save_path, attempt + 1),
+                )
+            else:
+                self._status_var.set(
+                    f"Could not show the DLC/updates for {file_name} - use "
+                    "ROM Tools > Check Downloaded Games for Updates / DLC"
+                )
+        elif picked:
             self._enqueue_companion_items(picked, browse_path, save_path)
+        self._show_next_companion_prompt()
+
+    def _show_next_companion_prompt(self):
         try:
             nxt = self._companion_prompt_queue.get_nowait()
         except queue.Empty:
-            nxt = None
-        if nxt:
-            self.after(0, lambda n=nxt: self._show_companion_prompt(*n))
+            return
+        self.after(self.COMPANION_PROMPT_GAP_MS, lambda n=nxt: self._show_companion_prompt(*n))
 
     def _check_library_updates_click(self):
         """Look up updates/DLC in the archive for games that are already downloaded."""
@@ -4152,7 +4194,7 @@ class MinervaApp(tk.Tk):
         dlg.title("Update Available")
         dlg.configure(bg=BG)
         dlg.resizable(False, False)
-        dlg.grab_set()
+        grab_when_mapped(dlg)
 
         tk.Label(dlg, text=f"A new version is available: {tag}",
                  bg=BG, fg=FG, font=("TkDefaultFont", 11, "bold")).pack(padx=20, pady=(16, 4))

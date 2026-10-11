@@ -6,19 +6,36 @@ import tkinter as tk
 from tkinter import ttk
 from minerva.ui.theme import BG, PANEL, PANEL_ALT, FG, FG_DIM, ACCENT, BORDER, SUCCESS
 from minerva.core.companions import KIND_DLC, KIND_UPDATE, Companion
+from minerva.ui.components.modal import grab_when_mapped
 
 
 def prompt_companions(parent, game_name: str, items: list[Companion], *, precheck_dlc: bool = False) -> list[Companion] | None:
-    """Return selected companions, empty list if skip, or None if the window was closed."""
+    """Return selected companions, empty list if skip, or None if the window was closed.
+
+    The window is built while it is withdrawn and only shown once it is complete, and it is destroyed if
+    building fails, so a half-built (blank) window can never be left on screen.
+    """
+    result: dict[str, list[Companion] | None] = {"picked": None}
     dlg = tk.Toplevel(parent)
+    dlg.withdraw()
+    try:
+        _build(dlg, parent, game_name, items, precheck_dlc, result)
+    except BaseException:
+        dlg.destroy()
+        raise
+    dlg.deiconify()
+    grab_when_mapped(dlg)
+    dlg.focus_set()
+    dlg.wait_window()
+    return result["picked"]
+
+
+def _build(dlg, parent, game_name, items, precheck_dlc, result) -> None:
     dlg.title("DLC and updates")
     dlg.configure(bg=BG)
     dlg.transient(parent)
-    dlg.grab_set()
     dlg.geometry("640x480")
     dlg.minsize(480, 360)
-
-    result: dict[str, list[Companion] | None] = {"picked": None}
 
     tk.Label(
         dlg,
@@ -81,8 +98,6 @@ def prompt_companions(parent, game_name: str, items: list[Companion], *, prechec
                command=lambda: _finish(_selected())).pack(side="right", padx=4)
 
     dlg.protocol("WM_DELETE_WINDOW", lambda: _finish(None))
-    dlg.wait_window()
-    return result["picked"]
 
 
 def _row(parent, item: Companion, var: tk.BooleanVar):

@@ -168,6 +168,7 @@ Local settings (`minerva_settings.json`), logs, torrents, downloads, extracted d
 │       └── components/
 │           ├── filter_bar.py  # Search, region pills, tags, summary, reset
 │           ├── companion_dialog.py
+│           ├── modal.py       # Safe modal grab (a refused grab can no longer leave a blank dialog)
 │           └── tools_dialog.py# ROM tools menu & utilities modal dialog
 └── tests/                     # stdlib unittest; engine tests run a real localhost libtorrent seeder
     ├── test_engine_transfer.py        # shared torrents, cancel/pause, magnets, resume, seeding, stalls

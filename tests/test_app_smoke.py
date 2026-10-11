@@ -324,6 +324,123 @@ class TestAppSmoke(unittest.TestCase):
 
         self._run_in_mainloop(scenario)
 
+    def _companion_item(self):
+        from minerva.core.companions import KIND_UPDATE, Companion
+        return Companion("Game (USA) (v1.04) (Update).zip", "/rom?id=5", "1 MB", KIND_UPDATE, "Updates")
+
+    def test_a_failing_companion_dialog_is_logged_retried_once_and_does_not_strand_later_prompts(self):
+        def scenario():
+            app = self.app
+            self._pump(0.3)
+            app.COMPANION_PROMPT_GAP_MS = 20  # shadows the class constant for this app only
+            item = self._companion_item()
+            calls, enqueued = [], []
+
+            def fake_prompt(parent, name, items, **kw):
+                calls.append(name)
+                if name == "A" and calls.count("A") == 1:
+                    app._show_companion_prompt("B", items, "/b/", "/tmp")  # arrives while A's dialog is open
+                    raise tk.TclError("grab failed: window not viewable")
+                return list(items)
+
+            try:
+                with mock.patch.object(app_module, "prompt_companions", side_effect=fake_prompt), \
+                        mock.patch.object(app, "_enqueue_companion_items",
+                                          side_effect=lambda items, bp, sp: enqueued.append(len(items))), \
+                        mock.patch.object(app_module, "log_error") as log:
+                    app._show_companion_prompt("A", [item], "/b/", "/tmp")
+                    self._pump(0.6)
+            finally:
+                del app.COMPANION_PROMPT_GAP_MS
+            self.assertEqual(sorted(calls), ["A", "A", "B"])  # A failed, was retried, and B was not lost
+            self.assertEqual(enqueued, [1, 1])
+            self.assertFalse(app._companion_dialog_open)
+            self.assertTrue(app._companion_prompt_queue.empty())
+            (failure,) = log.call_args_list
+            self.assertIn("companion dialog failed for A", failure.args[0])
+
+        self._run_in_mainloop(scenario)
+
+    def test_a_companion_dialog_that_fails_twice_leaves_a_hint_and_a_free_flag(self):
+        def scenario():
+            app = self.app
+            self._pump(0.3)
+            app.COMPANION_PROMPT_GAP_MS = 20
+            calls = []
+
+            def fake_prompt(parent, name, items, **kw):
+                calls.append(name)
+                raise tk.TclError("grab failed: window not viewable")
+
+            try:
+                with mock.patch.object(app_module, "prompt_companions", side_effect=fake_prompt), \
+                        mock.patch.object(app_module, "log_error") as log:
+                    app._show_companion_prompt("A", [self._companion_item()], "/b/", "/tmp")
+                    self._pump(0.5)
+            finally:
+                del app.COMPANION_PROMPT_GAP_MS
+            self.assertEqual(calls, ["A", "A"])  # one retry, not an endless loop
+            self.assertEqual(log.call_count, 2)
+            self.assertFalse(app._companion_dialog_open)
+            self.assertIn("Check Downloaded Games", app._status_var.get())
+
+        self._run_in_mainloop(scenario)
+
+    def test_queued_companion_prompts_open_a_moment_apart(self):
+        def scenario():
+            app = self.app
+            self._pump(0.3)
+            app.COMPANION_PROMPT_GAP_MS = 120
+            item = self._companion_item()
+            times = []
+
+            def fake_prompt(parent, name, items, **kw):
+                times.append(time.monotonic())
+                if len(times) == 1:  # two more prompts arrive while the first dialog is open
+                    app._show_companion_prompt("B", items, "/b/", "/tmp")
+                    app._show_companion_prompt("C", items, "/b/", "/tmp")
+                return []
+
+            try:
+                with mock.patch.object(app_module, "prompt_companions", side_effect=fake_prompt):
+                    app._show_companion_prompt("A", [item], "/b/", "/tmp")
+                    self._pump(0.8)
+            finally:
+                del app.COMPANION_PROMPT_GAP_MS
+            self.assertEqual(len(times), 3)
+            self.assertGreaterEqual(times[1] - times[0], 0.09)  # a double-click cannot reach the next prompt
+            self.assertGreaterEqual(times[2] - times[1], 0.09)
+
+        self._run_in_mainloop(scenario)
+
+    def test_tk_callback_exceptions_reach_the_error_log_once_per_minute(self):
+        def scenario():
+            import sys
+            from minerva.constants import get_error_log_path
+
+            app = self.app
+
+            def raised(message):
+                try:
+                    raise ValueError(message)
+                except ValueError:
+                    return sys.exc_info()
+
+            first, second = raised("boom one"), raised("boom two")
+            with mock.patch.object(tk.Tk, "report_callback_exception") as printed:
+                app.report_callback_exception(*first)
+                app.report_callback_exception(*first)  # a callback that keeps failing must not flood the log
+                app.report_callback_exception(*second)
+            text = get_error_log_path().read_text(encoding="utf-8")
+            self.assertEqual(text.count("ValueError: boom one"), 1)
+            self.assertEqual(text.count("ValueError: boom two"), 1)
+            self.assertIn("Tk callback exception", text)
+            self.assertIn("Traceback (most recent call last)", text)  # the traceback itself, not just the message
+            self.assertIn("raise ValueError(message)", text)
+            self.assertEqual(printed.call_count, 3)  # terminal runs still print every one
+
+        self._run_in_mainloop(scenario)
+
     def test_search_typing_is_debounced_into_one_render(self):
         def scenario():
             app = self.app
