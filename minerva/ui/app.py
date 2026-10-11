@@ -176,6 +176,8 @@ class MinervaApp(tk.Tk):
     #: Pause before a queued DLC/updates prompt opens, so a double-click that dismisses one prompt cannot
     #: land on the next one appearing under the cursor.
     COMPANION_PROMPT_GAP_MS = 500
+    #: How often the running copy looks for a "show yourself" request from a second copy.
+    WAKE_POLL_MS = 500
 
     def report_callback_exception(self, exc, val, tb):
         """Tk calls this when a callback raises.  The windowless build has no console, so keep it in the log."""
@@ -244,6 +246,8 @@ class MinervaApp(tk.Tk):
         self._seed_var = tk.BooleanVar(value=bool(self._settings.get("seed_after_download", False)))
         self._companion_dialog_open = False
         self._companion_prompt_queue: queue.Queue = queue.Queue()
+        self._single_instance = None
+        self._wake_after_id = None
         self._launch_in_tray = bool(self._start_minimized_var.get()) or "--minimized" in sys.argv
         if self._launch_in_tray:
             # Hide before the window maps so it never appears on the taskbar.
@@ -4383,6 +4387,26 @@ class MinervaApp(tk.Tk):
         except tk.TclError:
             pass
 
+    def attach_single_instance(self, guard):
+        """Hold ``guard`` (the lock on this data folder) and answer a second copy's request to show the window."""
+        self._single_instance = guard
+        if self._wake_after_id is None:
+            self._wake_after_id = self.after(self.WAKE_POLL_MS, self._poll_show_request)
+
+    def _poll_show_request(self):
+        self._wake_after_id = None
+        guard = self._single_instance
+        if guard is None or self._quitting:
+            return
+        try:
+            if guard.take_show_request():
+                log_activity("single_instance.show_requested")
+                self._restore_from_tray()
+        except Exception as e:  # keep polling: one failure must not stop later requests from being answered
+            log_error("MinervaApp show-request poll failed", e)
+        if not self._quitting:
+            self._wake_after_id = self.after(self.WAKE_POLL_MS, self._poll_show_request)
+
     def _quit_from_tray(self):
         self._on_close()
 
@@ -4417,7 +4441,7 @@ class MinervaApp(tk.Tk):
 
     _TIMER_ATTRS = (
         "_poll_after_id", "_render_after_id", "_icon_refresh_after_id", "_lookup_pump_after_id",
-        "_library_rescan_after_id", "_search_save_after_id",
+        "_library_rescan_after_id", "_search_save_after_id", "_wake_after_id",
     )
 
     def destroy(self):

@@ -44,6 +44,8 @@ dkeys/
 *.log
 minerva_settings.json
 minerva_settings.corrupt-*.json
+minerva.lock
+minerva.wake
 minerva_error.log
 minerva_error.log.1
 activity_log*.txt

@@ -441,6 +441,75 @@ class TestAppSmoke(unittest.TestCase):
 
         self._run_in_mainloop(scenario)
 
+    def test_the_running_copy_brings_its_window_forward_when_a_second_copy_asks(self):
+        def scenario():
+            from minerva.core.single_instance import SingleInstance
+
+            app = self.app
+            self._pump(0.3)
+            app.WAKE_POLL_MS = 20  # shadows the class constant for this app only
+            with tempfile.TemporaryDirectory() as folder:
+                guard = SingleInstance(folder)
+                self.assertTrue(guard.acquire())
+                shown = []
+                try:
+                    with mock.patch.object(app, "_restore_from_tray", side_effect=lambda: shown.append(1)):
+                        app.attach_single_instance(guard)
+                        SingleInstance(folder).request_show()  # what a second copy does
+                        self._pump(0.3)
+                        self.assertEqual(shown, [1])
+                        self._pump(0.2)
+                        self.assertEqual(shown, [1])  # one request, one answer
+                        SingleInstance(folder).request_show()  # and it keeps listening
+                        self._pump(0.3)
+                        self.assertEqual(shown, [1, 1])
+                finally:
+                    app._single_instance = None  # the poll stops by itself at its next tick
+                    self._pump(0.1)
+                    del app.WAKE_POLL_MS
+                    guard.release()
+
+        self._run_in_mainloop(scenario)
+
+    def test_a_failure_while_checking_for_requests_does_not_stop_the_listening(self):
+        def scenario():
+            from minerva.core.single_instance import SingleInstance
+
+            app = self.app
+            self._pump(0.3)
+            app.WAKE_POLL_MS = 20
+            with tempfile.TemporaryDirectory() as folder:
+                guard = SingleInstance(folder)
+                shown, results = [], [OSError("disk hiccup"), True]
+
+                def flaky():
+                    result = results.pop(0) if results else False
+                    if isinstance(result, Exception):
+                        raise result
+                    return result
+
+                try:
+                    with mock.patch.object(guard, "take_show_request", side_effect=flaky), \
+                            mock.patch.object(app, "_restore_from_tray", side_effect=lambda: shown.append(1)), \
+                            mock.patch.object(app_module, "log_error") as log:
+                        app.attach_single_instance(guard)
+                        self._pump(0.4)
+                finally:
+                    app._single_instance = None
+                    self._pump(0.1)
+                    del app.WAKE_POLL_MS
+            self.assertEqual(shown, [1])  # the second poll still answered the request
+            self.assertEqual(log.call_count, 1)
+
+        self._run_in_mainloop(scenario)
+
+    def test_closing_the_window_stops_the_listening_for_requests(self):
+        def scenario():
+            app = self.app
+            self.assertIn("_wake_after_id", app._TIMER_ATTRS)  # destroy() cancels it with the other timers
+
+        self._run_in_mainloop(scenario)
+
     def test_search_typing_is_debounced_into_one_render(self):
         def scenario():
             app = self.app

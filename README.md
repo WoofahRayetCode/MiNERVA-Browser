@@ -31,6 +31,7 @@ A portable desktop GUI for browsing and downloading from [minerva-archive.org](h
 - ⚙️ **Advanced downloads panel** — save folder, extract/CHD/Xbox toggles, and ROM tools (collapsed by default)
 - 📂 **Custom save folder** via the Browse button (defaults to `downloads/` next to the app)
 - 💾 **State persistence** — preferences, filters, and active/queued downloads persist across app launches
+- 🔒 **One copy per folder** — the app's settings, resume data and caches live next to the executable, so a second copy started against the same folder brings the running one to the front (even from the tray) instead of overwriting its state; copies in different folders are independent. The lock is released by the OS if the app crashes, so it can never get stuck
 - 🗂️ **Torrent caching** — each *collection* `.torrent` is fetched once (not once per file), validated, and cached in `torrentfiles/`
 - 🚫 **Deduplication** — automatically skips items already pending, active, completed, or being looked up
 - 🛡️ **Hardened I/O** — HTTP requests retry with backoff and honour `Retry-After`; settings are written atomically with a `.bak` and a corrupt file is quarantined, never overwritten
@@ -127,14 +128,14 @@ python minerva_browser.py
 
 > **Note:** `libtorrent` is required for downloading. Without it, the browser still works for navigating and searching, but downloads will be disabled. `pillow` and `pystray` enable the system tray icon.
 
-Local settings (`minerva_settings.json`), logs, torrents, downloads, extracted dumps, and auto-installed tools stay next to the working copy (or the portable exe) and are gitignored.
+Local settings (`minerva_settings.json`), logs, torrents, downloads, extracted dumps, auto-installed tools, and the one-copy-per-folder lock (`minerva.lock`, `minerva.wake`) stay next to the working copy (or the portable exe) and are gitignored.
 
 ---
 
 ## Project Structure
 
 ```
-├── minerva_browser.py         # Application entry point
+├── minerva_browser.py         # Application entry point (calls minerva/launcher.py)
 ├── minerva_browser.spec       # PyInstaller standalone build configuration
 ├── build.ps1                  # Windows build automation script
 ├── build.sh                   # Linux build automation script
@@ -143,6 +144,7 @@ Local settings (`minerva_settings.json`), logs, torrents, downloads, extracted d
 │   └── smoke_libtorrent_bundle.py   # Check a PyInstaller binary loads libtorrent
 ├── minerva/
 │   ├── constants.py           # Paths, theme tokens, trackers, logging, atomic settings I/O
+│   ├── launcher.py            # Start-up: one running copy per folder, then the app
 │   ├── core/
 │   │   ├── torrent_engine.py  # libtorrent engine: one torrent per collection, many downloads per torrent
 │   │   ├── lt_settings.py     # Validated libtorrent session settings + alert mask
@@ -152,6 +154,7 @@ Local settings (`minerva_settings.json`), logs, torrents, downloads, extracted d
 │   │   ├── torrent_cache.py   # Single-flight, validated collection .torrent cache
 │   │   ├── lookup.py          # Row lookup (hashes.db → ROM page) → verified torrent source, aggregated errors
 │   │   ├── hashes_db.py       # Reads single rows of the archive's hashes.db over HTTP range requests
+│   │   ├── single_instance.py # OS file lock per data folder + "show yourself" request to the running copy
 │   │   ├── library_index.py   # Background "already downloaded" index
 │   │   ├── entries.py         # Per-listing precompute (regions, tags, sizes, match keys)
 │   │   ├── download_view.py   # Row formatting for the downloads list (Tk-free)
@@ -177,6 +180,7 @@ Local settings (`minerva_settings.json`), logs, torrents, downloads, extracted d
     ├── test_downloads_panel.py        # 5k-row panel budgets, filters, key handling
     ├── test_download_queue*.py        # queue behaviour incl. 10k-item scale tests
     ├── test_http.py / test_torrent_cache.py / test_lookup.py / test_hashes_db.py
+    ├── test_single_instance.py / test_launcher.py   # lock across real processes, crash safety, second-copy handling
     ├── test_extractors.py / test_companions.py / test_ps3_dkeys.py / test_parsers.py
     └── …                              # settings, library index, entries, view model, assets
 ```
