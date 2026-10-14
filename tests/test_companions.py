@@ -13,6 +13,8 @@ from minerva.core.companions import (
     reset_companion_cache,
     system_key,
     switch_ids_related,
+    detect_system_browse_path,
+    KNOWN_SYSTEM_BROWSE_PATHS,
 )
 
 
@@ -221,6 +223,66 @@ class TestCompanions(unittest.TestCase):
         )
         self.assertEqual(found, [])
 
+    def test_detect_system_browse_path(self):
+        # PS3 serials
+        self.assertEqual(
+            detect_system_browse_path("Demon's Souls [BCUS98174].iso"),
+            KNOWN_SYSTEM_BROWSE_PATHS["Sony - PlayStation 3"],
+        )
+        self.assertEqual(
+            detect_system_browse_path("BLUS30444 - Metal Gear Solid 4.iso"),
+            KNOWN_SYSTEM_BROWSE_PATHS["Sony - PlayStation 3"],
+        )
+        # PS Vita serials and .vpk
+        self.assertEqual(
+            detect_system_browse_path("Persona 4 Golden [PCSE00120].iso"),
+            KNOWN_SYSTEM_BROWSE_PATHS["Sony - PlayStation Vita"],
+        )
+        self.assertEqual(
+            detect_system_browse_path("HomebrewGame.vpk"),
+            KNOWN_SYSTEM_BROWSE_PATHS["Sony - PlayStation Vita"],
+        )
+        # Switch Title ID and extensions
+        self.assertEqual(
+            detect_system_browse_path("Super Mario Odyssey [0100000000010000].nsp"),
+            KNOWN_SYSTEM_BROWSE_PATHS["Nintendo - Nintendo Switch"],
+        )
+        self.assertEqual(
+            detect_system_browse_path("Zelda BOTW.xci"),
+            KNOWN_SYSTEM_BROWSE_PATHS["Nintendo - Nintendo Switch"],
+        )
+        # 3DS extensions
+        self.assertEqual(
+            detect_system_browse_path("Pokemon Sun.cia"),
+            KNOWN_SYSTEM_BROWSE_PATHS["Nintendo - Nintendo 3DS"],
+        )
+        self.assertEqual(
+            detect_system_browse_path("Pokemon Moon.3ds"),
+            KNOWN_SYSTEM_BROWSE_PATHS["Nintendo - Nintendo 3DS"],
+        )
+        # Wii U extensions
+        self.assertEqual(
+            detect_system_browse_path("Mario Kart 8.wux"),
+            KNOWN_SYSTEM_BROWSE_PATHS["Nintendo - Nintendo Wii U"],
+        )
+        # Xbox 360
+        self.assertEqual(
+            detect_system_browse_path("Halo Reach.xiso.iso"),
+            KNOWN_SYSTEM_BROWSE_PATHS["Microsoft - Xbox 360"],
+        )
+        # Path keywords
+        self.assertEqual(
+            detect_system_browse_path("/media/usb/ps3/Uncharted.iso"),
+            KNOWN_SYSTEM_BROWSE_PATHS["Sony - PlayStation 3"],
+        )
+        self.assertEqual(
+            detect_system_browse_path("/roms/switch/Metroid Dread.zip"),
+            KNOWN_SYSTEM_BROWSE_PATHS["Nintendo - Nintendo Switch"],
+        )
+        # Unknown
+        self.assertIsNone(detect_system_browse_path("Unknown_ROM_123.bin"))
+
 
 if __name__ == "__main__":
     unittest.main()
+

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import pathlib
 import re
 import threading
 import time
@@ -246,6 +248,86 @@ def parent_browse_path(path: str) -> str:
 def folder_name_from_path(path: str) -> str:
     raw = urllib.parse.unquote((path or "").replace("\\", "/").rstrip("/"))
     return raw.split("/")[-1]
+
+
+KNOWN_SYSTEM_BROWSE_PATHS: dict[str, str] = {
+    "Sony - PlayStation 3": "/browse/./Redump/Sony - PlayStation 3/",
+    "Nintendo - Nintendo Switch": "/browse/./No-Intro/Nintendo - Nintendo Switch/",
+    "Sony - PlayStation Vita": "/browse/./No-Intro/Sony - PlayStation Vita/",
+    "Nintendo - Nintendo 3DS": "/browse/./No-Intro/Nintendo - Nintendo 3DS/",
+    "Nintendo - Nintendo Wii U": "/browse/./No-Intro/Nintendo - Nintendo Wii U/",
+    "Microsoft - Xbox 360": "/browse/./Redump/Microsoft - Xbox 360/",
+    "Sony - PlayStation 4": "/browse/./Redump/Sony - PlayStation 4/",
+    "Sony - PlayStation": "/browse/./Redump/Sony - PlayStation/",
+    "Sony - PlayStation 2": "/browse/./Redump/Sony - PlayStation 2/",
+    "Sony - PlayStation Portable": "/browse/./Redump/Sony - PlayStation Portable/",
+}
+
+_PS3_SERIAL_RE = re.compile(r"\bB[CL][AEUJK][A-Z]\s*-?\s*\d{5}\b", re.IGNORECASE)
+_PSVITA_SERIAL_RE = re.compile(r"\b(PCSE|PCSB|PCSG|PCSF|PCSH|PCSC|PCSA)\s*-?\s*\d{5}\b", re.IGNORECASE)
+_PS4_SERIAL_RE = re.compile(r"\b(CUSA|CUSE)\s*-?\s*\d{5}\b", re.IGNORECASE)
+_PS1_SERIAL_RE = re.compile(r"\b(SLUS|SLES|SCES|SCUS)\s*-?\s*0\d{4}\b", re.IGNORECASE)
+_PS2_SERIAL_RE = re.compile(r"\b(SLUS|SLES|SCES|SCUS)\s*-?\s*[25]\d{4}\b", re.IGNORECASE)
+
+
+def detect_system_browse_path(path_or_name: str | os.PathLike) -> str | None:
+    """Infer the collection browse path for a local file name or path."""
+    text = str(path_or_name)
+    name = pathlib.Path(text).name
+    lower_full = text.lower()
+
+    # 1. Serial and Title ID detection
+    if _PS3_SERIAL_RE.search(name):
+        return KNOWN_SYSTEM_BROWSE_PATHS["Sony - PlayStation 3"]
+    if _PSVITA_SERIAL_RE.search(name):
+        return KNOWN_SYSTEM_BROWSE_PATHS["Sony - PlayStation Vita"]
+    if _PS4_SERIAL_RE.search(name):
+        return KNOWN_SYSTEM_BROWSE_PATHS["Sony - PlayStation 4"]
+    tid = switch_title_id(name)
+    if tid:
+        return KNOWN_SYSTEM_BROWSE_PATHS["Nintendo - Nintendo Switch"]
+    if _PS1_SERIAL_RE.search(name):
+        return KNOWN_SYSTEM_BROWSE_PATHS["Sony - PlayStation"]
+    if _PS2_SERIAL_RE.search(name):
+        return KNOWN_SYSTEM_BROWSE_PATHS["Sony - PlayStation 2"]
+
+    # 2. File extension detection
+    ext = pathlib.Path(name).suffix.lower()
+    if ext in (".nsp", ".xci"):
+        return KNOWN_SYSTEM_BROWSE_PATHS["Nintendo - Nintendo Switch"]
+    if ext == ".vpk":
+        return KNOWN_SYSTEM_BROWSE_PATHS["Sony - PlayStation Vita"]
+    if ext in (".cia", ".3ds"):
+        return KNOWN_SYSTEM_BROWSE_PATHS["Nintendo - Nintendo 3DS"]
+    if ext in (".wux", ".rpx"):
+        return KNOWN_SYSTEM_BROWSE_PATHS["Nintendo - Nintendo Wii U"]
+    if ext == ".xex" or name.lower().endswith(".xiso.iso"):
+        return KNOWN_SYSTEM_BROWSE_PATHS["Microsoft - Xbox 360"]
+
+    # 3. Path / name console keywords
+    if re.search(r"\b(playstation\s*3|ps3)\b", lower_full):
+        return KNOWN_SYSTEM_BROWSE_PATHS["Sony - PlayStation 3"]
+    if re.search(r"\b(playstation\s*vita|ps\s*vita|psvita)\b", lower_full):
+        return KNOWN_SYSTEM_BROWSE_PATHS["Sony - PlayStation Vita"]
+    if re.search(r"\b(switch|nintendo\s*switch)\b", lower_full):
+        return KNOWN_SYSTEM_BROWSE_PATHS["Nintendo - Nintendo Switch"]
+    if re.search(r"\b(wii\s*u|wiiu)\b", lower_full):
+        return KNOWN_SYSTEM_BROWSE_PATHS["Nintendo - Nintendo Wii U"]
+    if re.search(r"\b(xbox\s*360|x360)\b", lower_full):
+        return KNOWN_SYSTEM_BROWSE_PATHS["Microsoft - Xbox 360"]
+    if re.search(r"\b(3ds|nintendo\s*3ds)\b", lower_full):
+        return KNOWN_SYSTEM_BROWSE_PATHS["Nintendo - Nintendo 3DS"]
+    if re.search(r"\b(playstation\s*4|ps4)\b", lower_full):
+        return KNOWN_SYSTEM_BROWSE_PATHS["Sony - PlayStation 4"]
+    if re.search(r"\b(playstation\s*2|ps2)\b", lower_full):
+        return KNOWN_SYSTEM_BROWSE_PATHS["Sony - PlayStation 2"]
+    if re.search(r"\b(psp|playstation\s*portable)\b", lower_full):
+        return KNOWN_SYSTEM_BROWSE_PATHS["Sony - PlayStation Portable"]
+    if re.search(r"\b(ps1|psx|playstation)\b", lower_full):
+        return KNOWN_SYSTEM_BROWSE_PATHS["Sony - PlayStation"]
+
+    return None
+
 
 
 def companion_folder_paths(browse_path: str, sibling_folders: list[dict]) -> list[str]:

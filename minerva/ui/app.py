@@ -1,6 +1,6 @@
 import sys
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog
 import threading
 import urllib.request
 import urllib.parse
@@ -53,11 +53,17 @@ from minerva.ui.theme import (
 from minerva.ui.components.filter_bar import FilterBar
 from minerva.ui.downloads_panel import DownloadsPanel, PanelActions
 from minerva.ui.components.tools_dialog import ToolsMenu, ToolsDialog
-from minerva.ui.components.companion_dialog import prompt_companions
+from minerva.ui.components.companion_dialog import prompt_companions, prompt_system_choice
 from minerva.ui.components.modal import grab_when_mapped
 from minerva.core.hashes_db import HashesDb
 from minerva.core.sqlite_http import fetch_entries, fetch_rom_info, extract_rom_id
-from minerva.core.companions import find_companions, classify_release, KIND_BASE
+from minerva.core.companions import (
+    find_companions,
+    classify_release,
+    KIND_BASE,
+    detect_system_browse_path,
+    folder_name_from_path,
+)
 from minerva.core.ps3_dkeys import (
     DKEY_ZIP_MAX_BYTES,
     PS3_DISC_KEYS_TXT_PATH,
@@ -1088,12 +1094,20 @@ class MinervaApp(tk.Tk):
                     label=f"⬇ Queue Selected ({len(self._checked_hrefs)} items)",
                     command=self._queue_checked_downloads,
                 )
+                menu.add_command(
+                    label=f"⬆ Check Updates / DLC ({len(self._checked_hrefs)} items)",
+                    command=self._check_checked_entries_updates,
+                )
             else:
                 entry = next((e for e in self._all_entries if e["href"] == sel[0]), None)
                 if entry and not entry.get("is_folder", False):
                     menu.add_command(
                         label=f"⬇ Download '{entry['name'][:28]}…'" if len(entry['name']) > 28 else f"⬇ Download '{entry['name']}'",
                         command=lambda ent=entry: self._download_single_entry(ent),
+                    )
+                    menu.add_command(
+                        label="⬆ Check for Updates / DLC",
+                        command=lambda ent=entry: self._check_entry_updates(ent),
                     )
             menu.add_command(label="🌐 Open in Web Browser", command=self._open_in_browser)
             menu.add_separator()
@@ -1613,6 +1627,7 @@ class MinervaApp(tk.Tk):
             "verify_archives": self._verify_downloaded_archives_button_click,
             "ensure_dkeys": self._ensure_ps3_dkeys_button_click,
             "check_updates": self._check_library_updates_click,
+            "check_local_file_updates": self._check_local_file_updates_click,
             "open_extracted": self._open_current_extracted_folder,
             "force_delete_bins": self._force_delete_bins_button_click,
         }
@@ -3101,6 +3116,7 @@ class MinervaApp(tk.Tk):
             open_folder=self._panel_open_folder,
             show_error=self._panel_show_error,
             copy_names=self._panel_copy_names,
+            check_updates=self._on_panel_check_updates,
             on_filter_change=self._sync_downloads_panel,
         )
 
@@ -3521,6 +3537,205 @@ class MinervaApp(tk.Tk):
             self._enqueue_companion_items(picked, "", self.get_download_dir())
         elif note:
             messagebox.showinfo(TITLE, note.strip())
+
+    def _check_entry_updates(self, entry: dict):
+        """Manually check for available updates and DLC for a single entry in the browse view."""
+        name = entry.get("name", "")
+        browse_path = self._current_path
+        if not name or not browse_path:
+            return
+        if classify_release(name, folder_name_from_path(browse_path)) != KIND_BASE:
+            messagebox.showinfo("Check for Updates / DLC", f"'{name}' does not appear to be a base game.")
+            return
+
+        self._status_var.set(f"Looking for updates/DLC: {name}…")
+
+        def worker():
+            try:
+                current = list(self._all_entries) if browse_path == self._current_path else None
+                items = find_companions(
+                    name,
+                    browse_path,
+                    current_entries=current,
+                    fetch_fn=fetch_entries,
+                    latest_update_only=True,
+                )
+            except Exception as e:
+                log_error(f"Manual companion search failed for {name}", e)
+                self.after(0, lambda: messagebox.showerror("Check for Updates / DLC", f"Failed to check updates:\n{e}"))
+                return
+            if not items:
+                self.after(0, lambda: self._on_no_updates_found(name))
+                return
+            self.after(0, lambda: self._show_companion_prompt(name, items, browse_path, self.get_download_dir()))
+
+        threading.Thread(target=worker, name="manual-entry-updates", daemon=True).start()
+
+    def _on_no_updates_found(self, name: str):
+        self._status_var.set(f"No updates or DLC found for {name}")
+        messagebox.showinfo("Check for Updates / DLC", f"No updates or DLC found in the archive for:\n\n{name}")
+
+    def _check_checked_entries_updates(self):
+        """Manually check for updates and DLC for all checked entries in the browse view."""
+        browse_path = self._current_path
+        folder = folder_name_from_path(browse_path)
+        checked = [e for e in self._all_entries if e.get("href") in self._checked_hrefs and not e.get("is_folder")]
+        base_games = [e for e in checked if classify_release(e.get("name", ""), folder) == KIND_BASE]
+        if not base_games:
+            messagebox.showinfo(
+                "Check for Updates / DLC",
+                "None of the checked items are base games." if checked else "No items are currently checked.",
+            )
+            return
+
+        games = [{"name": e["name"], "browse_path": browse_path} for e in base_games]
+        self._update_check_running = True
+        self._extract_status_var.set(f"Checking updates for {len(games)} game(s)…")
+
+        def worker():
+            try:
+                current = list(self._all_entries) if browse_path == self._current_path else None
+                result = check_library_updates(
+                    games,
+                    (),
+                    fetch_entries,
+                    progress=lambda i, n, name: self.after(
+                        0, lambda: self._extract_status_var.set(f"Update check {i}/{n}: {name}")
+                    ),
+                    cancel=lambda: self._quitting,
+                    finder=lambda n, bp, **kwargs: find_companions(
+                        n, bp, current_entries=current, **kwargs
+                    ),
+                )
+            except Exception as e:
+                log_error("Manual batch update check failed", e)
+                self.after(0, lambda err=e: self._finish_update_check(None, str(err)))
+                return
+            self.after(0, lambda: self._finish_update_check(result, ""))
+
+        threading.Thread(target=worker, name="manual-batch-updates", daemon=True).start()
+
+    def _on_panel_check_updates(self, ids: list[str]):
+        """Check for updates/DLC for selected downloads in the Downloads panel."""
+        if not ids:
+            return
+        names: list[str] = []
+        snap = self._download_queue.snapshot() if self._download_queue else {}
+        all_queue_items = (
+            *snap.get("done", ()),
+            *snap.get("pending", ()),
+            *snap.get("active_items", ()),
+            *snap.get("retry", ()),
+        )
+        queue_by_id = {item["id"]: item.get("name", "") for item in all_queue_items if "id" in item}
+
+        for did in ids:
+            name = None
+            if self._torrent_engine:
+                meta = self._torrent_engine.get_meta(did)
+                if meta and meta.get("name"):
+                    name = meta["name"]
+            if not name:
+                name = queue_by_id.get(did)
+            if name and name not in names:
+                names.append(name)
+
+        if not names:
+            return
+
+        games: list[dict] = []
+        for name in names:
+            hist = self._download_history.get(name, {})
+            browse_path = hist.get("browse_path") or ""
+            if not browse_path:
+                browse_path = detect_system_browse_path(name) or ""
+            games.append({"name": name, "browse_path": browse_path})
+
+        if len(games) == 1 and not games[0]["browse_path"]:
+            chosen_path = prompt_system_choice(self, games[0]["name"])
+            if not chosen_path:
+                return
+            games[0]["browse_path"] = chosen_path
+
+        valid_games = [
+            g for g in games
+            if g.get("browse_path") and classify_release(g["name"], folder_name_from_path(g["browse_path"])) == KIND_BASE
+        ]
+        if not valid_games:
+            messagebox.showinfo(
+                "Check for Updates / DLC",
+                "None of the selected downloads could be matched to an archive folder.\n\n"
+                "Updates can only be checked for base games with a known console system.",
+            )
+            return
+
+        download_dir = pathlib.Path(self.get_download_dir())
+        self._update_check_running = True
+        self._extract_status_var.set(f"Checking {len(valid_games)} download(s) for updates…")
+
+        def worker():
+            try:
+                installed = {h.get("name", "") for h in self._download_history.values()}
+                installed |= {p.name for p in collect_downloaded_archives(download_dir)}
+                result = check_library_updates(
+                    valid_games,
+                    installed,
+                    fetch_entries,
+                    progress=lambda i, n, name: self.after(
+                        0, lambda: self._extract_status_var.set(f"Update check {i}/{n}: {name}")
+                    ),
+                    cancel=lambda: self._quitting,
+                )
+            except Exception as e:
+                log_error("Panel download update check failed", e)
+                self.after(0, lambda err=e: self._finish_update_check(None, str(err)))
+                return
+            self.after(0, lambda: self._finish_update_check(result, ""))
+
+        threading.Thread(target=worker, name="panel-updates-check", daemon=True).start()
+
+    def _check_local_file_updates_click(self):
+        """Prompt to pick a local ROM file and search the archive for matching updates/DLC."""
+        file_path_str = filedialog.askopenfilename(
+            parent=self,
+            title="Select ROM to Check for Updates / DLC",
+            filetypes=[
+                ("ROM & Disc Images", "*.iso *.chd *.zip *.7z *.rar *.pkg *.bin *.cue *.wbfs *.gcz *.rvz *.cia *.3ds *.nsp *.xci *.vpk *.xex"),
+                ("All Files", "*.*"),
+            ],
+        )
+        if not file_path_str:
+            return
+
+        p = pathlib.Path(file_path_str)
+        file_name = p.name
+        browse_path = detect_system_browse_path(p)
+        if not browse_path:
+            browse_path = prompt_system_choice(self, file_name)
+            if not browse_path:
+                return
+
+        self._status_var.set(f"Looking for updates/DLC: {file_name}…")
+
+        def worker():
+            try:
+                items = find_companions(
+                    file_name,
+                    browse_path,
+                    fetch_fn=fetch_entries,
+                    latest_update_only=True,
+                )
+            except Exception as e:
+                log_error(f"Local ROM companion search failed for {file_name}", e)
+                self.after(0, lambda: messagebox.showerror("Check for Updates / DLC", f"Failed to check updates:\n{e}"))
+                return
+            if not items:
+                self.after(0, lambda: self._on_no_updates_found(file_name))
+                return
+            self.after(0, lambda: self._show_companion_prompt(file_name, items, browse_path, self.get_download_dir()))
+
+        threading.Thread(target=worker, name="local-file-updates", daemon=True).start()
+
 
     def _enqueue_companion_items(self, items, browse_path: str, save_path: str):
         for item in items:

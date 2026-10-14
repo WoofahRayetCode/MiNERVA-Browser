@@ -1,6 +1,7 @@
 import time
 import tkinter as tk
 import unittest
+from unittest import mock
 
 from minerva.core.download_queue import DownloadQueue
 from minerva.ui.theme import setup_modern_styles
@@ -69,6 +70,7 @@ class PanelCase(unittest.TestCase):
             retry=lambda ids: self.calls.append(("retry", list(ids))),
             move=lambda ids, where: self.calls.append(("move", list(ids), where)),
             open_folder=lambda ids, extracted: self.calls.append(("open_folder", list(ids), extracted)),
+            check_updates=lambda ids: self.calls.append(("check_updates", list(ids))),
         )
         self.panel = dp.DownloadsPanel(self.root, a)
         self.panel.pack(fill="both", expand=True)
@@ -241,6 +243,31 @@ class TestInteractions(PanelCase):
         self.panel.tree.event_generate("<space>")
         self.root.update()
         self.assertEqual(self.calls, [("toggle_pause", ["id2"])])
+
+    def test_right_click_menu_includes_check_updates(self):
+        q = make_queue(pending=1, active=1, done=1)
+        self.sync(q)
+        self.panel.tree.selection_set(["id0"])
+        event = mock.Mock()
+        event.y = 10
+        event.x_root = 100
+        event.y_root = 100
+        with mock.patch.object(self.panel.tree, "identify_row", return_value="id0"), \
+             mock.patch.object(self.panel._menu, "tk_popup"):
+            self.panel._on_right_click(event)
+
+        menu = self.panel._menu
+        found = False
+        last_idx = menu.index("end")
+        if last_idx is not None:
+            for idx in range(last_idx + 1):
+                if menu.type(idx) == "command" and "Check for Updates / DLC" in menu.entrycget(idx, "label"):
+                    menu.invoke(idx)
+                    found = True
+                    break
+        self.assertTrue(found, "Check for Updates / DLC menu entry must exist in right-click context menu")
+        self.assertEqual(self.calls, [("check_updates", ["id0"])])
+
 
 
 class TestScale(PanelCase):

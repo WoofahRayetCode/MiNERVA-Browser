@@ -5,7 +5,7 @@ from __future__ import annotations
 import tkinter as tk
 from tkinter import ttk
 from minerva.ui.theme import BG, PANEL, PANEL_ALT, FG, FG_DIM, ACCENT, BORDER, SUCCESS
-from minerva.core.companions import KIND_DLC, KIND_UPDATE, Companion
+from minerva.core.companions import KIND_DLC, KIND_UPDATE, Companion, KNOWN_SYSTEM_BROWSE_PATHS
 from minerva.ui.components.modal import grab_when_mapped
 
 
@@ -124,3 +124,70 @@ def _row(parent, item: Companion, var: tk.BooleanVar):
         tk.Label(row, text=item.folder, bg=PANEL_ALT, fg=FG_DIM, font=("TkDefaultFont", 8)).pack(
             side="right", padx=8
         )
+
+
+def prompt_system_choice(parent, game_name: str, default_system: str | None = None) -> str | None:
+    """Prompt the user to choose which console system a ROM belongs to.
+
+    Returns the collection browse path (e.g. '/browse/./Redump/Sony - PlayStation 3/'),
+    or None if cancelled.
+    """
+    systems = list(KNOWN_SYSTEM_BROWSE_PATHS.keys())
+    if not systems:
+        return None
+    default = default_system if default_system in systems else systems[0]
+
+    chosen: dict[str, str | None] = {"path": None}
+    dlg = tk.Toplevel(parent)
+    dlg.withdraw()
+    try:
+        dlg.title("Select System")
+        dlg.configure(bg=BG)
+        dlg.transient(parent)
+        dlg.geometry("480x200")
+        dlg.minsize(420, 180)
+
+        tk.Label(
+            dlg,
+            text=f"Select console system for:\n{game_name}",
+            bg=BG,
+            fg=FG,
+            font=("TkDefaultFont", 10, "bold"),
+            justify="left",
+            wraplength=440,
+        ).pack(anchor="w", padx=16, pady=(16, 12))
+
+        combo_frame = tk.Frame(dlg, bg=BG)
+        combo_frame.pack(fill="x", padx=16, pady=(0, 16))
+
+        tk.Label(combo_frame, text="System:", bg=BG, fg=FG_DIM, font=("TkDefaultFont", 9)).pack(side="left", padx=(0, 8))
+
+        var = tk.StringVar(value=default)
+        combo = ttk.Combobox(combo_frame, textvariable=var, values=systems, state="readonly", width=35)
+        combo.pack(side="left", fill="x", expand=True)
+
+        btns = tk.Frame(dlg, bg=BG)
+        btns.pack(fill="x", padx=16, pady=(0, 14))
+
+        def _cancel():
+            dlg.destroy()
+
+        def _confirm():
+            sys_name = var.get()
+            chosen["path"] = KNOWN_SYSTEM_BROWSE_PATHS.get(sys_name)
+            dlg.destroy()
+
+        ttk.Button(btns, text="Cancel", command=_cancel).pack(side="right", padx=4)
+        ttk.Button(btns, text="Check Updates", style="Primary.TButton", command=_confirm).pack(side="right", padx=4)
+
+        dlg.protocol("WM_DELETE_WINDOW", _cancel)
+    except BaseException:
+        dlg.destroy()
+        raise
+
+    dlg.deiconify()
+    grab_when_mapped(dlg)
+    dlg.focus_set()
+    dlg.wait_window()
+    return chosen["path"]
+

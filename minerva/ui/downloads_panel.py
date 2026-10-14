@@ -57,6 +57,7 @@ class PanelActions:
     open_folder: Callable[[list[str], bool], None] = _noop
     show_error: Callable[[str], None] = _noop
     copy_names: Callable[[list[str]], None] = _noop
+    check_updates: Callable[[list[str]], None] = _noop
     on_filter_change: Callable[[], None] = _noop
 
 
@@ -228,6 +229,7 @@ class DownloadsPanel(tk.Frame):
         if len(ids) == 1 and kinds == {dv.KIND_ERROR}:
             add("Show error details…", lambda: self.actions.show_error(ids[0]))
         menu.add_separator()
+        add("Check for Updates / DLC…", lambda: self.actions.check_updates(ids))
         add("Copy name" + ("s" if len(ids) > 1 else ""), lambda: self.actions.copy_names(ids))
         if live:
             add("Cancel\tDel", lambda: self.actions.cancel(live))

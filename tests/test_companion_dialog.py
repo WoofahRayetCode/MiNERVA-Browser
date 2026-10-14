@@ -4,10 +4,10 @@ import unittest
 from tkinter import ttk
 from unittest import mock
 
-from minerva.core.companions import KIND_DLC, KIND_UPDATE, Companion
+from minerva.core.companions import KIND_DLC, KIND_UPDATE, Companion, KNOWN_SYSTEM_BROWSE_PATHS
 from minerva.ui.components import companion_dialog, modal
-from minerva.ui.components.companion_dialog import prompt_companions
-from minerva.ui.components.tools_dialog import ToolsDialog
+from minerva.ui.components.companion_dialog import prompt_companions, prompt_system_choice
+from minerva.ui.components.tools_dialog import ToolsDialog, ToolsMenu
 from minerva.ui.theme import setup_modern_styles
 
 
@@ -133,6 +133,22 @@ class TestCompanionDialog(unittest.TestCase):
             prompt_companions(self.root, "Game", ITEMS)
         self.assertEqual(states, ["withdrawn"] * len(ITEMS))
 
+    def test_prompt_system_choice_confirm(self):
+        def action(dlg):
+            button(dlg, "Check Updates").invoke()
+
+        self.drive(action)
+        path = prompt_system_choice(self.root, "Demon's Souls.iso", default_system="Sony - PlayStation 3")
+        self.assertEqual(path, KNOWN_SYSTEM_BROWSE_PATHS["Sony - PlayStation 3"])
+
+    def test_prompt_system_choice_cancel(self):
+        def action(dlg):
+            button(dlg, "Cancel").invoke()
+
+        self.drive(action)
+        path = prompt_system_choice(self.root, "Unknown.iso")
+        self.assertIsNone(path)
+
 
 class TestToolsDialogGrab(unittest.TestCase):
     @classmethod
@@ -161,6 +177,21 @@ class TestToolsDialogGrab(unittest.TestCase):
         finally:
             dlg.destroy()
 
+    def test_tools_dialog_and_menu_contain_check_local_file_updates(self):
+        called = []
+        callbacks = {"check_local_file_updates": lambda: called.append("checked")}
+        dlg = ToolsDialog(self.root, callbacks, "7-Zip", "chdman")
+        try:
+            lbl = next(w for w in descendants(dlg) if isinstance(w, tk.Label) and "Check Local ROM" in w.cget("text"))
+            self.assertIsNotNone(lbl)
+            card = lbl.master.master
+            btn = next(w for w in descendants(card) if isinstance(w, ttk.Button) and w.cget("text") == "Run")
+            btn.invoke()
+            self.assertEqual(called, ["checked"])
+        finally:
+            dlg.destroy()
+
 
 if __name__ == "__main__":
     unittest.main()
+

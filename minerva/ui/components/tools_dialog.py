@@ -70,6 +70,10 @@ class ToolsMenu:
             label="⬆ Check Downloaded Games for Updates / DLC",
             command=callbacks.get("check_updates"),
         )
+        menu.add_command(
+            label="🔍 Check Local ROM File for Updates / DLC…",
+            command=callbacks.get("check_local_file_updates"),
+        )
         menu.add_separator()
         menu.add_command(
             label="📁 Open Extracted ROMs Folder",
@@ -189,6 +193,11 @@ class ToolsDialog(tk.Toplevel):
                 "⬆ Check for Updates / DLC",
                 "Look in the archive for newer updates and DLC for games you already downloaded",
                 self.callbacks.get("check_updates"),
+            ),
+            (
+                "🔍 Check Local ROM File for Updates / DLC…",
+                "Select a ROM on disk to find and download matching updates and DLC from the archive",
+                self.callbacks.get("check_local_file_updates"),
             ),
             (
                 "🔍 Verify Extracted Integrity",
