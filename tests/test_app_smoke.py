@@ -510,6 +510,94 @@ class TestAppSmoke(unittest.TestCase):
 
         self._run_in_mainloop(scenario)
 
+    def _restore_window(self):
+        app = self.app
+        try:
+            app.deiconify()
+            app.state("normal")
+        except tk.TclError:
+            pass
+
+    def test_minimize_stays_on_the_taskbar(self):
+        def scenario():
+            app = self.app
+            self._pump(0.2)
+            try:
+                with mock.patch.object(app, "withdraw") as withdrawn:
+                    app._minimize_to_taskbar()
+                    self._pump(0.3)
+                    self.assertEqual(app.state(), "iconic")
+                    withdrawn.assert_not_called()
+                    self._pump(0.2)
+                    self.assertNotEqual(app.state(), "withdrawn")
+                    self.assertEqual(app.state(), "iconic")
+            finally:
+                self._restore_window()
+
+        self._run_in_mainloop(scenario)
+
+    def test_close_button_minimizes_to_the_taskbar_when_the_tray_is_up(self):
+        def scenario():
+            app = self.app
+            self._pump(0.2)
+            self._restore_window()
+            try:
+                with mock.patch.object(app, "_on_close") as close, \
+                        mock.patch.object(app, "withdraw") as withdrawn:
+                    app._tray_icon = object()
+                    app._quitting = False
+                    app._on_close_request()
+                    self._pump(0.3)
+                    close.assert_not_called()
+                    withdrawn.assert_not_called()
+                    self.assertEqual(app.state(), "iconic")
+            finally:
+                app._tray_icon = None
+                app._quitting = False
+                self._restore_window()
+
+        self._run_in_mainloop(scenario)
+
+    def test_close_button_quits_when_there_is_no_tray(self):
+        def scenario():
+            app = self.app
+            app._tray_icon = None
+            app._quitting = False
+            with mock.patch.object(app, "_on_close") as close, \
+                    mock.patch.object(app, "_minimize_to_taskbar") as minimize:
+                app._on_close_request()
+                self._pump(0.2)
+            close.assert_called_once()
+            minimize.assert_not_called()
+
+        self._run_in_mainloop(scenario)
+
+    def test_a_hidden_window_minimizes_onto_the_taskbar(self):
+        def scenario():
+            app = self.app
+            self._pump(0.2)
+            # Same shape as a minimized launch: withdrawn, and not yet managed by the window manager.
+            app._seen_map = False
+            app.withdraw()
+            try:
+                app._minimize_to_taskbar()
+                self._pump(0.3)
+                self.assertEqual(app.state(), "iconic")
+                self.assertTrue(app._seen_map)
+            finally:
+                self._restore_window()
+
+        self._run_in_mainloop(scenario)
+
+    def test_minimize_is_not_stolen_off_the_taskbar(self):
+        def scenario():
+            app = self.app
+            self.assertNotIn("_on_window_unmap", app.bind("<Unmap>"))
+            self.assertFalse(hasattr(app, "_on_window_unmap"))
+            self.assertFalse(hasattr(app, "_minimize_to_tray"))
+
+        self._run_in_mainloop(scenario)
+
     def test_search_typing_is_debounced_into_one_render(self):
         def scenario():
             app = self.app

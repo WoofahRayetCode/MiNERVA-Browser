@@ -248,9 +248,18 @@ class MinervaApp(tk.Tk):
         self._companion_prompt_queue: queue.Queue = queue.Queue()
         self._single_instance = None
         self._wake_after_id = None
-        self._launch_in_tray = bool(self._start_minimized_var.get()) or "--minimized" in sys.argv
-        if self._launch_in_tray:
-            # Hide before the window maps so it never appears on the taskbar.
+        self._seen_map = False
+        self.bind("<Map>", self._note_taskbar_map, add="+")
+        self._launch_minimized = bool(self._start_minimized_var.get()) or "--minimized" in sys.argv
+        self._hidden_alpha = None
+        if self._launch_minimized:
+            # Stay unmapped while the UI is built. Iconifying before the first map
+            # never creates a taskbar button. _minimize_to_taskbar maps, then iconifies.
+            try:
+                self._hidden_alpha = self.attributes("-alpha")
+                self.attributes("-alpha", 0.0)
+            except tk.TclError:
+                self._hidden_alpha = None
             try:
                 self.withdraw()
             except tk.TclError:
@@ -365,7 +374,6 @@ class MinervaApp(tk.Tk):
         self._extract_worker_thread = threading.Thread(target=self._extract_worker_loop, daemon=True)
         self._extract_worker_thread.start()
         self.protocol("WM_DELETE_WINDOW", self._on_close_request)
-        self.bind("<Unmap>", self._on_window_unmap)
         saved_last_path = self._settings.get("last_path")
         if not isinstance(saved_last_path, str) or not saved_last_path.strip():
             saved_last_path = BROWSE_ROOT
@@ -376,8 +384,8 @@ class MinervaApp(tk.Tk):
             on_done=lambda: self._restore_left_tree_selection(saved_last_path)
         )
         self._navigate(saved_last_path, preserve_search=True, restore_query=saved_last_query)
-        if getattr(self, "_launch_in_tray", False):
-            self._minimize_to_tray()
+        if getattr(self, "_launch_minimized", False):
+            self._minimize_to_taskbar()
         self.after(100, self._start_startup_cleanup)
         self.after(2500, self._check_for_updates_async)
 
@@ -638,7 +646,7 @@ class MinervaApp(tk.Tk):
             ("Decompress archives", self._auto_extract_default_var, self._on_extract_defaults_change),
             ("Delete archive", self._delete_archive_default_var, self._on_extract_defaults_change),
             ("Autostart", self._autostart_var, self._on_startup_settings_change),
-            ("Start minimized to tray", self._start_minimized_var, self._on_startup_settings_change),
+            ("Start minimized", self._start_minimized_var, self._on_startup_settings_change),
             ("Offer DLC / updates", self._offer_companions_var, self._on_extract_defaults_change),
             ("Seed finished files", self._seed_var, self._on_seed_setting_change),
         ]:
@@ -4331,7 +4339,7 @@ class MinervaApp(tk.Tk):
 
             menu = pystray.Menu(
                 pystray.MenuItem("Show MiNERVA", lambda icon, item: self.after(0, self._restore_from_tray), default=True),
-                pystray.MenuItem("Minimize to Tray", lambda icon, item: self.after(0, self._minimize_to_tray)),
+                pystray.MenuItem("Minimize", lambda icon, item: self.after(0, self._minimize_to_taskbar)),
                 pystray.Menu.SEPARATOR,
                 pystray.MenuItem("Open Download Folder", lambda icon, item: self.after(0, self._open_current_downloads_folder)),
                 pystray.MenuItem("Pause / Resume All", lambda icon, item: self.after(0, self._toggle_pause_all_active)),
@@ -4352,29 +4360,82 @@ class MinervaApp(tk.Tk):
     def _tray_available(self) -> bool:
         return bool(getattr(self, "_tray_icon", None)) and not getattr(self, "_quitting", False)
 
-    def _minimize_to_tray(self):
-        if not self._tray_available():
-            self.iconify()
-            return
-        try:
-            self.withdraw()
-        except tk.TclError:
-            pass
+    def _note_taskbar_map(self, event):
+        if event.widget is self:
+            self._seen_map = True
 
-    def _on_window_unmap(self, event):
-        """Send the taskbar minimize button to the tray instead of the taskbar."""
-        if event.widget is not self or not self._tray_available():
+    def _minimize_to_taskbar(self):
+        """Minimize the window and keep its taskbar button.
+
+        ``withdraw()`` removes that button. A window iconified before it has ever been
+        mapped is also missing from the taskbar, so map once, then iconify.
+        """
+        if getattr(self, "_quitting", False):
             return
         try:
-            if self.state() == "iconic":
-                self.after(0, self._minimize_to_tray)
+            if self.state() == "withdrawn" or not getattr(self, "_seen_map", False):
+                self.deiconify()
+                self.update_idletasks()
+            if self.state() != "iconic":
+                self.iconify()
+            self.update_idletasks()
         except tk.TclError:
-            pass
+            return
+        if sys.platform == "win32":
+            self._win32_minimize()
+        hidden = getattr(self, "_hidden_alpha", None)
+        if hidden is not None:
+            try:
+                self.attributes("-alpha", hidden)
+            except tk.TclError:
+                pass
+            self._hidden_alpha = None
+
+    def _win32_minimize(self) -> bool:
+        """Ask the shell to minimize the real top-level HWND so the taskbar button stays."""
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            user32 = ctypes.windll.user32
+            hwnd = user32.GetParent(self.winfo_id()) or self.winfo_id()
+            if not hwnd:
+                return False
+            GWL_EXSTYLE = -20
+            WS_EX_APPWINDOW = 0x00040000
+            WS_EX_TOOLWINDOW = 0x00000080
+            SW_MINIMIZE = 6
+            if ctypes.sizeof(ctypes.c_void_p) == 8:
+                get_long = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, wintypes.HWND, ctypes.c_int)(
+                    ("GetWindowLongPtrW", user32)
+                )
+                set_long = ctypes.WINFUNCTYPE(
+                    ctypes.c_ssize_t, wintypes.HWND, ctypes.c_int, ctypes.c_ssize_t
+                )(("SetWindowLongPtrW", user32))
+            else:
+                get_long = ctypes.WINFUNCTYPE(ctypes.c_long, wintypes.HWND, ctypes.c_int)(
+                    ("GetWindowLongW", user32)
+                )
+                set_long = ctypes.WINFUNCTYPE(
+                    ctypes.c_long, wintypes.HWND, ctypes.c_int, ctypes.c_long
+                )(("SetWindowLongW", user32))
+            style = int(get_long(hwnd, GWL_EXSTYLE) or 0)
+            style = (style & ~WS_EX_TOOLWINDOW) | WS_EX_APPWINDOW
+            set_long(hwnd, GWL_EXSTYLE, style)
+            # ShowWindow's return is the previous visibility, not success or failure.
+            user32.ShowWindow(hwnd, SW_MINIMIZE)
+            return True
+        except Exception:
+            return False
 
     def _on_close_request(self):
-        """Titlebar close hides to the tray; use Exit on the tray menu to quit."""
+        """Titlebar close minimizes to the taskbar. Tray Exit quits.
+
+        If the tray icon never started, close still quits so the process cannot get stuck.
+        """
         if self._tray_available():
-            self._minimize_to_tray()
+            # After the delete handler returns. Some window managers ignore iconify inside it.
+            self.after(0, self._minimize_to_taskbar)
             return
         self._on_close()
 
