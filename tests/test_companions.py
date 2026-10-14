@@ -138,6 +138,80 @@ class TestCompanions(unittest.TestCase):
         self.assertGreater(version_key("Game (v1.04) (Update).zip"), version_key("Game (v1.01) (Update).zip"))
         self.assertGreater(version_key("Game [v196608].nsp"), version_key("Game [v65536].nsp"))
 
+    def test_title_key_strips_media_flags(self):
+        self.assertEqual(
+            title_key("Demon's Souls (Japan) (v1.04) (Disc) (Update).zip"),
+            title_key("Demon's Souls (Japan).zip"),
+        )
+        self.assertEqual(
+            title_key("Battlefield - Bad Company 2 (USA) (v1.05) (Disc) (Update).zip"),
+            title_key("Battlefield - Bad Company 2 (USA).zip"),
+        )
+        self.assertEqual(
+            title_key("Game (USA) (Digital) (DLC).zip"),
+            title_key("Game (USA).zip"),
+        )
+
+    def test_names_match_companion_rejects_beta_updates_for_stable_rom(self):
+        # Stable base ROM should NOT match beta or prototype updates
+        self.assertFalse(
+            names_match_companion(
+                "Battlefield - Bad Company 2 (USA).zip",
+                "Battlefield - Bad Company 2 (USA) (v1.01) (Beta) (Update).zip",
+            )
+        )
+        self.assertTrue(
+            names_match_companion(
+                "Battlefield - Bad Company 2 (USA).zip",
+                "Battlefield - Bad Company 2 (USA) (v1.05) (Disc) (Update).zip",
+            )
+        )
+        self.assertFalse(
+            names_match_companion(
+                "Resistance 3 (USA).zip",
+                "Resistance 3 (USA) (v2.05) (Beta) (Update).zip",
+            )
+        )
+        self.assertTrue(
+            names_match_companion(
+                "Resistance 3 (USA).zip",
+                "Resistance 3 (USA) (v1.05) (Disc) (Update).zip",
+            )
+        )
+        # Beta base ROM should match beta update
+        self.assertTrue(
+            names_match_companion(
+                "Resistance 3 (USA) (Beta).zip",
+                "Resistance 3 (USA) (v2.05) (Beta) (Update).zip",
+            )
+        )
+
+    def test_find_companions_prefers_stable_disc_updates_over_beta(self):
+        current = [
+            {"name": "Battlefield - Bad Company 2 (USA).zip", "href": "/rom?id=1", "size": "5 GB", "is_folder": False},
+        ]
+        updates = [
+            {"name": "Battlefield - Bad Company 2 (USA) (v1.01) (Beta) (Update).zip", "href": "/rom?id=2", "size": "8 MB", "is_folder": False},
+            {"name": "Battlefield - Bad Company 2 (USA) (v1.05) (Disc) (Update).zip", "href": "/rom?id=3", "size": "200 MB", "is_folder": False},
+        ]
+
+        def fetch(path):
+            if "Updates" in path:
+                return updates
+            return [
+                {"name": "Sony - PlayStation 3 (PSN) (Updates)/", "href": "/browse/./No-Intro/Sony - PlayStation 3 (PSN) (Updates)/", "is_folder": True}
+            ]
+
+        found = find_companions(
+            "Battlefield - Bad Company 2 (USA).zip",
+            "/browse/./Redump/Sony - PlayStation 3/",
+            current_entries=current,
+            fetch_fn=fetch,
+            latest_update_only=True,
+        )
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0].name, "Battlefield - Bad Company 2 (USA) (v1.05) (Disc) (Update).zip")
+
     def test_skip_when_queued_file_is_dlc(self):
         found = find_companions(
             "Game (USA) (DLC).zip",

@@ -8,6 +8,7 @@ import time
 import urllib.parse
 from dataclasses import dataclass, field
 from minerva.core.extractors import normalize_chd_stem
+from minerva.core.entries import detect_release_tags
 from minerva.constants import log_activity, log_error
 
 KIND_BASE = "base"
@@ -20,6 +21,10 @@ _MIN_TITLE_KEY_LEN = 8
 
 _DLC_FLAG = re.compile(r"[\(\[]\s*DLC\s*[\)\]]", re.IGNORECASE)
 _UPDATE_FLAG = re.compile(r"[\(\[]\s*(?:Title\s+)?(?:Updates?|Patch(?:es)?)\s*[\)\]]", re.IGNORECASE)
+_MEDIA_FLAG = re.compile(
+    r"[\(\[]\s*(?:Disc|Disk|Digital|PSN|Cartridge|eShop)\s*[\)\]]",
+    re.IGNORECASE,
+)
 _HEX_ID = re.compile(r"[\(\[]\s*[0-9A-Fa-f]{8}\s*[\)\]]")  # e.g. Xbox 360 title-update hash "(1F887267)"
 _BIOS_FLAG = re.compile(r"\[BIOS\]|\(System\s+(Application|Module|Firmware|Data Archive)", re.IGNORECASE)
 _SWITCH_TID = re.compile(r"\b(01[0-9A-Fa-f]{14})\b")
@@ -88,6 +93,7 @@ def title_key(name: str) -> str:
     stem = _UPDATE_FLAG.sub(" ", stem)
     stem = _HEX_ID.sub(" ", stem)
     stem = _SWITCH_TID.sub(" ", stem)
+    stem = _MEDIA_FLAG.sub(" ", stem)
     cleaned = normalize_chd_stem(stem) or stem
     return re.sub(r"\s+", " ", cleaned).strip().lower()
 
@@ -164,10 +170,24 @@ def regions_compatible(left: str, right: str) -> bool:
     return bool(a & b)
 
 
+_TEST_TAGS = frozenset({"beta", "demo", "proto"})
+
+
+def release_tags_compatible(base_name: str, candidate_name: str) -> bool:
+    """Pre-release test updates (beta/demo/proto) should not attach to stable retail base games."""
+    base_tags = detect_release_tags(base_name.lower())
+    cand_tags = detect_release_tags(candidate_name.lower())
+    if (cand_tags & _TEST_TAGS) and not (base_tags & cand_tags & _TEST_TAGS):
+        return False
+    return True
+
+
 def names_match_companion(base_name: str, candidate_name: str) -> bool:
     if not base_name or not candidate_name:
         return False
     if base_name.strip().lower() == candidate_name.strip().lower():
+        return False
+    if not release_tags_compatible(base_name, candidate_name):
         return False
     base_ids = serials_from_name(base_name)
     cand_ids = serials_from_name(candidate_name)
