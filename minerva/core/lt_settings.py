@@ -8,6 +8,8 @@ and reports them instead of silently running on libtorrent's defaults.
 """
 from __future__ import annotations
 
+import os
+import random
 from typing import Iterable
 
 # Superset of libtorrent's own default bootstrap list (which only has dht.libtorrent.org).
@@ -44,20 +46,31 @@ def compute_alert_mask(lt_module) -> int:
 
 
 def optimized_session_settings(alert_mask: int | None = None) -> dict:
-    """Tuned libtorrent settings for throughput and fast peer discovery.
+    """Tuned libtorrent settings for throughput, multi-core hashing, and fast peer discovery.
 
     Every key must exist in libtorrent 2.x; ``tests/test_lt_settings.py`` enforces that
     against the installed build.  ``inactivity_timeout`` / ``peer_timeout`` are
     deliberately left at libtorrent's defaults: short values cause peer churn on
     low-seed archive torrents.
     """
+    cores = os.cpu_count() or 4
+    rand_port = random.randint(49152, 65530)
     settings = {
+        # Listen interface & port randomization (bypasses ISP port 6881 shaping)
+        "listen_interfaces": f"0.0.0.0:{rand_port},[::]:{rand_port}",
+
+        # Disk & Hashing Threads (multi-threaded verification scales with CPU cores)
+        "hashing_threads": min(8, max(2, cores)),
+        "aio_threads": min(32, max(16, cores * 2)),
+        "max_queued_disk_bytes": 256 * 1024 * 1024,
+
         # Concurrency & connections
         "connections_limit": 500,
         "connection_speed": 100,
         "torrent_connect_boost": 50,
         "unchoke_slots_limit": 80,
         "num_optimistic_unchoke_slots": 8,
+        "choking_algorithm": 1,  # rate_based_choker: tit-for-tat reciprocation from fast seeders
         "max_peerlist_size": 4000,
         "max_paused_peerlist_size": 1000,
         "max_pex_peers": 100,
@@ -67,15 +80,18 @@ def optimized_session_settings(alert_mask: int | None = None) -> dict:
         "max_out_request_queue": 1500,
         "max_allowed_in_request_queue": 2000,
         "whole_pieces_threshold": 20,
+        "prioritize_partial_pieces": True,
+        "piece_extent_affinity": True,
+        "strict_end_game_mode": True,
         "piece_timeout": 20,
         "request_timeout": 30,
         "peer_connect_timeout": 15,
         "min_reconnect_time": 2,
 
-        # Socket & network buffers
-        "recv_socket_buffer_size": 2 * 1024 * 1024,
-        "send_socket_buffer_size": 2 * 1024 * 1024,
-        "max_peer_recv_buffer_size": 4 * 1024 * 1024,
+        # Socket & network buffers (expanded for line-rate gigabit throughput)
+        "recv_socket_buffer_size": 4 * 1024 * 1024,
+        "send_socket_buffer_size": 4 * 1024 * 1024,
+        "max_peer_recv_buffer_size": 8 * 1024 * 1024,
 
         # Protocols & discovery
         "enable_dht": True,
@@ -86,6 +102,7 @@ def optimized_session_settings(alert_mask: int | None = None) -> dict:
         "enable_incoming_tcp": True,
         "enable_outgoing_utp": True,
         "enable_incoming_utp": True,
+        "mixed_mode_algorithm": 0,  # prefer_tcp over uTP to avoid LEDBAT latency backoff
         "use_dht_as_fallback": False,
         "dht_aggressive_lookups": True,
         "dht_bootstrap_nodes": DHT_BOOTSTRAP_NODES,

@@ -517,6 +517,7 @@ class TorrentEngine:
             params.file_priorities = priorities
             params.renamed_files = {idx: member.flat_name} if member.flat_name else {}
         group.handle = self._session.add_torrent(params)
+        self._tune_handle(group.handle)
         group.members[member.did] = member
         member.group = group
         member.state_override = "" if ti is not None else "Metadata"
@@ -593,6 +594,15 @@ class TorrentEngine:
             log_error("TorrentEngine stale-file check failed", e)
 
     # -- pausing / priorities ----------------------------------------------------------------------
+    @staticmethod
+    def _tune_handle(handle):
+        """Scale handle-level connection limits so a single download can use available peers."""
+        try:
+            handle.set_max_connections(300)
+            handle.set_max_uploads(50)
+        except Exception as e:
+            log_error("TorrentEngine handle limits failed", e)
+
     @staticmethod
     def _wanted(group: _Group, idx: int) -> bool:
         return any(

@@ -74,6 +74,28 @@ class TestAgainstInstalledLibtorrent(unittest.TestCase):
             self.assertTrue(applied["announce_to_all_trackers"])
             self.assertTrue(applied["announce_to_all_tiers"])
             self.assertEqual(applied["alert_mask"], lt_settings.compute_alert_mask(lt))
+            self.assertGreaterEqual(applied["hashing_threads"], 2)
+            self.assertGreaterEqual(applied["aio_threads"], 16)
+            self.assertGreaterEqual(applied["max_queued_disk_bytes"], 256 * 1024 * 1024)
+            self.assertTrue(applied["prioritize_partial_pieces"])
+            self.assertTrue(applied["piece_extent_affinity"])
+            self.assertEqual(applied["mixed_mode_algorithm"], 0)
+            self.assertEqual(applied["choking_algorithm"], 1)
+        finally:
+            engine.shutdown()
+
+    def test_handle_tuning_sets_max_connections_and_uploads(self):
+        from minerva.core.torrent_engine import TorrentEngine
+
+        engine = TorrentEngine(settings_overrides=_OFFLINE)
+        try:
+            params = lt.add_torrent_params()
+            params.info_hashes = lt.info_hash_t(lt.sha1_hash(b"test1234567890123456"))
+            params.save_path = "/tmp"
+            h = engine._session.add_torrent(params)
+            engine._tune_handle(h)
+            self.assertEqual(h.max_connections(), 300)
+            self.assertEqual(h.max_uploads(), 50)
         finally:
             engine.shutdown()
 
